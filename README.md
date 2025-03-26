@@ -142,8 +142,8 @@ The script will then:
 1.  **Load Config:** Read and parse `config.yaml`.
 2.  **Initialize Logger:** Set up the structured logger.
 3.  **Iterate Sites:** For each site in the config:
-    a.  **Initialize Database:** Connect to SQLite or Qdrant, create necessary tables/collections.
-    b.  **Crawl:**
+    1.  **Initialize Database:** Connect to SQLite or Qdrant, create necessary tables/collections.
+    2.  **Crawl:**
         *   Start at the base `url`.
         *   Use Puppeteer (`processPage`) to fetch and render HTML.
         *   Use Readability to extract main content.
@@ -151,10 +151,10 @@ The script will then:
         *   Convert HTML to Markdown using Turndown.
         *   Use `axios`/`cheerio` on the *original* fetched page (before Puppeteer) to find new links to add to the crawl queue.
         *   Keep track of all visited URLs.
-    c.  **Process Content:** For each crawled page's Markdown:
+    3.  **Process Content:** For each crawled page's Markdown:
         *   **Chunk:** Split Markdown into smaller `DocumentChunk` objects based on headings and size.
         *   **Hash Check:** Generate a hash of the chunk content. Check if a chunk with the same ID exists in the DB and if its hash matches.
         *   **Embed (if needed):** If the chunk is new or changed, call the OpenAI API (`createEmbeddings`) to get the vector embedding.
         *   **Store:** Insert or update the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
-    d.  **Cleanup:** After crawling the site, query the database for all chunks associated with that site's URL prefix. Delete any chunks whose URLs were *not* in the set of visited URLs for the current run.
+    4.  **Cleanup:** After crawling the site, query the database for all chunks associated with that site's URL prefix. Delete any chunks whose URLs were *not* in the set of visited URLs for the current run.
 4.  **Complete:** Log completion status.
