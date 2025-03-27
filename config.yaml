@@ -1,4 +1,11 @@
 sites:
+  - url: 'https://ambientmesh.io/docs/'
+    database_type: 'sqlite'
+    product_name: 'ambient'
+    version: 'latest'
+    max_size: 1048576
+    database_params:
+      db_path: './ambient.db'
   - url: 'https://argo-cd.readthedocs.io/en/stable/'
     database_type: 'sqlite'
     product_name: 'argo'
