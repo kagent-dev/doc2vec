@@ -1,106 +1,164 @@
-sites:
-  - url: 'https://ambientmesh.io/docs/'
-    database_type: 'sqlite'
-    product_name: 'ambient'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './ambient.db'
-  - url: 'https://argo-cd.readthedocs.io/en/stable/'
-    database_type: 'sqlite'
-    product_name: 'argo'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './argo.db'
-  - url: 'https://argoproj.github.io/argo-rollouts/installation/'
-    database_type: 'sqlite'
-    product_name: 'argo-rollouts'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './argo-rollouts.db'
-  - url: 'https://rollouts-plugin-trafficrouter-gatewayapi.readthedocs.io/en/latest/'
-    database_type: 'sqlite'
-    product_name: 'argo-rollouts'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './argo-rollouts.db'
-  - url: 'https://docs.cilium.io/en/stable/'
-    database_type: 'sqlite'
-    product_name: 'cilium'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './cilium.db'
-  - url: 'https://gateway-api.sigs.k8s.io/'
-    database_type: 'sqlite'
-    product_name: 'gateway-api'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './gateway-api.db'
-  - url: 'https://docs.solo.io/gloo-mesh/latest/'
-    database_type: 'sqlite'
-    product_name: 'gloo-mesh-core'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './gloo-mesh-core.db'
-  - url: 'https://docs.solo.io/gloo-mesh-enterprise/latest/'
-    database_type: 'sqlite'
-    product_name: 'gloo-mesh-enterprise'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './gloo-mesh-enterprise.db'
-  - url: 'https://docs.solo.io/gloo-edge/latest/'
-    database_type: 'sqlite'
-    product_name: 'gloo-edge'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './gloo-edge.db'
-  - url: 'https://docs.solo.io/gateway/latest/'
-    database_type: 'sqlite'
-    product_name: 'gloo-gateway'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './gloo-gateway.db'
-  - url: 'https://helm.sh/docs/'
-    database_type: 'sqlite'
-    product_name: 'helm'
-    version: 'latest'
-    max_size: 1048576
-    database_params:
-      db_path: './helm.db'
-  - url: 'https://istio.io/latest/docs/'
-    database_type: 'sqlite'
+# Doc2Vec Configuration
+sources:
+  # GitHub Sources
+  - type: github
     product_name: 'istio'
     version: 'latest'
+    repo: 'istio/istio'
+    start_date: '2025-01-01'
     max_size: 1048576
-    database_params:
-      db_path: './istio.db'
-  - url: 'https://kubernetes.io/docs/'
-    database_type: 'sqlite'
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './istio-issues.db'
+
+  # Website Sources
+  - type: website
+    product_name: 'ambient'
+    version: 'latest'
+    url: 'https://ambientmesh.io/docs/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './ambient.db'
+
+  - type: website
+    product_name: 'argo'
+    version: 'latest'
+    url: 'https://argo-cd.readthedocs.io/en/stable/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './argo.db'
+
+  - type: website
+    product_name: 'argo-rollouts'
+    version: 'latest'
+    url: 'https://argoproj.github.io/argo-rollouts/installation/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './argo-rollouts.db'
+
+  - type: website
+    product_name: 'argo-rollouts'
+    version: 'latest'
+    url: 'https://rollouts-plugin-trafficrouter-gatewayapi.readthedocs.io/en/latest/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './argo-rollouts.db'
+
+  - type: website
+    product_name: 'cilium'
+    version: 'latest'
+    url: 'https://docs.cilium.io/en/stable/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './cilium.db'
+
+  - type: website
+    product_name: 'gateway-api'
+    version: 'latest'
+    url: 'https://gateway-api.sigs.k8s.io/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './gateway-api.db'
+
+  - type: website
+    product_name: 'gloo-mesh-core'
+    version: 'latest'
+    url: 'https://docs.solo.io/gloo-mesh/latest/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './gloo-mesh-core.db'
+
+  - type: website
+    product_name: 'gloo-mesh-enterprise'
+    version: 'latest'
+    url: 'https://docs.solo.io/gloo-mesh-enterprise/latest/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './gloo-mesh-enterprise.db'
+
+  - type: website
+    product_name: 'gloo-edge'
+    version: 'latest'
+    url: 'https://docs.solo.io/gloo-edge/latest/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './gloo-edge.db'
+
+  - type: website
+    product_name: 'gloo-gateway'
+    version: 'latest'
+    url: 'https://docs.solo.io/gateway/latest/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './gloo-gateway.db'
+
+  - type: website
+    product_name: 'helm'
+    version: 'latest'
+    url: 'https://helm.sh/docs/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './helm.db'
+
+  - type: website
+    product_name: 'istio'
+    version: 'latest'
+    url: 'https://istio.io/latest/docs/'
+    max_size: 1048576
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './istio.db'
+
+  - type: website
     product_name: 'kubernetes'
     version: 'latest'
+    url: 'https://kubernetes.io/docs/'
     max_size: 1048576
-    database_params:
-      db_path: './kubernetes.db'
-  - url: 'https://opentelemetry.io/docs/'
-    database_type: 'sqlite'
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './kubernetes.db'
+
+  - type: website
     product_name: 'otel'
     version: 'latest'
+    url: 'https://opentelemetry.io/docs/'
     max_size: 1048576
-    database_params:
-      db_path: './otel.db'
-  - url: 'https://prometheus.io/docs/'
-    database_type: 'sqlite'
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './otel.db'
+
+  - type: website
     product_name: 'prometheus'
     version: 'latest'
+    url: 'https://prometheus.io/docs/'
     max_size: 1048576
-    database_params:
-      db_path: './prometheus.db'
+    database_config:
+      type: 'sqlite'
+      params:
+        db_path: './prometheus.db'
