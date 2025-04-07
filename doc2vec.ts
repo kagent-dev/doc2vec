@@ -16,23 +16,50 @@ import * as sqliteVec from "sqlite-vec";
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { Logger, LogLevel } from './logger';
 
+const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+
 dotenv.config();
 
 interface Config {
-    sites: SiteConfig[];
+    sources: SourceConfig[];
 }
 
-interface SiteConfig {
-    url: string;
-    database_type: 'sqlite' | 'qdrant';
+// Base configuration that applies to all source types
+interface BaseSourceConfig {
+    type: 'website' | 'github';
     product_name: string;
     version: string;
     max_size: number;
-    database_params: DatabaseParams;
+    database_config: DatabaseConfig;
 }
 
-interface DatabaseParams {
-    db_path?: string;
+// Configuration specific to website sources
+interface WebsiteSourceConfig extends BaseSourceConfig {
+    type: 'website';
+    url: string;
+}
+
+// Configuration specific to GitHub repo sources
+interface GithubSourceConfig extends BaseSourceConfig {
+    type: 'github';
+    repo: string;
+    start_date?: string;
+}
+
+// Union type for all possible source configurations
+type SourceConfig = WebsiteSourceConfig | GithubSourceConfig;
+
+// Database configuration
+interface DatabaseConfig {
+    type: 'sqlite' | 'qdrant';
+    params: SqliteDatabaseParams | QdrantDatabaseParams;
+}
+
+interface SqliteDatabaseParams {
+    db_path?: string;  // Optional, will use default if not provided
+}
+
+interface QdrantDatabaseParams {
     qdrant_url?: string;
     qdrant_port?: number;
     collection_name?: string;
@@ -95,10 +122,11 @@ class Doc2Vec {
             logger.info(`Loading configuration from ${configPath}`);
             
             const configFile = fs.readFileSync(configPath, 'utf8');
-            const config = yaml.load(configFile) as Config;
+            let config = yaml.load(configFile) as any;
             
-            logger.info(`Configuration loaded successfully, found ${config.sites.length} sites`);
-            return config;
+            const typedConfig = config as Config;
+            logger.info(`Configuration loaded successfully, found ${typedConfig.sources.length} sources`);
+            return typedConfig;
         } catch (error) {
             this.logger.error(`Failed to load or parse config file at ${configPath}:`, error);
             process.exit(1);
@@ -206,13 +234,20 @@ class Doc2Vec {
     }
 
     public async run(): Promise<void> {
-        this.logger.section('PROCESSING SITES');
+        this.logger.section('PROCESSING SOURCES');
         
-        for (const siteConfig of this.config.sites) {
-            const siteLogger = this.logger.child(`site:${siteConfig.product_name}`);
+        for (const sourceConfig of this.config.sources) {
+            const sourceLogger = this.logger.child(`source:${sourceConfig.product_name}`);
             
-            siteLogger.info(`Processing site ${siteConfig.url} (${siteConfig.database_type}) for ${siteConfig.product_name}@${siteConfig.version}`);
-            await this.processSite(siteConfig, siteLogger);
+            sourceLogger.info(`Processing ${sourceConfig.type} source for ${sourceConfig.product_name}@${sourceConfig.version}`);
+            
+            if (sourceConfig.type === 'github') {
+                await this.processGithubRepo(sourceConfig, sourceLogger);
+            } else if (sourceConfig.type === 'website') {
+                await this.processWebsite(sourceConfig, sourceLogger);
+            } else {
+                sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
+            }
         }
         
         this.logger.section('PROCESSING COMPLETE');
@@ -227,23 +262,344 @@ class Doc2Vec {
         }
     }
 
-    private async processSite(siteConfig: SiteConfig, parentLogger: Logger): Promise<void> {
-        const logger = parentLogger.child('process');
-        logger.info(`Starting processing for ${siteConfig.url}`);
+    private generateMetadataUUID(repo: string): string {
+        // Simple deterministic approach - hash the repo name and convert to UUID format
+        const hash = crypto.createHash('md5').update(`metadata_${repo}`).digest('hex');
+        // Format as UUID with version bits set correctly (version 4)
+        return `${hash.substr(0, 8)}-${hash.substr(8, 4)}-4${hash.substr(13, 3)}-${hash.substr(16, 4)}-${hash.substr(20, 12)}`;
+    }
+
+    private async initDatabaseMetadata(dbConnection: DatabaseConnection): Promise<void> {
+        const logger = this.logger.child('metadata');
+        
+        if (dbConnection.type === 'sqlite') {
+            const db = dbConnection.db;
+            logger.debug('Creating metadata table if it doesn\'t exist');
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS vec_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            `);
+            logger.info('SQLite metadata table initialized');
+        } else if (dbConnection.type === 'qdrant') {
+            // For Qdrant, we'll use the same collection but verify it exists
+            logger.info(`Using existing Qdrant collection for metadata: ${dbConnection.collectionName}`);
+            // Nothing special to initialize as we'll use the same collection
+        }
+    }
+
+    private async getLastRunDate(dbConnection: DatabaseConnection, repo: string, defaultDate: string): Promise<string> {
+        const logger = this.logger.child('metadata');
+        const metadataKey = `last_run_${repo.replace('/', '_')}`;
+        
+        try {
+            if (dbConnection.type === 'sqlite') {
+                const stmt = dbConnection.db.prepare('SELECT value FROM vec_metadata WHERE key = ?');
+                const result = stmt.get(metadataKey) as { value: string } | undefined;
+                
+                if (result) {
+                    logger.info(`Retrieved last run date for ${repo}: ${result.value}`);
+                    return result.value;
+                }
+            } else if (dbConnection.type === 'qdrant') {
+                // Generate a UUID for this repo's metadata
+                const metadataUUID = this.generateMetadataUUID(repo);
+                logger.debug(`Looking up metadata with UUID: ${metadataUUID}`);
+                
+                try {
+                    // Try to retrieve the metadata point for this repo
+                    const response = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                        ids: [metadataUUID],
+                        with_payload: true,
+                        with_vector: false
+                    });
+                    
+                    if (response.length > 0 && response[0].payload?.metadata_value) {
+                        const lastRunDate = response[0].payload.metadata_value as string;
+                        logger.info(`Retrieved last run date for ${repo}: ${lastRunDate}`);
+                        return lastRunDate;
+                    }
+                } catch (error) {
+                    logger.warn(`Failed to retrieve metadata for ${repo}:`, error);
+                }
+            }
+        } catch (error) {
+            logger.warn(`Error retrieving last run date:`, error);
+        }
+        
+        logger.info(`No saved run date found for ${repo}, using default: ${defaultDate}`);
+        return defaultDate;
+    }
+
+    private async updateLastRunDate(dbConnection: DatabaseConnection, repo: string): Promise<void> {
+        const logger = this.logger.child('metadata');
+        const now = new Date().toISOString();
+        
+        try {
+            if (dbConnection.type === 'sqlite') {
+                const metadataKey = `last_run_${repo.replace('/', '_')}`;
+                const stmt = dbConnection.db.prepare(`
+                    INSERT INTO vec_metadata (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                `);
+                stmt.run(metadataKey, now);
+                logger.info(`Updated last run date for ${repo} to ${now}`);
+            } else if (dbConnection.type === 'qdrant') {
+                // Generate UUID for this repo's metadata
+                const metadataUUID = this.generateMetadataUUID(repo);
+                const metadataKey = `last_run_${repo.replace('/', '_')}`;
+                
+                logger.debug(`Using UUID: ${metadataUUID} for metadata`);
+                
+                // Generate a dummy embedding (all zeros)
+                const dummyEmbeddingSize = 3072; // Same size as your content embeddings
+                const dummyEmbedding = new Array(dummyEmbeddingSize).fill(0);
+                
+                // Create a point with special metadata payload
+                const metadataPoint = {
+                    id: metadataUUID,
+                    vector: dummyEmbedding,
+                    payload: {
+                        metadata_key: metadataKey,
+                        metadata_value: now,
+                        is_metadata: true, // Flag to identify metadata points
+                        content: `Metadata: Last run date for ${repo}`,
+                        product_name: 'system',
+                        version: 'metadata',
+                        url: 'metadata://' + repo
+                    }
+                };
+                
+                await dbConnection.client.upsert(dbConnection.collectionName, {
+                    wait: true,
+                    points: [metadataPoint]
+                });
+                
+                logger.info(`Updated last run date for ${repo} to ${now}`);
+            }
+        } catch (error) {
+            logger.error(`Failed to update last run date for ${repo}:`, error);
+        }
+    }
+
+    private async fetchAndProcessGitHubIssues(repo: string, sourceConfig: GithubSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
+        const [owner, repoName] = repo.split('/');
+        const GITHUB_API_URL = `https://api.github.com/repos/${owner}/${repoName}/issues`;
+        
+        // Initialize metadata storage if needed
+        await this.initDatabaseMetadata(dbConnection);
+        
+        // Get the last run date from the database
+        const startDate = sourceConfig.start_date || '2025-01-01';
+        const lastRunDate = await this.getLastRunDate(dbConnection, repo, `${startDate}T00:00:00Z`);
     
-        const dbConnection = await this.initDatabase(siteConfig, logger);
+        const fetchWithRetry = async (url: string, params = {}, retries = 5, delay = 5000): Promise<any> => {
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    const response = await axios.get(url, {
+                        headers: {
+                            Authorization: `token ${GITHUB_TOKEN}`,
+                            Accept: 'application/vnd.github.v3+json',
+                        },
+                        params,
+                    });
+                    return response.data;
+                } catch (error: any) {
+                    if (error.response && error.response.status === 403) {
+                        const resetTime = error.response.headers['x-ratelimit-reset'];
+                        const currentTime = Math.floor(Date.now() / 1000);
+                        const waitTime = resetTime ? (resetTime - currentTime) * 1000 : delay * 2;
+                        logger.warn(`GitHub rate limit exceeded. Waiting ${waitTime / 1000}s`);
+                        await new Promise(res => setTimeout(res, waitTime));
+                    } else {
+                        logger.error(`GitHub fetch failed: ${error.message}`);
+                        throw error;
+                    }
+                }
+            }
+            throw new Error('Max retries reached');
+        };
+    
+        const fetchAllIssues = async (sinceDate: string): Promise<any[]> => {
+            let issues: any[] = [];
+            let page = 1;
+            const perPage = 100;
+            const sinceTimestamp = new Date(sinceDate);
+    
+            while (true) {
+                const data = await fetchWithRetry(GITHUB_API_URL, {
+                    per_page: perPage,
+                    page,
+                    state: 'all',
+                    since: sinceDate,
+                });
+    
+                if (data.length === 0) break;
+    
+                const filtered = data.filter((issue: any) => new Date(issue.created_at) >= sinceTimestamp);
+                issues = issues.concat(filtered);
+    
+                if (filtered.length < data.length) break;
+                page++;
+            }
+            return issues;
+        };
+    
+        const fetchIssueComments = async (issueNumber: number): Promise<any[]> => {
+            const url = `${GITHUB_API_URL}/${issueNumber}/comments`;
+            return await fetchWithRetry(url);
+        };
+    
+        const generateMarkdownForIssue = async (issue: any): Promise<string> => {
+            const comments = await fetchIssueComments(issue.number);
+            let md = `# Issue #${issue.number}: ${issue.title}\n\n`;
+            md += `- **Author:** ${issue.user.login}\n`;
+            md += `- **State:** ${issue.state}\n`;
+            md += `- **Created on:** ${new Date(issue.created_at).toDateString()}\n`;
+            md += `- **Updated on:** ${new Date(issue.updated_at).toDateString()}\n`;
+            md += `- **Labels:** ${issue.labels.map((l: any) => `\`${l.name}\``).join(', ') || 'None'}\n\n`;
+            md += `## Description\n\n${issue.body || '_No description._'}\n\n## Comments\n\n`;
+    
+            if (comments.length === 0) {
+                md += '_No comments._\n';
+            } else {
+                for (const c of comments) {
+                    md += `### ${c.user.login} - ${new Date(c.created_at).toDateString()}\n\n${c.body}\n\n---\n\n`;
+                }
+            }
+    
+            return md;
+        };
+    
+        // Process a single issue and store its chunks
+        const processIssue = async (issue: any): Promise<void> => {
+            const issueNumber = issue.number;
+            const url = `https://github.com/${repo}/issues/${issueNumber}`;
+            
+            logger.info(`Processing issue #${issueNumber}`);
+            
+            // Generate markdown for the issue
+            const markdown = await generateMarkdownForIssue(issue);
+            
+            // Chunk the markdown content
+            const issueConfig = {
+                ...sourceConfig,
+                product_name: sourceConfig.product_name || repo,
+                max_size: sourceConfig.max_size || Infinity
+            };
+            
+            const chunks = await this.chunkMarkdown(markdown, issueConfig, url);
+            logger.info(`Issue #${issueNumber}: Created ${chunks.length} chunks`);
+            
+            // Process and store each chunk immediately
+            for (const chunk of chunks) {
+                const chunkHash = this.generateHash(chunk.content);
+                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+                
+                if (dbConnection.type === 'sqlite') {
+                    const { checkHashStmt } = this.prepareSQLiteStatements(dbConnection.db);
+                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+                    
+                    if (existing && existing.hash === chunkHash) {
+                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                        continue;
+                    }
+    
+                    const embeddings = await this.createEmbeddings([chunk.content]);
+                    if (embeddings.length) {
+                        this.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
+                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
+                    } else {
+                        logger.error(`Embedding failed for chunk: ${chunkId}`);
+                    }
+                } else if (dbConnection.type === 'qdrant') {
+                    try {
+                        let pointId: string;
+                        try {
+                            pointId = chunk.metadata.chunk_id;
+                            if (!this.isValidUuid(pointId)) {
+                                pointId = this.hashToUuid(chunk.metadata.chunk_id);
+                            }
+                        } catch (e) {
+                            pointId = crypto.randomUUID();
+                        }
+    
+                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                            ids: [pointId],
+                            with_payload: true,
+                            with_vector: false,
+                        });
+    
+                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
+                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                            continue;
+                        }
+                        
+                        const embeddings = await this.createEmbeddings([chunk.content]);
+                        if (embeddings.length) {
+                            await this.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
+                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
+                        } else {
+                            logger.error(`Embedding failed for chunk: ${chunkId}`);
+                        }
+                    } catch (error) {
+                        logger.error(`Error processing chunk in Qdrant:`, error);
+                    }
+                }
+            }
+        };
+    
+        logger.info(`Fetching GitHub issues for ${repo} since ${lastRunDate}`);
+        const issues = await fetchAllIssues(lastRunDate);
+        logger.info(`Found ${issues.length} updated/new issues`);
+    
+        // Process each issue individually, one at a time
+        for (let i = 0; i < issues.length; i++) {
+            logger.info(`Processing issue ${i + 1}/${issues.length}`);
+            await processIssue(issues[i]);
+        }
+    
+        // Update the last run date in the database after processing all issues
+        await this.updateLastRunDate(dbConnection, repo);
+        
+        logger.info(`Successfully processed ${issues.length} issues`);
+    }
+
+    private async processGithubRepo(config: GithubSourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for GitHub repo: ${config.repo}`);
+        
+        const dbConnection = await this.initDatabase(config, logger);
+        
+        // Initialize metadata storage
+        await this.initDatabaseMetadata(dbConnection);
+        
+        logger.section('GITHUB ISSUES');
+        
+        // Process GitHub issues
+        await this.fetchAndProcessGitHubIssues(config.repo, config, dbConnection, logger);
+        
+        logger.info(`Finished processing GitHub repo: ${config.repo}`);
+    }
+
+    private async processWebsite(config: WebsiteSourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for website: ${config.url}`);
+        
+        const dbConnection = await this.initDatabase(config, logger);
         const validChunkIds: Set<string> = new Set();
         const visitedUrls: Set<string> = new Set();
-        const urlPrefix = this.getUrlPrefix(siteConfig.url);
-    
+        const urlPrefix = this.getUrlPrefix(config.url);
+        
         logger.section('CRAWL AND EMBEDDING');
     
-        await this.crawlWebsite(siteConfig.url, siteConfig, async (url, content) => {
+        await this.crawlWebsite(config.url, config, async (url, content) => {
             visitedUrls.add(url);
     
             logger.info(`Processing content from ${url} (${content.length} chars markdown)`);
             try {
-                const chunks = await this.chunkMarkdown(content, siteConfig, url);
+                const chunks = await this.chunkMarkdown(content, config, url);
                 logger.info(`Created ${chunks.length} chunks`);
     
                 if (chunks.length > 0) {
@@ -323,7 +679,7 @@ class Doc2Vec {
     
         }, logger, visitedUrls);
     
-        logger.info(`Found ${validChunkIds.size} valid chunks across processed pages for ${siteConfig.url}`);
+        logger.info(`Found ${validChunkIds.size} valid chunks across processed pages for ${config.url}`);
     
         logger.section('CLEANUP');
         if (dbConnection.type === 'sqlite') {
@@ -334,14 +690,17 @@ class Doc2Vec {
             await this.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
         }
     
-        logger.info(`Finished processing site: ${siteConfig.url}`);
+        logger.info(`Finished processing website: ${config.url}`);
     }
 
-    private async initDatabase(siteConfig: SiteConfig, parentLogger: Logger): Promise<DatabaseConnection> {
+    private async initDatabase(config: SourceConfig, parentLogger: Logger): Promise<DatabaseConnection> {
         const logger = parentLogger.child('database');
+        const dbConfig = config.database_config;
         
-        if (siteConfig.database_type === 'sqlite') {
-            const dbPath = siteConfig.database_params.db_path || path.join(process.cwd(), `${siteConfig.product_name.replace(/\s+/g, '_')}-${siteConfig.version}.db`);
+        if (dbConfig.type === 'sqlite') {
+            const params = dbConfig.params as SqliteDatabaseParams;
+            const dbPath = params.db_path || path.join(process.cwd(), `${config.product_name.replace(/\s+/g, '_')}-${config.version}.db`);
+            
             logger.info(`Opening SQLite database at ${dbPath}`);
             
             const db = new BetterSqlite3(dbPath, { allowExtension: true } as any);
@@ -363,10 +722,11 @@ class Doc2Vec {
             `);
             logger.info(`SQLite database initialized successfully`);
             return { db, type: 'sqlite' };
-        } else if (siteConfig.database_type === 'qdrant') {
-            const qdrantUrl = siteConfig.database_params.qdrant_url || 'http://localhost:6333';
-            const qdrantPort = siteConfig.database_params.qdrant_port || 443;
-            const collectionName = siteConfig.database_params.collection_name || `${siteConfig.product_name.toLowerCase().replace(/\s+/g, '_')}_${siteConfig.version}`;
+        } else if (dbConfig.type === 'qdrant') {
+            const params = dbConfig.params as QdrantDatabaseParams;
+            const qdrantUrl = params.qdrant_url || 'http://localhost:6333';
+            const qdrantPort = params.qdrant_port || 443;
+            const collectionName = params.collection_name || `${config.product_name.toLowerCase().replace(/\s+/g, '_')}_${config.version}`;
             
             logger.info(`Connecting to Qdrant at ${qdrantUrl}:${qdrantPort}, collection: ${collectionName}`);
             const qdrantClient = new QdrantClient({ url: qdrantUrl, apiKey: process.env.QDRANT_API_KEY, port: qdrantPort });
@@ -375,7 +735,7 @@ class Doc2Vec {
             logger.info(`Qdrant connection established successfully`);
             return { client: qdrantClient, collectionName, type: 'qdrant' };
         } else {
-            const errMsg = `Unsupported database type: ${siteConfig.database_type}`;
+            const errMsg = `Unsupported database type: ${dbConfig.type}`;
             logger.error(errMsg);
             throw new Error(errMsg);
         }
@@ -549,7 +909,7 @@ class Doc2Vec {
     private async removeObsoleteChunksQdrant(db: QdrantDB, visitedUrls: Set<string>, urlPrefix: string, logger: Logger) {
         const { client, collectionName } = db;
         try {
-    
+            // Get all points that match the URL prefix but are not metadata points
             const response = await client.scroll(collectionName, {
                 limit: 10000,
                 with_payload: true,
@@ -562,6 +922,14 @@ class Doc2Vec {
                                 text: urlPrefix + "*"
                             }
                         }
+                    ],
+                    must_not: [
+                        {
+                            key: "is_metadata",
+                            match: {
+                                value: true
+                            }
+                        }
                     ]
                 }
             });
@@ -569,7 +937,10 @@ class Doc2Vec {
             const obsoletePointIds = response.points
                 .filter((point: any) => {
                     const url = point.payload?.url;
-    
+                    // Double check it's not a metadata record
+                    if (point.payload?.is_metadata === true) {
+                        return false;
+                    }
                     return url && !visitedUrls.has(url);
                 })
                 .map((point: any) => point.id);
@@ -589,7 +960,7 @@ class Doc2Vec {
 
     private async crawlWebsite(
         baseUrl: string,
-        siteConfig: SiteConfig,
+        sourceConfig: WebsiteSourceConfig,
         processPageContent: (url: string, content: string) => Promise<void>,
         parentLogger: Logger,
         visitedUrls: Set<string>
@@ -619,7 +990,7 @@ class Doc2Vec {
     
             try {
                 logger.info(`Crawling: ${url}`);
-                const content = await this.processPage(url, siteConfig);
+                const content = await this.processPage(url, sourceConfig);
     
                 if (content !== null) {
                     await processPageContent(url, content);
@@ -639,7 +1010,7 @@ class Doc2Vec {
                     if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
     
                     const fullUrl = this.buildUrl(href, url);
-                    if (fullUrl.startsWith(siteConfig.url) && !visitedUrls.has(this.normalizeUrl(fullUrl))) {
+                    if (fullUrl.startsWith(sourceConfig.url) && !visitedUrls.has(this.normalizeUrl(fullUrl))) {
                          if (!queue.includes(fullUrl)) {
                              queue.push(fullUrl);
                              newLinksFound++;
@@ -686,7 +1057,7 @@ class Doc2Vec {
         }
     }
 
-    private async processPage(url: string, siteConfig: SiteConfig): Promise<string | null> {
+    private async processPage(url: string, sourceConfig: SourceConfig): Promise<string | null> {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing page content from ${url}`);
     
@@ -703,8 +1074,8 @@ class Doc2Vec {
                 return mainContentElement.innerHTML;
             });
     
-            if (htmlContent.length > siteConfig.max_size) {
-                logger.warn(`Raw HTML content (${htmlContent.length} chars) exceeds max size (${siteConfig.max_size}). Skipping detailed processing for ${url}.`);
+            if (htmlContent.length > sourceConfig.max_size) {
+                logger.warn(`Raw HTML content (${htmlContent.length} chars) exceeds max size (${sourceConfig.max_size}). Skipping detailed processing for ${url}.`);
                 await browser.close();
                 return null;
             }
@@ -773,7 +1144,7 @@ class Doc2Vec {
         this.markCodeParents(node.parentElement);
     }
 
-    private async chunkMarkdown(markdown: string, siteConfig: SiteConfig, url: string): Promise<DocumentChunk[]> {
+    private async chunkMarkdown(markdown: string, sourceConfig: SourceConfig, url: string): Promise<DocumentChunk[]> {
         const logger = this.logger.child('chunker');
         logger.debug(`Chunking markdown from ${url} (${markdown.length} chars)`);
         
@@ -825,8 +1196,8 @@ class Doc2Vec {
             return {
                 content,
                 metadata: {
-                    product_name: siteConfig.product_name,
-                    version: siteConfig.version,
+                    product_name: sourceConfig.product_name,
+                    version: sourceConfig.version,
                     heading_hierarchy: [...hierarchy],
                     section: hierarchy[hierarchy.length - 1] || "Introduction",
                     chunk_id: chunkId,
