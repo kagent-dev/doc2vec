@@ -26,11 +26,21 @@ interface Config {
 
 // Base configuration that applies to all source types
 interface BaseSourceConfig {
-    type: 'website' | 'github';
+    type: 'website' | 'github' | 'local_directory';
     product_name: string;
     version: string;
     max_size: number;
     database_config: DatabaseConfig;
+}
+
+// Configuration specific to local directory sources
+interface LocalDirectorySourceConfig extends BaseSourceConfig {
+    type: 'local_directory';
+    path: string;                  // Path to the local directory
+    include_extensions?: string[]; // File extensions to include (e.g., ['.md', '.txt'])
+    exclude_extensions?: string[]; // File extensions to exclude
+    recursive?: boolean;           // Whether to traverse subdirectories
+    encoding?: BufferEncoding;     // File encoding (default: 'utf8')
 }
 
 // Configuration specific to website sources
@@ -47,7 +57,7 @@ interface GithubSourceConfig extends BaseSourceConfig {
 }
 
 // Union type for all possible source configurations
-type SourceConfig = WebsiteSourceConfig | GithubSourceConfig;
+type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig;
 
 // Database configuration
 interface DatabaseConfig {
@@ -245,6 +255,8 @@ class Doc2Vec {
                 await this.processGithubRepo(sourceConfig, sourceLogger);
             } else if (sourceConfig.type === 'website') {
                 await this.processWebsite(sourceConfig, sourceLogger);
+            } else if (sourceConfig.type === 'local_directory') {
+                await this.processLocalDirectory(sourceConfig, sourceLogger);
             } else {
                 sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
             }
@@ -693,6 +705,220 @@ class Doc2Vec {
         logger.info(`Finished processing website: ${config.url}`);
     }
 
+    private async processLocalDirectory(config: LocalDirectorySourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for local directory: ${config.path}`);
+        
+        const dbConnection = await this.initDatabase(config, logger);
+        const validChunkIds: Set<string> = new Set();
+        const processedFiles: Set<string> = new Set();
+        
+        logger.section('FILE SCANNING AND EMBEDDING');
+        
+        await this.processDirectory(
+            config.path, 
+            config, 
+            async (filePath, content) => {
+                processedFiles.add(filePath);
+                
+                logger.info(`Processing content from ${filePath} (${content.length} chars)`);
+                try {
+                    // Use the file path as URL for tracking
+                    const fileUrl = `file://${filePath}`;
+                    const chunks = await this.chunkMarkdown(content, config, fileUrl);
+                    logger.info(`Created ${chunks.length} chunks`);
+                    
+                    if (chunks.length > 0) {
+                        const chunkProgress = logger.progress(`Embedding chunks for ${filePath}`, chunks.length);
+                        
+                        for (let i = 0; i < chunks.length; i++) {
+                            const chunk = chunks[i];
+                            validChunkIds.add(chunk.metadata.chunk_id);
+                            
+                            const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+                            
+                            let needsEmbedding = true;
+                            const chunkHash = this.generateHash(chunk.content);
+                            
+                            if (dbConnection.type === 'sqlite') {
+                                const { checkHashStmt } = this.prepareSQLiteStatements(dbConnection.db);
+                                const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+                                
+                                if (existing && existing.hash === chunkHash) {
+                                    needsEmbedding = false;
+                                    chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
+                                    logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                                }
+                            } else if (dbConnection.type === 'qdrant') {
+                                try {
+                                    let pointId: string;
+                                    try {
+                                        pointId = chunk.metadata.chunk_id;
+                                        if (!this.isValidUuid(pointId)) {
+                                            pointId = this.hashToUuid(chunk.metadata.chunk_id);
+                                        }
+                                    } catch (e) {
+                                        pointId = crypto.randomUUID();
+                                    }
+                                    
+                                    const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                                        ids: [pointId],
+                                        with_payload: true,
+                                        with_vector: false,
+                                    });
+                                    
+                                    if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
+                                        needsEmbedding = false;
+                                        chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
+                                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                                    }
+                                } catch (error) {
+                                    logger.error(`Error checking existing point in Qdrant:`, error);
+                                }
+                            }
+                            
+                            if (needsEmbedding) {
+                                const embeddings = await this.createEmbeddings([chunk.content]);
+                                if (embeddings.length > 0) {
+                                    const embedding = embeddings[0];
+                                    if (dbConnection.type === 'sqlite') {
+                                        this.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
+                                        chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
+                                    } else if (dbConnection.type === 'qdrant') {
+                                        await this.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
+                                        chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
+                                    }
+                                } else {
+                                    logger.error(`Embedding failed for chunk: ${chunkId}`);
+                                    chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
+                                }
+                            }
+                        }
+                        
+                        chunkProgress.complete();
+                    }
+                } catch (error) {
+                    logger.error(`Error during chunking or embedding for ${filePath}:`, error);
+                }
+            }, 
+            logger
+        );
+        
+        logger.info(`Found ${validChunkIds.size} valid chunks across processed files for ${config.path}`);
+        
+        logger.section('CLEANUP');
+        if (dbConnection.type === 'sqlite') {
+            logger.info(`Running SQLite cleanup for local directory ${config.path}`);
+            this.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config.path, logger);
+        } else if (dbConnection.type === 'qdrant') {
+            logger.info(`Running Qdrant cleanup for local directory ${config.path} in collection ${dbConnection.collectionName}`);
+            await this.removeObsoleteFilesQdrant(dbConnection, processedFiles, config.path, logger);
+        }
+        
+        logger.info(`Finished processing local directory: ${config.path}`);
+    }
+
+    private async processDirectory(
+        dirPath: string,
+        config: LocalDirectorySourceConfig,
+        processFileContent: (filePath: string, content: string) => Promise<void>,
+        parentLogger: Logger,
+        visitedPaths: Set<string> = new Set()
+    ): Promise<void> {
+        const logger = parentLogger.child('directory-processor');
+        logger.info(`Processing directory: ${dirPath}`);
+        
+        const recursive = config.recursive !== undefined ? config.recursive : true;
+        const includeExtensions = config.include_extensions || ['.md', '.txt', '.html', '.htm'];
+        const excludeExtensions = config.exclude_extensions || [];
+        const encoding = config.encoding || 'utf8' as BufferEncoding;
+        
+        try {
+            const files = fs.readdirSync(dirPath);
+            let processedFiles = 0;
+            let skippedFiles = 0;
+            
+            for (const file of files) {
+                const filePath = path.join(dirPath, file);
+                const stat = fs.statSync(filePath);
+                
+                // Skip already visited paths
+                if (visitedPaths.has(filePath)) {
+                    logger.debug(`Skipping already visited path: ${filePath}`);
+                    continue;
+                }
+                
+                visitedPaths.add(filePath);
+                
+                if (stat.isDirectory()) {
+                    if (recursive) {
+                        await this.processDirectory(filePath, config, processFileContent, logger, visitedPaths);
+                    } else {
+                        logger.debug(`Skipping directory ${filePath} (recursive=false)`);
+                    }
+                } else if (stat.isFile()) {
+                    const extension = path.extname(file).toLowerCase();
+                    
+                    // Apply extension filters
+                    if (excludeExtensions.includes(extension)) {
+                        logger.debug(`Skipping file with excluded extension: ${filePath}`);
+                        skippedFiles++;
+                        continue;
+                    }
+                    
+                    if (includeExtensions.length > 0 && !includeExtensions.includes(extension)) {
+                        logger.debug(`Skipping file with non-included extension: ${filePath}`);
+                        skippedFiles++;
+                        continue;
+                    }
+                    
+                    try {
+                        logger.info(`Reading file: ${filePath}`);
+                        const content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
+                        
+                        if (content.length > config.max_size) {
+                            logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                            skippedFiles++;
+                            continue;
+                        }
+                        
+                        // Convert HTML to Markdown if needed
+                        let processedContent: string;
+                        if (extension === '.html' || extension === '.htm') {
+                            logger.debug(`Converting HTML to Markdown for ${filePath}`);
+                            const cleanHtml = sanitizeHtml(content, {
+                                allowedTags: [
+                                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                                ],
+                                allowedAttributes: {
+                                    'a': ['href'],
+                                    'pre': ['class', 'data-language'],
+                                    'code': ['class', 'data-language'],
+                                    'div': ['class'],
+                                    'span': ['class']
+                                }
+                            });
+                            processedContent = this.turndownService.turndown(cleanHtml);
+                        } else {
+                            processedContent = content;
+                        }
+                        
+                        await processFileContent(filePath, processedContent);
+                        processedFiles++;
+                    } catch (error) {
+                        logger.error(`Error processing file ${filePath}:`, error);
+                    }
+                }
+            }
+            
+            logger.info(`Directory processed. Processed: ${processedFiles}, Skipped: ${skippedFiles}`);
+        } catch (error) {
+            logger.error(`Error reading directory ${dirPath}:`, error);
+        }
+    }
+
     private async initDatabase(config: SourceConfig, parentLogger: Logger): Promise<DatabaseConnection> {
         const logger = parentLogger.child('database');
         const dbConfig = config.database_config;
@@ -888,6 +1114,93 @@ class Doc2Vec {
     
         logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for URL ${urlPrefix}`);
     }
+
+    private removeObsoleteFilesSQLite(db: Database, processedFiles: Set<string>, dirPrefix: string, logger: Logger) {
+        const getChunksForDirStmt = db.prepare(`
+            SELECT chunk_id, url FROM vec_items
+            WHERE url LIKE 'file://%' AND url LIKE ?
+        `);
+        const deleteChunkStmt = db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`);
+        
+        const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
+        const filePrefix = `file://${cleanedDirPrefix}`;
+        
+        const existingChunks = getChunksForDirStmt.all(`${filePrefix}%`) as { chunk_id: string; url: string }[];
+        let deletedCount = 0;
+        
+        const transaction = db.transaction(() => {
+            for (const { chunk_id, url } of existingChunks) {
+                // Remove file:// prefix to match with processedFiles
+                const filePath = url.substring(7);
+                if (!processedFiles.has(filePath)) {
+                    logger.debug(`Deleting obsolete chunk from SQLite: ${chunk_id.substring(0, 8)}... (File not processed)`);
+                    deleteChunkStmt.run(chunk_id);
+                    deletedCount++;
+                }
+            }
+        });
+        transaction();
+        
+        logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for directory ${dirPrefix}`);
+    }
+    
+    private async removeObsoleteFilesQdrant(db: QdrantDB, processedFiles: Set<string>, dirPrefix: string, logger: Logger) {
+        const { client, collectionName } = db;
+        try {
+
+            const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
+            const filePrefix = `file://${cleanedDirPrefix}`;
+            
+            // Get all points that match the file prefix but are not metadata points
+            const response = await client.scroll(collectionName, {
+                limit: 10000,
+                with_payload: true,
+                with_vector: false,
+                filter: {
+                    must: [
+                        {
+                            key: "url",
+                            match: {
+                                text: `${filePrefix}`
+                            }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: "is_metadata",
+                            match: {
+                                value: true
+                            }
+                        }
+                    ]
+                }
+            });
+            
+            const obsoletePointIds = response.points
+                .filter((point: any) => {
+                    const url = point.payload?.url;
+                    // Double check it's not a metadata record
+                    if (point.payload?.is_metadata === true) {
+                        return false;
+                    }
+                    // Remove file:// prefix to match with processedFiles
+                    const filePath = url && url.startsWith('file://') ? url.substring(7) : '';
+                    return filePath && !processedFiles.has(filePath);
+                })
+                .map((point: any) => point.id);
+            
+            if (obsoletePointIds.length > 0) {
+                await client.delete(collectionName, {
+                    points: obsoletePointIds,
+                });
+                logger.info(`Deleted ${obsoletePointIds.length} obsolete chunks from Qdrant for directory ${dirPrefix}`);
+            } else {
+                logger.info(`No obsolete chunks to delete from Qdrant for directory ${dirPrefix}`);
+            }
+        } catch (error) {
+            logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+        }
+    }
     
     private isValidUuid(str: string): boolean {
         const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -919,7 +1232,7 @@ class Doc2Vec {
                         {
                             key: "url",
                             match: {
-                                text: urlPrefix + "*"
+                                text: urlPrefix
                             }
                         }
                     ],
