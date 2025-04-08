@@ -1,6 +1,6 @@
 # Doc2Vec
 
-This project provides a configurable tool (`doc2vec`) to crawl specified websites (typically documentation sites) and GitHub repositories, extract relevant content, convert it to Markdown, chunk it intelligently, generate vector embeddings using OpenAI, and store the chunks along with their embeddings in a vector database (SQLite with `sqlite-vec` or Qdrant).
+This project provides a configurable tool (`doc2vec`) to crawl specified websites (typically documentation sites), GitHub repositories, and local directories, extract relevant content, convert it to Markdown, chunk it intelligently, generate vector embeddings using OpenAI, and store the chunks along with their embeddings in a vector database (SQLite with `sqlite-vec` or Qdrant).
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
 
@@ -8,6 +8,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
+*   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
@@ -17,8 +18,8 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
 *   **Change Detection:** Uses content hashing to detect changes and only re-embeds and updates chunks that have actually been modified.
 *   **Incremental Updates:** For GitHub sources, tracks the last run date to only fetch new or updated issues.
-*   **Cleanup:** Removes obsolete chunks from the database corresponding to pages that are no longer found during a crawl.
-*   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, database types, metadata, and other parameters.
+*   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
+*   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, database types, metadata, and other parameters.
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
 
 ## Prerequisites
@@ -72,7 +73,7 @@ Configuration is managed through two files:
     **Structure:**
 
     *   `sources`: An array of source configurations.
-        *   `type`: Either `'website'` or `'github'`
+        *   `type`: Either `'website'`, `'github'`, or `'local_directory'`
         
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
@@ -81,7 +82,14 @@ Configuration is managed through two files:
         *   `repo`: Repository name in the format `'owner/repo'` (e.g., `'istio/istio'`).
         *   `start_date`: (Optional) Starting date to fetch issues from (e.g., `'2025-01-01'`).
         
-        Common configuration for both types:
+        For local directories (`type: 'local_directory'`):
+        *   `path`: Path to the local directory to process.
+        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt']`). Defaults to `['.md', '.txt', '.html', '.htm']`.
+        *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
+        *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
+        *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`).
+        
+        Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
         *   `version`: A string identifying the product version (used in metadata).
         *   `max_size`: Maximum raw content size (in characters). For websites, this limits the raw HTML fetched by Puppeteer. Recommending 1MB (1048576).
@@ -121,6 +129,19 @@ Configuration is managed through two files:
           params:
             db_path: './istio-issues.db'
       
+      # Local directory source example
+      - type: 'local_directory'
+        product_name: 'project-docs'
+        version: 'current'
+        path: './docs'
+        include_extensions: ['.md', '.txt']
+        recursive: true
+        max_size: 1048576
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './project-docs.db'
+      
       # Qdrant example
       - type: 'website'
         product_name: 'Istio'
@@ -158,6 +179,7 @@ The script will then:
 5.  Process each source according to its type:
     - For websites: Crawl the site, extract content, convert to Markdown
     - For GitHub repos: Fetch issues and comments, convert to Markdown
+    - For local directories: Scan files, process content (converting HTML to Markdown if needed)
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
@@ -192,7 +214,11 @@ The script will then:
           *   Fetch issues and comments using the GitHub API.
           *   Convert to formatted Markdown.
           *   Track last run date to support incremental updates.
-    3.  **Process Content:** For each processed page or issue:
+        - **For Local Directories:**
+          *   Recursively scan directories for files matching the configured extensions.
+          *   Read file content, converting HTML to Markdown if needed.
+          *   Process each file's content.
+    3.  **Process Content:** For each processed page, issue, or file:
         *   **Chunk:** Split Markdown into smaller `DocumentChunk` objects based on headings and size.
         *   **Hash Check:** Generate a hash of the chunk content. Check if a chunk with the same ID exists in the DB and if its hash matches.
         *   **Embed (if needed):** If the chunk is new or changed, call the OpenAI API (`createEmbeddings`) to get the vector embedding.
