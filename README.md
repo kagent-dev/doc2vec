@@ -87,6 +87,7 @@ Configuration is managed through two files:
         *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt']`). Defaults to `['.md', '.txt', '.html', '.htm']`.
         *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
+        *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
         *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`).
         
         Common configuration for all types:

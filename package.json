@@ -1,10 +1,19 @@
 {
     "name": "doc2vec",
     "version": "1.0.0",
+    "type": "commonjs",
     "description": "",
     "main": "doc2vec.ts",
+    "private": false,
+    "publishConfig": {
+    "access": "public"
+    },
+    "bin": {
+        "doc2vec": "dist/doc2vec.js"
+    },
     "scripts": {
-        "start": "ts-node doc2vec.ts"
+        "build": "tsc && chmod 755 dist/doc2vec.js",
+        "start": "node dist/doc2vec.js"
     },
     "keywords": [],
     "author": "",

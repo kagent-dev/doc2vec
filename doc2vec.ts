@@ -1,3 +1,5 @@
+#!/usr/bin/env ts-node
+
 import { Readability } from '@mozilla/readability';
 import axios from 'axios';
 import { load } from 'cheerio';
@@ -41,6 +43,7 @@ interface LocalDirectorySourceConfig extends BaseSourceConfig {
     exclude_extensions?: string[]; // File extensions to exclude
     recursive?: boolean;           // Whether to traverse subdirectories
     encoding?: BufferEncoding;     // File encoding (default: 'utf8')
+    url_rewrite_prefix?: string;   // Optional URL prefix to rewrite file:// URLs (e.g., 'https://mydomain.com')
 }
 
 // Configuration specific to website sources
@@ -723,8 +726,33 @@ class Doc2Vec {
                 
                 logger.info(`Processing content from ${filePath} (${content.length} chars)`);
                 try {
-                    // Use the file path as URL for tracking
-                    const fileUrl = `file://${filePath}`;
+                    // Generate URL based on configuration
+                    let fileUrl: string;
+                    
+                    if (config.url_rewrite_prefix) {
+                        // Replace local path with URL prefix
+                        const relativePath = path.relative(config.path, filePath).replace(/\\/g, '/');
+                        
+                        // If relativePath starts with '..', it means the file is outside the base directory
+                        if (relativePath.startsWith('..')) {
+                            // For files outside the configured path, use the default file:// scheme
+                            fileUrl = `file://${filePath}`;
+                            logger.debug(`File outside configured path, using default URL: ${fileUrl}`);
+                        } else {
+                            // For files inside the configured path, rewrite the URL
+                            // Handle trailing slashes in the URL prefix to avoid double slashes
+                            const prefix = config.url_rewrite_prefix.endsWith('/') 
+                                ? config.url_rewrite_prefix.slice(0, -1) 
+                                : config.url_rewrite_prefix;
+                                
+                            fileUrl = `${prefix}/${relativePath}`;
+                            logger.debug(`URL rewritten: ${filePath} -> ${fileUrl}`);
+                        }
+                    } else {
+                        // Use default file:// URL
+                        fileUrl = `file://${filePath}`;
+                    }
+                    
                     const chunks = await this.chunkMarkdown(content, config, fileUrl);
                     logger.info(`Created ${chunks.length} chunks`);
                     
@@ -804,15 +832,13 @@ class Doc2Vec {
             logger
         );
         
-        logger.info(`Found ${validChunkIds.size} valid chunks across processed files for ${config.path}`);
-        
         logger.section('CLEANUP');
         if (dbConnection.type === 'sqlite') {
             logger.info(`Running SQLite cleanup for local directory ${config.path}`);
-            this.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config.path, logger);
+            this.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config, logger);
         } else if (dbConnection.type === 'qdrant') {
             logger.info(`Running Qdrant cleanup for local directory ${config.path} in collection ${dbConnection.collectionName}`);
-            await this.removeObsoleteFilesQdrant(dbConnection, processedFiles, config.path, logger);
+            await this.removeObsoleteFilesQdrant(dbConnection, processedFiles, config, logger);
         }
         
         logger.info(`Finished processing local directory: ${config.path}`);
@@ -916,6 +942,160 @@ class Doc2Vec {
             logger.info(`Directory processed. Processed: ${processedFiles}, Skipped: ${skippedFiles}`);
         } catch (error) {
             logger.error(`Error reading directory ${dirPath}:`, error);
+        }
+    }
+
+    private removeObsoleteFilesSQLite(
+        db: Database, 
+        processedFiles: Set<string>, 
+        pathConfig: { path: string; url_rewrite_prefix?: string } | string, 
+        logger: Logger
+    ) {
+        const getChunksForPathStmt = db.prepare(`
+            SELECT chunk_id, url FROM vec_items
+            WHERE url LIKE ? || '%'
+        `);
+        const deleteChunkStmt = db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`);
+        
+        // Determine if we're using URL rewriting or direct file paths
+        const isRewriteMode = typeof pathConfig === 'object' && pathConfig.url_rewrite_prefix;
+        
+        // Set up the URL prefix for searching
+        let urlPrefix: string;
+        if (isRewriteMode) {
+            // Handle URL rewriting case
+            urlPrefix = (pathConfig as { path: string; url_rewrite_prefix?: string }).url_rewrite_prefix || '';
+            urlPrefix = urlPrefix.endsWith('/') ? urlPrefix.slice(0, -1) : urlPrefix;
+        } else {
+            // Handle direct file path case
+            const dirPrefix = typeof pathConfig === 'string' ? pathConfig : pathConfig.path;
+            const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
+            urlPrefix = `file://${cleanedDirPrefix}`;
+        }
+        
+        logger.debug(`Searching for chunks with URL prefix: ${urlPrefix}`);
+        const existingChunks = getChunksForPathStmt.all(urlPrefix) as { chunk_id: string; url: string }[];
+        let deletedCount = 0;
+        
+        const transaction = db.transaction(() => {
+            for (const { chunk_id, url } of existingChunks) {
+                // Skip if it's not from our URL prefix (safety check)
+                if (!url.startsWith(urlPrefix)) continue;
+                
+                let filePath: string;
+                let shouldDelete = false;
+                
+                if (isRewriteMode) {
+                    // URL rewrite mode: extract relative path and construct full file path
+                    const config = pathConfig as { path: string; url_rewrite_prefix?: string };
+                    const relativePath = url.substring(urlPrefix.length + 1); // +1 for the '/'
+                    filePath = path.join(config.path, relativePath);
+                    shouldDelete = !processedFiles.has(filePath);
+                } else {
+                    // Direct file path mode: remove file:// prefix to match with processedFiles
+                    filePath = url.substring(7); // Remove 'file://' prefix
+                    shouldDelete = !processedFiles.has(filePath);
+                }
+                
+                if (shouldDelete) {
+                    logger.debug(`Deleting obsolete chunk from SQLite: ${chunk_id.substring(0, 8)}... (File not processed: ${filePath})`);
+                    deleteChunkStmt.run(chunk_id);
+                    deletedCount++;
+                }
+            }
+        });
+        transaction();
+        
+        logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for URL prefix ${urlPrefix}`);
+    }
+
+    private async removeObsoleteFilesQdrant(
+        db: QdrantDB, 
+        processedFiles: Set<string>, 
+        pathConfig: { path: string; url_rewrite_prefix?: string } | string, 
+        logger: Logger
+    ) {
+        const { client, collectionName } = db;
+        try {
+            // Determine if we're using URL rewriting or direct file paths
+            const isRewriteMode = typeof pathConfig === 'object' && pathConfig.url_rewrite_prefix;
+            
+            // Set up the URL prefix for searching
+            let urlPrefix: string;
+            if (isRewriteMode) {
+                // Handle URL rewriting case
+                urlPrefix = (pathConfig as { path: string; url_rewrite_prefix?: string }).url_rewrite_prefix || '';
+                urlPrefix = urlPrefix.endsWith('/') ? urlPrefix.slice(0, -1) : urlPrefix;
+            } else {
+                // Handle direct file path case
+                const dirPrefix = typeof pathConfig === 'string' ? pathConfig : pathConfig.path;
+                const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
+                urlPrefix = `file://${cleanedDirPrefix}`;
+            }
+            
+            logger.debug(`Checking for obsolete chunks with URL prefix: ${urlPrefix}`);
+            const response = await client.scroll(collectionName, {
+                limit: 10000,
+                with_payload: true,
+                with_vector: false,
+                filter: {
+                    must: [
+                        {
+                            key: "url",
+                            match: {
+                                text: urlPrefix
+                            }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: "is_metadata",
+                            match: {
+                                value: true
+                            }
+                        }
+                    ]
+                }
+            });
+            
+            const obsoletePointIds = response.points
+                .filter((point: any) => {
+                    const url = point.payload?.url;
+                    // Double check it's not a metadata record
+                    if (point.payload?.is_metadata === true) {
+                        return false;
+                    }
+                    
+                    if (!url || !url.startsWith(urlPrefix)) {
+                        return false;
+                    }
+                    
+                    let filePath: string;
+                    
+                    if (isRewriteMode) {
+                        // URL rewrite mode: extract relative path and construct full file path
+                        const config = pathConfig as { path: string; url_rewrite_prefix?: string };
+                        const relativePath = url.substring(urlPrefix.length + 1); // +1 for the '/'
+                        filePath = path.join(config.path, relativePath);
+                    } else {
+                        // Direct file path mode: remove file:// prefix to match with processedFiles
+                        filePath = url.startsWith('file://') ? url.substring(7) : '';
+                    }
+                    
+                    return filePath && !processedFiles.has(filePath);
+                })
+                .map((point: any) => point.id);
+            
+            if (obsoletePointIds.length > 0) {
+                await client.delete(collectionName, {
+                    points: obsoletePointIds,
+                });
+                logger.info(`Deleted ${obsoletePointIds.length} obsolete chunks from Qdrant for URL prefix ${urlPrefix}`);
+            } else {
+                logger.info(`No obsolete chunks to delete from Qdrant for URL prefix ${urlPrefix}`);
+            }
+        } catch (error) {
+            logger.error(`Error removing obsolete chunks from Qdrant:`, error);
         }
     }
 
@@ -1113,93 +1293,6 @@ class Doc2Vec {
         transaction();
     
         logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for URL ${urlPrefix}`);
-    }
-
-    private removeObsoleteFilesSQLite(db: Database, processedFiles: Set<string>, dirPrefix: string, logger: Logger) {
-        const getChunksForDirStmt = db.prepare(`
-            SELECT chunk_id, url FROM vec_items
-            WHERE url LIKE 'file://%' AND url LIKE ?
-        `);
-        const deleteChunkStmt = db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`);
-        
-        const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
-        const filePrefix = `file://${cleanedDirPrefix}`;
-        
-        const existingChunks = getChunksForDirStmt.all(`${filePrefix}%`) as { chunk_id: string; url: string }[];
-        let deletedCount = 0;
-        
-        const transaction = db.transaction(() => {
-            for (const { chunk_id, url } of existingChunks) {
-                // Remove file:// prefix to match with processedFiles
-                const filePath = url.substring(7);
-                if (!processedFiles.has(filePath)) {
-                    logger.debug(`Deleting obsolete chunk from SQLite: ${chunk_id.substring(0, 8)}... (File not processed)`);
-                    deleteChunkStmt.run(chunk_id);
-                    deletedCount++;
-                }
-            }
-        });
-        transaction();
-        
-        logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for directory ${dirPrefix}`);
-    }
-    
-    private async removeObsoleteFilesQdrant(db: QdrantDB, processedFiles: Set<string>, dirPrefix: string, logger: Logger) {
-        const { client, collectionName } = db;
-        try {
-
-            const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
-            const filePrefix = `file://${cleanedDirPrefix}`;
-            
-            // Get all points that match the file prefix but are not metadata points
-            const response = await client.scroll(collectionName, {
-                limit: 10000,
-                with_payload: true,
-                with_vector: false,
-                filter: {
-                    must: [
-                        {
-                            key: "url",
-                            match: {
-                                text: `${filePrefix}`
-                            }
-                        }
-                    ],
-                    must_not: [
-                        {
-                            key: "is_metadata",
-                            match: {
-                                value: true
-                            }
-                        }
-                    ]
-                }
-            });
-            
-            const obsoletePointIds = response.points
-                .filter((point: any) => {
-                    const url = point.payload?.url;
-                    // Double check it's not a metadata record
-                    if (point.payload?.is_metadata === true) {
-                        return false;
-                    }
-                    // Remove file:// prefix to match with processedFiles
-                    const filePath = url && url.startsWith('file://') ? url.substring(7) : '';
-                    return filePath && !processedFiles.has(filePath);
-                })
-                .map((point: any) => point.id);
-            
-            if (obsoletePointIds.length > 0) {
-                await client.delete(collectionName, {
-                    points: obsoletePointIds,
-                });
-                logger.info(`Deleted ${obsoletePointIds.length} obsolete chunks from Qdrant for directory ${dirPrefix}`);
-            } else {
-                logger.info(`No obsolete chunks to delete from Qdrant for directory ${dirPrefix}`);
-            }
-        } catch (error) {
-            logger.error(`Error removing obsolete chunks from Qdrant:`, error);
-        }
     }
     
     private isValidUuid(str: string): boolean {
