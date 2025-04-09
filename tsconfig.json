@@ -14,5 +14,5 @@
       "moduleResolution": "node"
     },
     "include": ["**/*.ts"],
-    "exclude": ["node_modules", "mcp", "solo-reference-architectures"]
+    "exclude": ["node_modules", "mcp"]
   }

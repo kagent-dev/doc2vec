@@ -1,5 +1,7 @@
 # Doc2Vec
 
+[![npm version](https://img.shields.io/npm/v/doc2vec.svg)](https://www.npmjs.com/package/doc2vec)
+
 This project provides a configurable tool (`doc2vec`) to crawl specified websites (typically documentation sites), GitHub repositories, and local directories, extract relevant content, convert it to Markdown, chunk it intelligently, generate vector embeddings using OpenAI, and store the chunks along with their embeddings in a vector database (SQLite with `sqlite-vec` or Qdrant).
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
@@ -195,6 +197,24 @@ The script will then:
 ### Qdrant (`database_config.type: 'qdrant'`)
 *   Uses `@qdrant/js-client-rest`.
 *   Requires `qdrant_url`, `qdrant_port`, `collection_name` and potentially `QDRANT_API_KEY`.
+
+## Now Available via npx
+
+You can run `doc2vec` without cloning the repo or installing it globally. Just use:
+
+```bash
+npx doc2vec [path/to/your/config.yaml]
+```
+
+This will:
+
+1. Fetch the latest version of doc2vec from npm.
+
+2. Load and process the sources defined in your config.yaml.
+
+3. Generate, embed, and store documentation chunks in the configured database(s).
+
+If you don’t specify a config path, it will look for config.yaml in the current working directory.
 
 ## Core Logic Flow
 
