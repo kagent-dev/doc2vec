@@ -1,4 +1,4 @@
-#!/usr/bin/env ts-node
+#!/usr/bin/env node
 
 import { Readability } from '@mozilla/readability';
 import axios from 'axios';
