@@ -1,6 +1,6 @@
 {
     "name": "doc2vec",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "type": "commonjs",
     "description": "",
     "main": "doc2vec.ts",
@@ -13,7 +13,9 @@
     },
     "scripts": {
         "build": "tsc && chmod 755 dist/doc2vec.js",
-        "start": "node dist/doc2vec.js"
+        "start": "node dist/doc2vec.js",
+        "prepublishOnly": "npm run build",
+        "prepare": "npm run build"
     },
     "keywords": [],
     "author": "",
