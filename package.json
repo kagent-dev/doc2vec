@@ -1,6 +1,6 @@
 {
     "name": "doc2vec",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "type": "commonjs",
     "description": "",
     "main": "doc2vec.ts",
