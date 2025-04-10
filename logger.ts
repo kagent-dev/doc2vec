@@ -78,17 +78,28 @@ enum LogLevel {
       
       const levelFormatted = `[${level.padEnd(5)}]`;
       
-      const formattedMessage = `${timestamp}${levelFormatted} ${modulePrefix}${message}`;
-      
+      let formattedMessage = `${timestamp}${levelFormatted} ${modulePrefix}${message}`;
+  
       if (args.length > 0) {
+        const argsString = args.map(arg => {
+          if (arg instanceof Error) {
+            return `\n--- Error Details ---\nMessage: ${arg.message}\nStack:\n${arg.stack}\n--- End Error ---`;
+          } 
+          else if (this.config.prettyPrint && typeof arg === 'object' && arg !== null) {
+            try {
+              return JSON.stringify(arg, null, 2);
+            } catch (e) {
+              return "[Unserializable Object]"; 
+            }
+          } else {
+            return String(arg); 
+          }
+        }).join('\n');
+  
         if (this.config.prettyPrint) {
-          return `${formattedMessage}\n${args.map(arg => 
-            typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
-          ).join('\n')}`;
+           formattedMessage += `\n${argsString}`; 
         } else {
-          return `${formattedMessage} ${args.map(arg => 
-            typeof arg === 'object' ? JSON.stringify(arg) : arg
-          ).join(' ')}`;
+           formattedMessage += ` ${args.map(String).join(' ')}`;
         }
       }
       

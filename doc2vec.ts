@@ -1467,10 +1467,11 @@ class Doc2Vec {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing page content from ${url}`);
     
-        const browser: Browser = await puppeteer.launch({
-            args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        });
+        let browser: Browser | null = null;
         try {
+            browser = await puppeteer.launch({
+                args: ['--no-sandbox', '--disable-setuid-sandbox'],
+            });
             const page: Page = await browser.newPage();
             logger.debug(`Navigating to ${url}`);
             await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
