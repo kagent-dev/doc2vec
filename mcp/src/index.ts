@@ -40,10 +40,14 @@ export interface QueryResult {
 
 async function createEmbeddings(text: string): Promise<number[]> {
     try {
+        console.log("Calling OpenAI embeddings API...");
+        const startTime = Date.now();
         const response = await openai.embeddings.create({
             model: 'text-embedding-3-large', // Or your preferred model
             input: text,
         });
+        const duration = Date.now() - startTime;
+        console.log(`OpenAI embeddings received in ${duration}ms.`);
         if (!response.data?.[0]?.embedding) {
             throw new Error("Failed to get embedding from OpenAI response.");
         }
@@ -64,7 +68,9 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
     let db: DatabaseType | null = null;
     try {
         db = new Database(dbPath);
+        console.log(`[DB ${dbPath}] Opened connection.`);
         sqliteVec.load(db);
+        console.log(`[DB ${dbPath}] sqliteVec loaded.`);
         let query = `
               SELECT
                   *,
@@ -80,12 +86,16 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
               LIMIT @top_k;`;
       
         const stmt = db.prepare(query);
+        console.log(`[DB ${dbPath}] Query prepared. Executing...`);
+        const startTime = Date.now();
         const rows = stmt.all({
           query_embedding: new Float32Array(queryEmbedding),
           product_name: filter.product_name,
           version: filter.version,
           top_k: topK,
         });
+        const duration = Date.now() - startTime;
+        console.log(`[DB ${dbPath}] Query executed in ${duration}ms. Found ${rows.length} rows.`);
       
         rows.forEach((row: any) => {
           delete row.embedding;
@@ -156,6 +166,7 @@ server.tool(
             ).join("\n");
 
             const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
+            console.log(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
 
             return {
                 content: [{ type: "text", text: responseText }],
@@ -195,6 +206,9 @@ app.post("/messages", async (req: Request, res: Response) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+
+const webserver = app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
 });
+
+webserver.keepAliveTimeout = 3000;
