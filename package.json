@@ -1,12 +1,12 @@
 {
     "name": "doc2vec",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "type": "commonjs",
     "description": "",
     "main": "doc2vec.ts",
     "private": false,
     "publishConfig": {
-    "access": "public"
+        "access": "public"
     },
     "bin": {
         "doc2vec": "dist/doc2vec.js"
@@ -25,7 +25,7 @@
         "@qdrant/js-client-rest": "^1.13.0",
         "@qdrant/qdrant-js": "^1.13.0",
         "axios": "^1.6.2",
-        "better-sqlite3": "^9.1.1",
+        "better-sqlite3": "^11.9.1",
         "chalk": "^5.4.1",
         "cheerio": "^1.0.0-rc.12",
         "dotenv": "^16.3.1",

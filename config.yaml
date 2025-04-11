@@ -77,6 +77,7 @@ sources:
     product_name: 'gloo-mesh-core'
     version: 'latest'
     url: 'https://docs.solo.io/gloo-mesh/latest/'
+    sitemap_url: 'https://docs.solo.io/gloo-mesh/sitemap.xml'
     max_size: 1048576
     database_config:
       type: 'sqlite'
@@ -87,6 +88,7 @@ sources:
     product_name: 'gloo-mesh-enterprise'
     version: 'latest'
     url: 'https://docs.solo.io/gloo-mesh-enterprise/latest/'
+    sitemap_url: 'https://docs.solo.io/gloo-mesh-enterprise/sitemap.xml'
     max_size: 1048576
     database_config:
       type: 'sqlite'
@@ -107,6 +109,7 @@ sources:
     product_name: 'gloo-gateway'
     version: 'latest'
     url: 'https://docs.solo.io/gateway/latest/'
+    sitemap_url: 'https://docs.solo.io/gateway/sitemap.xml'
     max_size: 1048576
     database_config:
       type: 'sqlite'

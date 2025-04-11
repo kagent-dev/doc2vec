@@ -50,6 +50,7 @@ interface LocalDirectorySourceConfig extends BaseSourceConfig {
 interface WebsiteSourceConfig extends BaseSourceConfig {
     type: 'website';
     url: string;
+    sitemap_url?: string; // Optional sitemap URL to extract additional URLs to crawl
 }
 
 // Configuration specific to GitHub repo sources
@@ -1364,6 +1365,46 @@ class Doc2Vec {
         }
     }
 
+    private async parseSitemap(sitemapUrl: string, logger: Logger): Promise<string[]> {
+        logger.info(`Parsing sitemap from ${sitemapUrl}`);
+        try {
+            const response = await axios.get(sitemapUrl);
+            const $ = load(response.data, { xmlMode: true });
+            
+            const urls: string[] = [];
+            
+            // Handle standard sitemaps
+            $('url > loc').each((_, element) => {
+                const url = $(element).text().trim();
+                if (url) {
+                    urls.push(url);
+                }
+            });
+            
+            // Handle sitemap indexes (sitemaps that link to other sitemaps)
+            const sitemapLinks: string[] = [];
+            $('sitemap > loc').each((_, element) => {
+                const nestedSitemapUrl = $(element).text().trim();
+                if (nestedSitemapUrl) {
+                    sitemapLinks.push(nestedSitemapUrl);
+                }
+            });
+            
+            // Recursively process nested sitemaps
+            for (const nestedSitemapUrl of sitemapLinks) {
+                logger.debug(`Found nested sitemap: ${nestedSitemapUrl}`);
+                const nestedUrls = await this.parseSitemap(nestedSitemapUrl, logger);
+                urls.push(...nestedUrls);
+            }
+            
+            logger.info(`Found ${urls.length} URLs in sitemap ${sitemapUrl}`);
+            return urls;
+        } catch (error) {
+            logger.error(`Error parsing sitemap at ${sitemapUrl}:`, error);
+            return [];
+        }
+    }
+
     private async crawlWebsite(
         baseUrl: string,
         sourceConfig: WebsiteSourceConfig,
@@ -1373,8 +1414,24 @@ class Doc2Vec {
     ): Promise<void> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
+        
+        // Process sitemap if provided
+        if (sourceConfig.sitemap_url) {
+            logger.section('SITEMAP PROCESSING');
+            const sitemapUrls = await this.parseSitemap(sourceConfig.sitemap_url, logger);
+            
+            // Add sitemap URLs to the queue if they're within the website scope
+            for (const url of sitemapUrls) {
+                if (url.startsWith(sourceConfig.url) && !queue.includes(url)) {
+                    logger.debug(`Adding URL from sitemap to queue: ${url}`);
+                    queue.push(url);
+                }
+            }
+            
+            logger.info(`Added ${queue.length - 1} URLs from sitemap to the crawl queue`);
+        }
     
-        logger.info(`Starting crawl from ${baseUrl}`);
+        logger.info(`Starting crawl from ${baseUrl} with ${queue.length} URLs in initial queue`);
         let processedCount = 0;
         let skippedCount = 0;
         let skippedSizeCount = 0;

@@ -9,6 +9,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 ## Key Features
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
+    * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
@@ -79,6 +80,7 @@ Configuration is managed through two files:
         
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
+        *   `sitemap_url`: (Optional) URL to the site's XML sitemap for discovering additional pages not linked in navigation.
         
         For GitHub repositories (`type: 'github'`):
         *   `repo`: Repository name in the format `'owner/repo'` (e.g., `'istio/istio'`).
@@ -114,6 +116,7 @@ Configuration is managed through two files:
         product_name: 'argo'
         version: 'stable'
         url: 'https://argo-cd.readthedocs.io/en/stable/'
+        sitemap_url: 'https://argo-cd.readthedocs.io/en/stable/sitemap.xml'
         max_size: 1048576
         database_config:
           type: 'sqlite'
@@ -180,7 +183,7 @@ The script will then:
 3.  Iterate through each source defined in the config.
 4.  Initialize the specified database connection.
 5.  Process each source according to its type:
-    - For websites: Crawl the site, extract content, convert to Markdown
+    - For websites: Crawl the site, process any sitemaps, extract content, convert to Markdown
     - For GitHub repos: Fetch issues and comments, convert to Markdown
     - For local directories: Scan files, process content (converting HTML to Markdown if needed)
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
@@ -214,7 +217,7 @@ This will:
 
 3. Generate, embed, and store documentation chunks in the configured database(s).
 
-If you don’t specify a config path, it will look for config.yaml in the current working directory.
+If you don't specify a config path, it will look for config.yaml in the current working directory.
 
 ## Core Logic Flow
 
@@ -225,6 +228,7 @@ If you don’t specify a config path, it will look for config.yaml in the curren
     2.  **Process by Source Type:**
         - **For Websites:**
           *   Start at the base `url`.
+          *   If `sitemap_url` is provided, fetch and parse the sitemap to extract additional URLs.
           *   Use Puppeteer (`processPage`) to fetch and render HTML.
           *   Use Readability to extract main content.
           *   Sanitize HTML.
