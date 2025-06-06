@@ -1,5 +1,20 @@
 # Doc2Vec Configuration
 sources:
+  - type: local_directory
+    product_name: 'solo-reference-architectures'
+    version: 'latest'
+    path: './solo-reference-architectures'
+    include_extensions: ['.md']
+    exclude_extensions: []
+    recursive: true
+    url_rewrite_prefix: https://github.com/solo-io/solo-reference-architectures/blob/main
+    max_size: 1048576
+    database_config:
+      type: 'qdrant'
+      params:
+        qdrant_url: 'https://qdrant.is.solo.io'
+        qdrant_port: 443
+        collection_name: 'github-solo-reference-architectures-tmp'
   # GitHub Sources
   - type: github
     product_name: 'istio'
