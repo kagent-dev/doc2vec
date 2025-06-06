@@ -199,6 +199,7 @@ export class ContentProcessor {
         let processedCount = 0;
         let skippedCount = 0;
         let skippedSizeCount = 0;
+        let pdfProcessedCount = 0;
         let errorCount = 0;
 
         while (queue.length > 0) {
@@ -221,44 +222,71 @@ export class ContentProcessor {
 
                 if (content !== null) {
                     await processPageContent(url, content);
-                    processedCount++;
+                    if (Utils.isPdfUrl(url)) {
+                        pdfProcessedCount++;
+                    } else {
+                        processedCount++;
+                    }
                 } else {
                     skippedSizeCount++;
                 }
 
-                const response = await axios.get(url);
-                const $ = load(response.data);
+                // Only try to extract links from HTML pages, not PDFs
+                if (!Utils.isPdfUrl(url)) {
+                    const response = await axios.get(url);
+                    const $ = load(response.data);
 
-                logger.debug(`Finding links on page ${url}`);
-                let newLinksFound = 0;
+                    logger.debug(`Finding links on page ${url}`);
+                    let newLinksFound = 0;
 
-                $('a[href]').each((_, element) => {
-                    const href = $(element).attr('href');
-                    if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
+                    $('a[href]').each((_, element) => {
+                        const href = $(element).attr('href');
+                        if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
 
-                    const fullUrl = Utils.buildUrl(href, url);
-                    if (fullUrl.startsWith(sourceConfig.url) && !visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
-                         if (!queue.includes(fullUrl)) {
-                             queue.push(fullUrl);
-                             newLinksFound++;
-                         }
-                    }
-                });
+                        const fullUrl = Utils.buildUrl(href, url);
+                        if (fullUrl.startsWith(sourceConfig.url) && !visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
+                             if (!queue.includes(fullUrl)) {
+                                 queue.push(fullUrl);
+                                 newLinksFound++;
+                             }
+                        }
+                    });
 
-                logger.debug(`Found ${newLinksFound} new links on ${url}`);
+                    logger.debug(`Found ${newLinksFound} new links on ${url}`);
+                }
             } catch (error) {
-                logger.error(`Failed during link discovery or initial fetch for ${url}:`, error);
+                logger.error(`Failed during processing or link discovery for ${url}:`, error);
                 errorCount++;
             }
         }
 
-        logger.info(`Crawl completed. Processed: ${processedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
+        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
     }
 
     async processPage(url: string, sourceConfig: SourceConfig): Promise<string | null> {
         const logger = this.logger.child('page-processor');
-        logger.debug(`Processing page content from ${url}`);
+        logger.debug(`Processing content from ${url}`);
 
+        // Check if this is a PDF URL
+        if (Utils.isPdfUrl(url)) {
+            logger.info(`Processing PDF: ${url}`);
+            try {
+                const markdown = await this.downloadAndConvertPdfFromUrl(url, logger);
+                
+                // Check size limit for PDF content
+                if (markdown.length > sourceConfig.max_size) {
+                    logger.warn(`PDF content (${markdown.length} chars) exceeds max size (${sourceConfig.max_size}). Skipping ${url}.`);
+                    return null;
+                }
+                
+                return markdown;
+            } catch (error) {
+                logger.error(`Failed to process PDF ${url}:`, error);
+                return null;
+            }
+        }
+
+        // Original HTML page processing logic
         let browser: Browser | null = null;
         try {
             browser = await puppeteer.launch({
@@ -419,6 +447,103 @@ export class ContentProcessor {
             
         } catch (error) {
             logger.error(`Failed to convert PDF ${filePath}:`, error);
+            throw error;
+        }
+    }
+
+    private async downloadAndConvertPdfFromUrl(url: string, logger: Logger): Promise<string> {
+        logger.debug(`Downloading and converting PDF from URL: ${url}`);
+        
+        try {
+            // Download the PDF file
+            const response = await axios.get(url, {
+                responseType: 'arraybuffer',
+                timeout: 60000, // 60 second timeout
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; doc2vec PDF processor)'
+                }
+            });
+            
+            if (response.status !== 200) {
+                throw new Error(`Failed to download PDF: HTTP ${response.status}`);
+            }
+            
+            logger.debug(`Downloaded PDF (${response.data.byteLength} bytes)`);
+            
+            // Dynamic import for PDF.js to handle ES module compatibility
+            const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+            
+            // Convert ArrayBuffer to Uint8Array
+            const pdfData = new Uint8Array(response.data);
+            
+            // Load the PDF document
+            const loadingTask = pdfjsLib.getDocument({
+                data: pdfData,
+                // Disable worker to avoid issues in Node.js environment
+                useWorkerFetch: false,
+                isEvalSupported: false,
+                useSystemFonts: true
+            });
+            
+            const pdfDocument = await loadingTask.promise;
+            const numPages = pdfDocument.numPages;
+            
+            logger.debug(`PDF has ${numPages} pages`);
+            
+            // Get the filename from URL for the title
+            const urlPath = new URL(url).pathname;
+            const filename = path.basename(urlPath, '.pdf') || 'document';
+            let markdown = `# ${filename}\n\n`;
+            
+            // Extract text from each page
+            for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                const page = await pdfDocument.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                
+                // Combine text items into a readable format
+                let pageText = '';
+                let currentY = -1;
+                
+                for (const item of textContent.items) {
+                    if ('str' in item) {
+                        // If this is a new line (different Y position), add a line break
+                        if (currentY !== -1 && Math.abs(item.transform[5] - currentY) > 5) {
+                            pageText += '\n';
+                        }
+                        
+                        pageText += item.str;
+                        
+                        // Add space if the next item doesn't start immediately after this one
+                        if ('width' in item && item.width > 0) {
+                            pageText += ' ';
+                        }
+                        
+                        currentY = item.transform[5];
+                    }
+                }
+                
+                // Clean up the text
+                pageText = pageText
+                    .replace(/\s+/g, ' ') // Replace multiple whitespace with single space
+                    .replace(/\n\s+/g, '\n') // Clean up line starts
+                    .trim();
+                
+                if (pageText.length > 0) {
+                    if (numPages > 1) {
+                        markdown += `## Page ${pageNum}\n\n`;
+                    }
+                    markdown += pageText + '\n\n';
+                }
+            }
+            
+            // Clean up the final markdown
+            markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+            
+            logger.debug(`Converted PDF to ${markdown.length} characters of markdown`);
+            return markdown;
+            
+        } catch (error) {
+            logger.error(`Failed to download and convert PDF from ${url}:`, error);
             throw error;
         }
     }

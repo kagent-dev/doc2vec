@@ -48,7 +48,18 @@ export class Utils {
         const ext = path.extname(pathname);
 
         if (!ext) return true;
-        return ['.html', '.htm'].includes(ext.toLowerCase());
+        return ['.html', '.htm', '.pdf'].includes(ext.toLowerCase());
+    }
+
+    static isPdfUrl(url: string): boolean {
+        try {
+            const parsedUrl = new URL(url);
+            const pathname = parsedUrl.pathname;
+            const ext = path.extname(pathname);
+            return ext.toLowerCase() === '.pdf';
+        } catch (error) {
+            return false;
+        }
     }
 
     static isValidUuid(str: string): boolean {

@@ -10,6 +10,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
     * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation.
+    * **PDF Support:** Automatically downloads and processes PDF files linked from websites.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
@@ -184,7 +185,7 @@ The script will then:
 3.  Iterate through each source defined in the config.
 4.  Initialize the specified database connection.
 5.  Process each source according to its type:
-    - For websites: Crawl the site, process any sitemaps, extract content, convert to Markdown
+    - For websites: Crawl the site, process any sitemaps, extract content from HTML pages and download/process PDF files, convert to Markdown
     - For GitHub repos: Fetch issues and comments, convert to Markdown
     - For local directories: Scan files, process content (converting HTML and PDF files to Markdown if needed)
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
@@ -204,12 +205,14 @@ The script will then:
 
 ## PDF Processing
 
-Doc2Vec includes built-in support for processing PDF files in local directories. PDF files are automatically detected by their `.pdf` extension and processed using [Mozilla's PDF.js](https://github.com/mozilla/pdf.js) library.
+Doc2Vec includes built-in support for processing PDF files in both local directories and websites. PDF files are automatically detected by their `.pdf` extension and processed using [Mozilla's PDF.js](https://github.com/mozilla/pdf.js) library.
 
 ### Features
 *   **Automatic Text Extraction:** Extracts text content from all pages in PDF documents
 *   **Markdown Conversion:** Converts extracted text to clean Markdown format with proper structure
 *   **Multi-page Support:** For multi-page PDFs, each page becomes a separate section with page headers
+*   **Website Integration:** Automatically downloads and processes PDFs linked from websites during crawling
+*   **Local File Support:** Processes PDF files found in local directories alongside other documents
 *   **Size Management:** Respects configured size limits to prevent processing of extremely large documents
 *   **Error Handling:** Graceful handling of corrupted or unsupported PDF files
 
@@ -223,6 +226,18 @@ Doc2Vec includes built-in support for processing PDF files in local directories.
     include_extensions: ['.md', '.txt', '.pdf']
     ```
 *   **Performance:** PDF processing is CPU-intensive. Large PDFs may take several seconds to process.
+*   **Website Configuration:** For websites that may contain PDFs, use larger size limits:
+    ```yaml
+    - type: 'website'
+      product_name: 'documentation'
+      version: 'latest'
+      url: 'https://docs.example.com/'
+      max_size: 10485760  # 10MB to handle PDFs
+      database_config:
+        type: 'sqlite'
+        params:
+          db_path: './docs.db'
+    ```
 
 ### Example Output
 A PDF file named "user-guide.pdf" will be converted to Markdown format like:
@@ -266,11 +281,11 @@ If you don't specify a config path, it will look for config.yaml in the current 
         - **For Websites:**
           *   Start at the base `url`.
           *   If `sitemap_url` is provided, fetch and parse the sitemap to extract additional URLs.
-          *   Use Puppeteer (`processPage`) to fetch and render HTML.
-          *   Use Readability to extract main content.
-          *   Sanitize HTML.
-          *   Convert HTML to Markdown using Turndown.
-          *   Use `axios`/`cheerio` on the *original* fetched page (before Puppeteer) to find new links to add to the crawl queue.
+          *   Use Puppeteer (`processPage`) to fetch and render HTML for web pages.
+          *   For PDF URLs, download and extract text using Mozilla's PDF.js.
+          *   Use Readability to extract main content from HTML pages.
+          *   Sanitize HTML and convert to Markdown using Turndown.
+          *   Use `axios`/`cheerio` on HTML pages to find new links to add to the crawl queue.
           *   Keep track of all visited URLs.
         - **For GitHub Repositories:**
           *   Fetch issues and comments using the GitHub API.
