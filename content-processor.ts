@@ -175,7 +175,7 @@ export class ContentProcessor {
         processPageContent: (url: string, content: string) => Promise<void>,
         parentLogger: Logger,
         visitedUrls: Set<string>
-    ): Promise<void> {
+    ): Promise<{ hasNetworkErrors: boolean }> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
         
@@ -201,6 +201,7 @@ export class ContentProcessor {
         let skippedSizeCount = 0;
         let pdfProcessedCount = 0;
         let errorCount = 0;
+        let hasNetworkErrors = false;
 
         while (queue.length > 0) {
             const url = queue.shift();
@@ -254,13 +255,61 @@ export class ContentProcessor {
 
                     logger.debug(`Found ${newLinksFound} new links on ${url}`);
                 }
-            } catch (error) {
+            } catch (error: any) {
                 logger.error(`Failed during processing or link discovery for ${url}:`, error);
                 errorCount++;
+                
+                // Check if this is a network error (DNS resolution, connection issues, etc.)
+                if (this.isNetworkError(error)) {
+                    hasNetworkErrors = true;
+                    logger.warn(`Network error detected for ${url}, this may affect cleanup decisions`);
+                }
             }
         }
 
         logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
+        
+        if (hasNetworkErrors) {
+            logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');
+        }
+        
+        return { hasNetworkErrors };
+    }
+
+    private isNetworkError(error: any): boolean {
+        // Check for common network error patterns
+        if (error?.code) {
+            // DNS resolution errors
+            if (error.code === 'ENOTFOUND') return true;
+            // Connection refused
+            if (error.code === 'ECONNREFUSED') return true;
+            // Connection timeout
+            if (error.code === 'ETIMEDOUT') return true;
+            // Connection reset
+            if (error.code === 'ECONNRESET') return true;
+            // Host unreachable
+            if (error.code === 'EHOSTUNREACH') return true;
+            // Network unreachable
+            if (error.code === 'ENETUNREACH') return true;
+        }
+        
+        // Check for axios-specific network errors
+        if (error?.isAxiosError) {
+            // If there's no response, it's likely a network error
+            if (!error.response) return true;
+        }
+        
+        // Check error message for network-related terms
+        const errorMessage = error?.message?.toLowerCase() || '';
+        if (errorMessage.includes('getaddrinfo') || 
+            errorMessage.includes('network') || 
+            errorMessage.includes('timeout') ||
+            errorMessage.includes('connection') ||
+            errorMessage.includes('dns')) {
+            return true;
+        }
+        
+        return false;
     }
 
     async processPage(url: string, sourceConfig: SourceConfig): Promise<string | null> {

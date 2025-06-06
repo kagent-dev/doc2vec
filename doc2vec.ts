@@ -295,7 +295,7 @@ class Doc2Vec {
         
         logger.section('CRAWL AND EMBEDDING');
 
-        await this.contentProcessor.crawlWebsite(config.url, config, async (url, content) => {
+        const crawlResult = await this.contentProcessor.crawlWebsite(config.url, config, async (url, content) => {
             visitedUrls.add(url);
 
             logger.info(`Processing content from ${url} (${content.length} chars markdown)`);
@@ -316,14 +316,14 @@ class Doc2Vec {
                         const chunkHash = Utils.generateHash(chunk.content);
 
                         if (dbConnection.type === 'sqlite') {
-                             const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                             const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+                            const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
+                            const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
 
-                             if (existing && existing.hash === chunkHash) {
-                                 needsEmbedding = false;
-                                 chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                 logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                             }
+                            if (existing && existing.hash === chunkHash) {
+                                needsEmbedding = false;
+                                chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
+                                logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                            }
                         } else if (dbConnection.type === 'qdrant') {
                             try {
                                 let pointId: string;
@@ -383,12 +383,17 @@ class Doc2Vec {
         logger.info(`Found ${validChunkIds.size} valid chunks across processed pages for ${config.url}`);
 
         logger.section('CLEANUP');
-        if (dbConnection.type === 'sqlite') {
-            logger.info(`Running SQLite cleanup for ${urlPrefix}`);
-            DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);
-        } else if (dbConnection.type === 'qdrant') {
-            logger.info(`Running Qdrant cleanup for ${urlPrefix} in collection ${dbConnection.collectionName}`);
-            await DatabaseManager.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
+        
+        if (crawlResult.hasNetworkErrors) {
+            logger.warn('Skipping cleanup due to network errors encountered during crawling. This prevents removal of valid chunks when the site is temporarily unreachable.');
+        } else {
+            if (dbConnection.type === 'sqlite') {
+                logger.info(`Running SQLite cleanup for ${urlPrefix}`);
+                DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);
+            } else if (dbConnection.type === 'qdrant') {
+                logger.info(`Running Qdrant cleanup for ${urlPrefix} in collection ${dbConnection.collectionName}`);
+                await DatabaseManager.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
+            }
         }
 
         logger.info(`Finished processing website: ${config.url}`);
