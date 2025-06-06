@@ -11,7 +11,7 @@ export interface BaseSourceConfig {
 export interface LocalDirectorySourceConfig extends BaseSourceConfig {
     type: 'local_directory';
     path: string;                  // Path to the local directory
-    include_extensions?: string[]; // File extensions to include (e.g., ['.md', '.txt'])
+    include_extensions?: string[]; // File extensions to include (e.g., ['.md', '.txt', '.pdf'])
     exclude_extensions?: string[]; // File extensions to exclude
     recursive?: boolean;           // Whether to traverse subdirectories
     encoding?: BufferEncoding;     // File encoding (default: 'utf8')

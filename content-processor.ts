@@ -343,6 +343,86 @@ export class ContentProcessor {
         this.markCodeParents(node.parentElement);
     }
 
+    private async convertPdfToMarkdown(filePath: string, logger: Logger): Promise<string> {
+        logger.debug(`Converting PDF to markdown: ${filePath}`);
+        
+        try {
+            // Dynamic import for PDF.js to handle ES module compatibility
+            const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+            
+            // Read the PDF file as a buffer and convert to Uint8Array
+            const pdfBuffer = fs.readFileSync(filePath);
+            const pdfData = new Uint8Array(pdfBuffer);
+            
+            // Load the PDF document
+            const loadingTask = pdfjsLib.getDocument({
+                data: pdfData,
+                // Disable worker to avoid issues in Node.js environment
+                useWorkerFetch: false,
+                isEvalSupported: false,
+                useSystemFonts: true
+            });
+            
+            const pdfDocument = await loadingTask.promise;
+            const numPages = pdfDocument.numPages;
+            
+            logger.debug(`PDF has ${numPages} pages`);
+            
+            let markdown = `# ${path.basename(filePath, '.pdf')}\n\n`;
+            
+            // Extract text from each page
+            for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                const page = await pdfDocument.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                
+                // Combine text items into a readable format
+                let pageText = '';
+                let currentY = -1;
+                
+                for (const item of textContent.items) {
+                    if ('str' in item) {
+                        // If this is a new line (different Y position), add a line break
+                        if (currentY !== -1 && Math.abs(item.transform[5] - currentY) > 5) {
+                            pageText += '\n';
+                        }
+                        
+                        pageText += item.str;
+                        
+                        // Add space if the next item doesn't start immediately after this one
+                        if ('width' in item && item.width > 0) {
+                            pageText += ' ';
+                        }
+                        
+                        currentY = item.transform[5];
+                    }
+                }
+                
+                // Clean up the text
+                pageText = pageText
+                    .replace(/\s+/g, ' ') // Replace multiple whitespace with single space
+                    .replace(/\n\s+/g, '\n') // Clean up line starts
+                    .trim();
+                
+                if (pageText.length > 0) {
+                    if (numPages > 1) {
+                        markdown += `## Page ${pageNum}\n\n`;
+                    }
+                    markdown += pageText + '\n\n';
+                }
+            }
+            
+            // Clean up the final markdown
+            markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+            
+            logger.debug(`Converted PDF to ${markdown.length} characters of markdown`);
+            return markdown;
+            
+        } catch (error) {
+            logger.error(`Failed to convert PDF ${filePath}:`, error);
+            throw error;
+        }
+    }
+
     async processDirectory(
         dirPath: string,
         config: LocalDirectorySourceConfig,
@@ -354,7 +434,7 @@ export class ContentProcessor {
         logger.info(`Processing directory: ${dirPath}`);
         
         const recursive = config.recursive !== undefined ? config.recursive : true;
-        const includeExtensions = config.include_extensions || ['.md', '.txt', '.html', '.htm'];
+        const includeExtensions = config.include_extensions || ['.md', '.txt', '.html', '.htm', '.pdf'];
         const excludeExtensions = config.exclude_extensions || [];
         const encoding = config.encoding || 'utf8' as BufferEncoding;
         
@@ -399,35 +479,52 @@ export class ContentProcessor {
                     
                     try {
                         logger.info(`Reading file: ${filePath}`);
-                        const content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
                         
-                        if (content.length > config.max_size) {
-                            logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
-                            skippedFiles++;
-                            continue;
+                        let content: string;
+                        let processedContent: string;
+                        
+                        if (extension === '.pdf') {
+                            // Handle PDF files
+                            logger.debug(`Processing PDF file: ${filePath}`);
+                            processedContent = await this.convertPdfToMarkdown(filePath, logger);
+                        } else {
+                            // Handle text-based files
+                            content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
+                            
+                            if (content.length > config.max_size) {
+                                logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                                skippedFiles++;
+                                continue;
+                            }
+                            
+                            // Convert HTML to Markdown if needed
+                            if (extension === '.html' || extension === '.htm') {
+                                logger.debug(`Converting HTML to Markdown for ${filePath}`);
+                                const cleanHtml = sanitizeHtml(content, {
+                                    allowedTags: [
+                                        'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                                        'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                                        'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                                    ],
+                                    allowedAttributes: {
+                                        'a': ['href'],
+                                        'pre': ['class', 'data-language'],
+                                        'code': ['class', 'data-language'],
+                                        'div': ['class'],
+                                        'span': ['class']
+                                    }
+                                });
+                                processedContent = this.turndownService.turndown(cleanHtml);
+                            } else {
+                                processedContent = content;
+                            }
                         }
                         
-                        // Convert HTML to Markdown if needed
-                        let processedContent: string;
-                        if (extension === '.html' || extension === '.htm') {
-                            logger.debug(`Converting HTML to Markdown for ${filePath}`);
-                            const cleanHtml = sanitizeHtml(content, {
-                                allowedTags: [
-                                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
-                                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
-                                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
-                                ],
-                                allowedAttributes: {
-                                    'a': ['href'],
-                                    'pre': ['class', 'data-language'],
-                                    'code': ['class', 'data-language'],
-                                    'div': ['class'],
-                                    'span': ['class']
-                                }
-                            });
-                            processedContent = this.turndownService.turndown(cleanHtml);
-                        } else {
-                            processedContent = content;
+                        // Check size limit for processed content
+                        if (processedContent.length > config.max_size) {
+                            logger.warn(`Processed content (${processedContent.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                            skippedFiles++;
+                            continue;
                         }
                         
                         await processFileContent(filePath, processedContent);
