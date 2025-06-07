@@ -10,8 +10,10 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
     * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation.
+    * **PDF Support:** Automatically downloads and processes PDF files linked from websites.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
+    * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
@@ -88,11 +90,11 @@ Configuration is managed through two files:
         
         For local directories (`type: 'local_directory'`):
         *   `path`: Path to the local directory to process.
-        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt']`). Defaults to `['.md', '.txt', '.html', '.htm']`.
+        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf']`.
         *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
-        *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`).
+        *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`). Note: PDF files are processed as binary and this setting doesn't apply to them.
         
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
@@ -140,9 +142,9 @@ Configuration is managed through two files:
         product_name: 'project-docs'
         version: 'current'
         path: './docs'
-        include_extensions: ['.md', '.txt']
+        include_extensions: ['.md', '.txt', '.pdf']
         recursive: true
-        max_size: 1048576
+        max_size: 10485760  # 10MB recommended for PDF files
         database_config:
           type: 'sqlite'
           params:
@@ -183,9 +185,9 @@ The script will then:
 3.  Iterate through each source defined in the config.
 4.  Initialize the specified database connection.
 5.  Process each source according to its type:
-    - For websites: Crawl the site, process any sitemaps, extract content, convert to Markdown
+    - For websites: Crawl the site, process any sitemaps, extract content from HTML pages and download/process PDF files, convert to Markdown
     - For GitHub repos: Fetch issues and comments, convert to Markdown
-    - For local directories: Scan files, process content (converting HTML to Markdown if needed)
+    - For local directories: Scan files, process content (converting HTML and PDF files to Markdown if needed)
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
@@ -200,6 +202,56 @@ The script will then:
 ### Qdrant (`database_config.type: 'qdrant'`)
 *   Uses `@qdrant/js-client-rest`.
 *   Requires `qdrant_url`, `qdrant_port`, `collection_name` and potentially `QDRANT_API_KEY`.
+
+## PDF Processing
+
+Doc2Vec includes built-in support for processing PDF files in both local directories and websites. PDF files are automatically detected by their `.pdf` extension and processed using [Mozilla's PDF.js](https://github.com/mozilla/pdf.js) library.
+
+### Features
+*   **Automatic Text Extraction:** Extracts text content from all pages in PDF documents
+*   **Markdown Conversion:** Converts extracted text to clean Markdown format with proper structure
+*   **Multi-page Support:** For multi-page PDFs, each page becomes a separate section with page headers
+*   **Website Integration:** Automatically downloads and processes PDFs linked from websites during crawling
+*   **Local File Support:** Processes PDF files found in local directories alongside other documents
+*   **Size Management:** Respects configured size limits to prevent processing of extremely large documents
+*   **Error Handling:** Graceful handling of corrupted or unsupported PDF files
+
+### Configuration Tips for PDFs
+*   **Larger Size Limits:** PDF files typically convert to more text than expected. Consider using larger `max_size` values (e.g., 10MB instead of 1MB) for directories containing PDFs:
+    ```yaml
+    max_size: 10485760  # 10MB recommended for PDF processing
+    ```
+*   **File Extensions:** Include `.pdf` in your `include_extensions` array:
+    ```yaml
+    include_extensions: ['.md', '.txt', '.pdf']
+    ```
+*   **Performance:** PDF processing is CPU-intensive. Large PDFs may take several seconds to process.
+*   **Website Configuration:** For websites that may contain PDFs, use larger size limits:
+    ```yaml
+    - type: 'website'
+      product_name: 'documentation'
+      version: 'latest'
+      url: 'https://docs.example.com/'
+      max_size: 10485760  # 10MB to handle PDFs
+      database_config:
+        type: 'sqlite'
+        params:
+          db_path: './docs.db'
+    ```
+
+### Example Output
+A PDF file named "user-guide.pdf" will be converted to Markdown format like:
+```markdown
+# user-guide
+
+## Page 1
+[Content from first page...]
+
+## Page 2
+[Content from second page...]
+```
+
+The resulting Markdown is then chunked and embedded using the same process as other text content.
 
 ## Now Available via npx
 
@@ -229,11 +281,11 @@ If you don't specify a config path, it will look for config.yaml in the current 
         - **For Websites:**
           *   Start at the base `url`.
           *   If `sitemap_url` is provided, fetch and parse the sitemap to extract additional URLs.
-          *   Use Puppeteer (`processPage`) to fetch and render HTML.
-          *   Use Readability to extract main content.
-          *   Sanitize HTML.
-          *   Convert HTML to Markdown using Turndown.
-          *   Use `axios`/`cheerio` on the *original* fetched page (before Puppeteer) to find new links to add to the crawl queue.
+          *   Use Puppeteer (`processPage`) to fetch and render HTML for web pages.
+          *   For PDF URLs, download and extract text using Mozilla's PDF.js.
+          *   Use Readability to extract main content from HTML pages.
+          *   Sanitize HTML and convert to Markdown using Turndown.
+          *   Use `axios`/`cheerio` on HTML pages to find new links to add to the crawl queue.
           *   Keep track of all visited URLs.
         - **For GitHub Repositories:**
           *   Fetch issues and comments using the GitHub API.
@@ -242,6 +294,7 @@ If you don't specify a config path, it will look for config.yaml in the current 
         - **For Local Directories:**
           *   Recursively scan directories for files matching the configured extensions.
           *   Read file content, converting HTML to Markdown if needed.
+          *   For PDF files, extract text using Mozilla's PDF.js and convert to Markdown format with proper page structure.
           *   Process each file's content.
     3.  **Process Content:** For each processed page, issue, or file:
         *   **Chunk:** Split Markdown into smaller `DocumentChunk` objects based on headings and size.
