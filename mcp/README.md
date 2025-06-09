@@ -8,7 +8,8 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
 - Filters by product name and version
 - Uses OpenAI's embedding API for query embedding generation
 - Fully compatible with the Model Context Protocol
-- Simple Express-based API with Server-Sent Events (SSE) for real-time communication
+- Support for multiple transport types: stdio (default) and streamable HTTP
+- Session management for HTTP transport
 
 ## Prerequisites
 
@@ -22,7 +23,8 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | Your OpenAI API key (required) | - |
 | `SQLITE_DB_DIR` | Directory containing SQLite databases | Current directory |
-| `PORT` | Port to run the server on | 3001 |
+| `TRANSPORT_TYPE` | Transport type: 'stdio' or 'http' | stdio |
+| `PORT` | Port to run the server on (HTTP transport only) | 3001 |
 
 ## Local Setup and Running
 
@@ -35,7 +37,7 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
    ```
    OPENAI_API_KEY=your_openai_api_key
    SQLITE_DB_DIR=/path/to/databases
-   PORT=3001
+   TRANSPORT_TYPE=stdio
    ```
 
 3. Build the TypeScript code:
@@ -44,9 +46,39 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
    ```
 
 4. Start the server:
+
+   **For stdio transport (default - for CLI/direct MCP usage):**
    ```bash
    npm start
+   # or
+   TRANSPORT_TYPE=stdio npm start
    ```
+
+   **For HTTP transport (for web-based clients):**
+   ```bash
+   TRANSPORT_TYPE=http PORT=3001 npm start
+   ```
+
+## Transport Types
+
+### Stdio Transport (Default)
+
+The stdio transport is the standard MCP transport for direct communication with MCP clients like Claude Desktop, IDEs, or other MCP-compatible applications. This is the recommended transport for most use cases.
+
+Usage:
+- Set `TRANSPORT_TYPE=stdio` or omit (default)
+- The server will communicate via stdin/stdout
+- No HTTP server is started
+
+### Streamable HTTP Transport
+
+The streamable HTTP transport allows web-based clients to connect to the MCP server via HTTP. This includes session management and supports multiple concurrent connections.
+
+Usage:
+- Set `TRANSPORT_TYPE=http`
+- Set `PORT` for the HTTP server (default: 3001)
+- Connect to `http://localhost:3001/mcp`
+- Sessions are managed automatically with UUID generation
 
 ## Docker Setup
 
@@ -60,11 +92,24 @@ This is going to include any `*.db` files in the `/data` directory of the image.
 
 ### Running with Docker
 
+**For stdio transport:**
+```bash
+docker run -i \
+  -e OPENAI_API_KEY=your_openai_api_key \
+  -e TRANSPORT_TYPE=stdio \
+  sqlite-vec-mcp-server:latest
+```
+
+**For HTTP transport:**
 ```bash
 docker run -p 3001:3001 \
   -e OPENAI_API_KEY=your_openai_api_key \
+  -e TRANSPORT_TYPE=http \
+  -e PORT=3001 \
   sqlite-vec-mcp-server:latest
 ```
+
+### Kubernetes Deployment
 
 ### Create a Secret for the OpenAI API Key
 
@@ -78,6 +123,7 @@ kubectl create secret generic mcp-secrets \
 ```bash
 kubectl create configmap mcp-config \
   --from-literal=SQLITE_DB_DIR=/data \
+  --from-literal=TRANSPORT_TYPE=http \
   --from-literal=PORT=3001
 ```
 
@@ -119,6 +165,11 @@ spec:
             configMapKeyRef:
               name: mcp-config
               key: SQLITE_DB_DIR
+        - name: TRANSPORT_TYPE
+          valueFrom:
+            configMapKeyRef:
+              name: mcp-config
+              key: TRANSPORT_TYPE
         - name: PORT
           valueFrom:
             configMapKeyRef:
@@ -164,3 +215,29 @@ The server implements a tool called `query-documentation` that can be used to qu
 - `productName` (string, required): The name of the product documentation database to search within
 - `version` (string, optional): The specific version of the product documentation
 - `limit` (number, optional, default: 4): Maximum number of results to return
+
+## Integration Examples
+
+### Claude Desktop Configuration
+
+For stdio transport, add to your Claude Desktop configuration:
+
+```json
+{
+  "mcpServers": {
+    "sqlite-vec-docs": {
+      "command": "node",
+      "args": ["/path/to/your/mcp/build/index.js"],
+      "env": {
+        "OPENAI_API_KEY": "your_openai_api_key",
+        "SQLITE_DB_DIR": "/path/to/databases",
+        "TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
+```
+
+### Web Client (HTTP Transport)
+
+For HTTP transport, clients can connect to `http://localhost:3001/mcp` and send MCP protocol messages via HTTP requests.
