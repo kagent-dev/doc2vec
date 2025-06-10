@@ -27,6 +27,75 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, database types, metadata, and other parameters.
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
 
+## Embedding Providers
+
+Doc2Vec now supports multiple embedding providers:
+
+### OpenAI (Default)
+- Uses OpenAI's text embedding models
+- Default model: `text-embedding-3-large`
+- Requires `OPENAI_API_KEY` environment variable
+
+### Google Gemini
+- Uses Google's Gemini embedding models  
+- Default model: `text-embedding-004`
+- Requires `GEMINI_API_KEY` environment variable
+
+## Configuration
+
+You can configure the embedding provider either globally (for all sources) or per-source:
+
+### Global Configuration
+```yaml
+# config.yaml
+embedding_config:
+  provider: 'gemini'  # or 'openai'
+  gemini:
+    model: 'text-embedding-004'
+    # api_key: 'your-api-key'  # Optional, uses GEMINI_API_KEY env var
+  # openai:
+  #   model: 'text-embedding-3-large' 
+  #   api_key: 'your-api-key'  # Optional, uses OPENAI_API_KEY env var
+
+sources:
+  - type: website
+    product_name: 'example'
+    version: 'latest'
+    url: 'https://example.com'
+    # ... other config
+```
+
+### Per-Source Configuration
+```yaml
+# config.yaml
+sources:
+  - type: website
+    product_name: 'example'
+    version: 'latest'
+    url: 'https://example.com'
+    embedding_config:  # Overrides global config for this source
+      provider: 'openai'
+      openai:
+        model: 'text-embedding-3-large'
+    # ... other config
+```
+
+## Environment Variables
+
+- `OPENAI_API_KEY`: Required when using OpenAI embeddings
+- `GEMINI_API_KEY`: Required when using Gemini embeddings
+
+## Supported Models
+
+### OpenAI
+- `text-embedding-3-large` (default)
+- `text-embedding-3-small`
+- `text-embedding-ada-002`
+
+### Gemini
+- `text-embedding-004` (default)
+- Other Gemini embedding models as they become available
+
 ## Prerequisites
 
 *   **Node.js:** Version 18 or higher recommended (check `.nvmrc` if available).

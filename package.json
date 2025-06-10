@@ -26,6 +26,7 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@google/generative-ai": "^0.21.0",
         "@mozilla/readability": "^0.4.4",
         "@qdrant/js-client-rest": "^1.13.0",
         "@qdrant/qdrant-js": "^1.13.0",

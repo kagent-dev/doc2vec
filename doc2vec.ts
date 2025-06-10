@@ -6,6 +6,7 @@ import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
 import { OpenAI } from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import * as dotenv from "dotenv";
 import { Logger, LogLevel } from './logger';
 import { Utils } from './utils';
@@ -18,7 +19,8 @@ import {
     WebsiteSourceConfig, 
     LocalDirectorySourceConfig,
     DatabaseConnection,
-    DocumentChunk
+    DocumentChunk,
+    EmbeddingConfig
 } from './types';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
@@ -27,7 +29,8 @@ dotenv.config();
 
 class Doc2Vec {
     private config: Config;
-    private openai: OpenAI;
+    private openai?: OpenAI;
+    private gemini?: GoogleGenerativeAI;
     private contentProcessor: ContentProcessor;
     private logger: Logger;
 
@@ -41,7 +44,28 @@ class Doc2Vec {
         
         this.logger.info('Initializing Doc2Vec');
         this.config = this.loadConfig(configPath);
-        this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        
+        // Initialize embedding clients based on configuration
+        const embeddingConfig = this.config.embedding_config || { provider: 'openai' };
+        
+        if (embeddingConfig.provider === 'openai') {
+            const apiKey = embeddingConfig.openai?.api_key || process.env.OPENAI_API_KEY;
+            if (!apiKey) {
+                this.logger.error('OpenAI API key not found. Please set OPENAI_API_KEY environment variable or provide it in config.');
+                process.exit(1);
+            }
+            this.openai = new OpenAI({ apiKey });
+            this.logger.info('Initialized OpenAI embedding client');
+        } else if (embeddingConfig.provider === 'gemini') {
+            const apiKey = embeddingConfig.gemini?.api_key || process.env.GEMINI_API_KEY;
+            if (!apiKey) {
+                this.logger.error('Gemini API key not found. Please set GEMINI_API_KEY environment variable or provide it in config.');
+                process.exit(1);
+            }
+            this.gemini = new GoogleGenerativeAI(apiKey);
+            this.logger.info('Initialized Gemini embedding client');
+        }
+        
         this.contentProcessor = new ContentProcessor(this.logger);
     }
 
@@ -207,7 +231,7 @@ class Doc2Vec {
                         continue;
                     }
 
-                    const embeddings = await this.createEmbeddings([chunk.content]);
+                    const embeddings = await this.createEmbeddings([chunk.content], sourceConfig);
                     if (embeddings.length) {
                         DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
                         logger.debug(`Stored chunk ${chunkId} in SQLite`);
@@ -237,7 +261,7 @@ class Doc2Vec {
                             continue;
                         }
                         
-                        const embeddings = await this.createEmbeddings([chunk.content]);
+                        const embeddings = await this.createEmbeddings([chunk.content], sourceConfig);
                         if (embeddings.length) {
                             await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
                             logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
@@ -354,7 +378,7 @@ class Doc2Vec {
 
 
                         if (needsEmbedding) {
-                            const embeddings = await this.createEmbeddings([chunk.content]);
+                            const embeddings = await this.createEmbeddings([chunk.content], config);
                             if (embeddings.length > 0) {
                                 const embedding = embeddings[0];
                                 if (dbConnection.type === 'sqlite') {
@@ -497,7 +521,7 @@ class Doc2Vec {
                             }
                             
                             if (needsEmbedding) {
-                                const embeddings = await this.createEmbeddings([chunk.content]);
+                                const embeddings = await this.createEmbeddings([chunk.content], config);
                                 if (embeddings.length > 0) {
                                     const embedding = embeddings[0];
                                     if (dbConnection.type === 'sqlite') {
@@ -535,18 +559,65 @@ class Doc2Vec {
         logger.info(`Finished processing local directory: ${config.path}`);
     }
 
-    private async createEmbeddings(texts: string[]): Promise<number[][]> {
+    private async createEmbeddings(texts: string[], sourceConfig?: SourceConfig): Promise<number[][]> {
         const logger = this.logger.child('embeddings');
+        
+        // Use source-specific embedding config if available, otherwise fall back to global config
+        const embeddingConfig = sourceConfig?.embedding_config || this.config.embedding_config || { provider: 'openai' };
+        
         try {
-            logger.debug(`Creating embeddings for ${texts.length} texts`);
-            const response = await this.openai.embeddings.create({
-                model: "text-embedding-3-large",
-                input: texts,
-            });
-            logger.debug(`Successfully created ${response.data.length} embeddings`);
-            return response.data.map(d => d.embedding);
+            logger.debug(`Creating embeddings for ${texts.length} texts using ${embeddingConfig.provider}`);
+            
+            if (embeddingConfig.provider === 'openai') {
+                if (!this.openai) {
+                    throw new Error('OpenAI client not initialized');
+                }
+                
+                const model = embeddingConfig.openai?.model || "text-embedding-3-large";
+                const response = await this.openai.embeddings.create({
+                    model,
+                    input: texts,
+                });
+                
+                logger.debug(`Successfully created ${response.data.length} OpenAI embeddings`);
+                return response.data.map(d => d.embedding);
+                
+            } else if (embeddingConfig.provider === 'gemini') {
+                if (!this.gemini) {
+                    throw new Error('Gemini client not initialized');
+                }
+                
+                const model = embeddingConfig.gemini?.model || "text-embedding-004";
+                const embeddings: number[][] = [];
+                
+                // Process texts individually since the API handles one at a time more reliably
+                for (const text of texts) {
+                    try {
+                        // Use the correct API structure for Google Generative AI
+                        const generativeModel = this.gemini.getGenerativeModel({ model });
+                        const result = await generativeModel.embedContent(text);
+                        
+                        if (result.embedding && result.embedding.values) {
+                            embeddings.push(result.embedding.values);
+                        } else {
+                            logger.warn(`Failed to get embedding for text: ${text.substring(0, 100)}...`);
+                            // Return empty array for failed embeddings to maintain consistency
+                            embeddings.push([]);
+                        }
+                    } catch (error) {
+                        logger.error(`Failed to embed individual text: ${error}`);
+                        embeddings.push([]);
+                    }
+                }
+                
+                logger.debug(`Successfully created ${embeddings.length} Gemini embeddings`);
+                return embeddings;
+            }
+            
+            throw new Error(`Unsupported embedding provider: ${embeddingConfig.provider}`);
+            
         } catch (error) {
-            logger.error('Failed to create embeddings:', error);
+            logger.error(`Failed to create embeddings with ${embeddingConfig.provider}:`, error);
             return [];
         }
     }

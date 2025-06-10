@@ -5,6 +5,24 @@ export interface BaseSourceConfig {
     version: string;
     max_size: number;
     database_config: DatabaseConfig;
+    embedding_config?: EmbeddingConfig; // Optional, allows per-source embedding configuration
+}
+
+// Embedding configuration
+export interface EmbeddingConfig {
+    provider: 'openai' | 'gemini';
+    openai?: OpenAIEmbeddingConfig;
+    gemini?: GeminiEmbeddingConfig;
+}
+
+export interface OpenAIEmbeddingConfig {
+    model?: string; // defaults to 'text-embedding-3-large'
+    api_key?: string; // optional, can use environment variable OPENAI_API_KEY
+}
+
+export interface GeminiEmbeddingConfig {
+    model?: string; // defaults to 'text-embedding-004'
+    api_key?: string; // optional, can use environment variable GEMINI_API_KEY
 }
 
 // Configuration specific to local directory sources
@@ -53,6 +71,7 @@ export interface QdrantDatabaseParams {
 
 export interface Config {
     sources: SourceConfig[];
+    embedding_config?: EmbeddingConfig; // Optional, defaults to OpenAI if not specified
 }
 
 export interface DocumentChunk {
