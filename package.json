@@ -26,6 +26,7 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@huggingface/transformers": "^3.5.2",
         "@mozilla/readability": "^0.4.4",
         "@qdrant/js-client-rest": "^1.13.0",
         "@qdrant/qdrant-js": "^1.13.0",

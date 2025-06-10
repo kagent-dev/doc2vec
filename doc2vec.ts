@@ -11,6 +11,7 @@ import { Logger, LogLevel } from './logger';
 import { Utils } from './utils';
 import { DatabaseManager } from './database';
 import { ContentProcessor } from './content-processor';
+import { EmbeddingProvider, createEmbeddingProvider } from './embedding-providers';
 import { 
     Config, 
     SourceConfig, 
@@ -30,6 +31,7 @@ class Doc2Vec {
     private openai: OpenAI;
     private contentProcessor: ContentProcessor;
     private logger: Logger;
+    private embeddingProvider: EmbeddingProvider;
 
     constructor(configPath: string) {
         this.logger = new Logger('Doc2Vec', {
@@ -43,6 +45,12 @@ class Doc2Vec {
         this.config = this.loadConfig(configPath);
         this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
         this.contentProcessor = new ContentProcessor(this.logger);
+        
+        // Initialize default embedding provider (OpenAI)
+        this.embeddingProvider = createEmbeddingProvider({
+            provider: 'openai',
+            params: { model: 'text-embedding-3-large' }
+        }, this.logger);
     }
 
     private loadConfig(configPath: string): Config {
@@ -59,6 +67,16 @@ class Doc2Vec {
         } catch (error) {
             this.logger.error(`Failed to load or parse config file at ${configPath}:`, error);
             process.exit(1);
+        }
+    }
+
+    private getEmbeddingProvider(sourceConfig: SourceConfig, logger: Logger): EmbeddingProvider {
+        if (sourceConfig.embedding_config) {
+            logger.info(`Using custom embedding provider: ${sourceConfig.embedding_config.provider}`);
+            return createEmbeddingProvider(sourceConfig.embedding_config, logger);
+        } else {
+            logger.debug('Using default embedding provider');
+            return this.embeddingProvider;
         }
     }
 
@@ -84,7 +102,7 @@ class Doc2Vec {
         this.logger.section('PROCESSING COMPLETE');
     }
 
-    private async fetchAndProcessGitHubIssues(repo: string, sourceConfig: GithubSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
+    private async fetchAndProcessGitHubIssues(repo: string, sourceConfig: GithubSourceConfig, dbConnection: DatabaseConnection, logger: Logger, embeddingProvider: EmbeddingProvider): Promise<void> {
         const [owner, repoName] = repo.split('/');
         const GITHUB_API_URL = `https://api.github.com/repos/${owner}/${repoName}/issues`;
         
@@ -207,7 +225,7 @@ class Doc2Vec {
                         continue;
                     }
 
-                    const embeddings = await this.createEmbeddings([chunk.content]);
+                    const embeddings = await embeddingProvider.createEmbeddings([chunk.content]);
                     if (embeddings.length) {
                         DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
                         logger.debug(`Stored chunk ${chunkId} in SQLite`);
@@ -237,7 +255,7 @@ class Doc2Vec {
                             continue;
                         }
                         
-                        const embeddings = await this.createEmbeddings([chunk.content]);
+                        const embeddings = await embeddingProvider.createEmbeddings([chunk.content]);
                         if (embeddings.length) {
                             await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
                             logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
@@ -271,6 +289,9 @@ class Doc2Vec {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for GitHub repo: ${config.repo}`);
         
+        // Initialize embedding provider for this source
+        const embeddingProvider = this.getEmbeddingProvider(config, logger);
+        
         const dbConnection = await DatabaseManager.initDatabase(config, logger);
         
         // Initialize metadata storage
@@ -279,7 +300,7 @@ class Doc2Vec {
         logger.section('GITHUB ISSUES');
         
         // Process GitHub issues
-        await this.fetchAndProcessGitHubIssues(config.repo, config, dbConnection, logger);
+        await this.fetchAndProcessGitHubIssues(config.repo, config, dbConnection, logger, embeddingProvider);
         
         logger.info(`Finished processing GitHub repo: ${config.repo}`);
     }
@@ -287,6 +308,9 @@ class Doc2Vec {
     private async processWebsite(config: WebsiteSourceConfig, parentLogger: Logger): Promise<void> {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for website: ${config.url}`);
+        
+        // Initialize embedding provider for this source
+        const embeddingProvider = this.getEmbeddingProvider(config, logger);
         
         const dbConnection = await DatabaseManager.initDatabase(config, logger);
         const validChunkIds: Set<string> = new Set();
@@ -354,7 +378,7 @@ class Doc2Vec {
 
 
                         if (needsEmbedding) {
-                            const embeddings = await this.createEmbeddings([chunk.content]);
+                            const embeddings = await embeddingProvider.createEmbeddings([chunk.content]);
                             if (embeddings.length > 0) {
                                 const embedding = embeddings[0];
                                 if (dbConnection.type === 'sqlite') {
@@ -402,6 +426,9 @@ class Doc2Vec {
     private async processLocalDirectory(config: LocalDirectorySourceConfig, parentLogger: Logger): Promise<void> {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for local directory: ${config.path}`);
+        
+        // Initialize embedding provider for this source
+        const embeddingProvider = this.getEmbeddingProvider(config, logger);
         
         const dbConnection = await DatabaseManager.initDatabase(config, logger);
         const validChunkIds: Set<string> = new Set();
@@ -497,7 +524,7 @@ class Doc2Vec {
                             }
                             
                             if (needsEmbedding) {
-                                const embeddings = await this.createEmbeddings([chunk.content]);
+                                const embeddings = await embeddingProvider.createEmbeddings([chunk.content]);
                                 if (embeddings.length > 0) {
                                     const embedding = embeddings[0];
                                     if (dbConnection.type === 'sqlite') {
@@ -534,22 +561,6 @@ class Doc2Vec {
         
         logger.info(`Finished processing local directory: ${config.path}`);
     }
-
-    private async createEmbeddings(texts: string[]): Promise<number[][]> {
-        const logger = this.logger.child('embeddings');
-        try {
-            logger.debug(`Creating embeddings for ${texts.length} texts`);
-            const response = await this.openai.embeddings.create({
-                model: "text-embedding-3-large",
-                input: texts,
-            });
-            logger.debug(`Successfully created ${response.data.length} embeddings`);
-            return response.data.map(d => d.embedding);
-        } catch (error) {
-            logger.error('Failed to create embeddings:', error);
-            return [];
-        }
-    }
 }
 
 if (require.main === module) {
@@ -560,4 +571,4 @@ if (require.main === module) {
     }
     const doc2Vec = new Doc2Vec(configPath);
     doc2Vec.run().catch(console.error);
-} 
+}

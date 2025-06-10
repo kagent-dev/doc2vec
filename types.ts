@@ -5,6 +5,7 @@ export interface BaseSourceConfig {
     version: string;
     max_size: number;
     database_config: DatabaseConfig;
+    embedding_config?: EmbeddingConfig; // Optional embedding configuration
 }
 
 // Configuration specific to local directory sources
@@ -49,6 +50,24 @@ export interface QdrantDatabaseParams {
     qdrant_url?: string;
     qdrant_port?: number;
     collection_name?: string;
+}
+
+// Embedding provider configuration
+export interface EmbeddingConfig {
+    provider: 'openai' | 'transformers';
+    params: OpenAIEmbeddingParams | TransformersEmbeddingParams;
+}
+
+export interface OpenAIEmbeddingParams {
+    model?: string; // Default: 'text-embedding-3-large'
+    api_key?: string; // Optional, will use environment variable if not provided
+}
+
+export interface TransformersEmbeddingParams {
+    model: string; // Required model name (e.g., 'Xenova/all-MiniLM-L6-v2')
+    local_files_only?: boolean; // Whether to only use local files
+    cache_dir?: string; // Optional cache directory
+    device?: 'cpu' | 'gpu'; // Device to use for inference
 }
 
 export interface Config {
