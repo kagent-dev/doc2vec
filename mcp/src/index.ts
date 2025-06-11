@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 import * as sqliteVec from "sqlite-vec";
 import Database, { Database as DatabaseType } from "better-sqlite3";
 import { OpenAI } from 'openai';
+import { AutoTokenizer, AutoModel, env } from "@huggingface/transformers";
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs'; // Import fs for checking file existence
@@ -20,21 +21,49 @@ import fs from 'fs'; // Import fs for checking file existence
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'openai'; // 'openai' or 'transformers'
 const openAIApiKey = process.env.OPENAI_API_KEY;
+const transformersModel = process.env.TRANSFORMERS_MODEL || 'onnx-community/Qwen3-Embedding-0.6B-ONNX';
+const transformersCacheDir = process.env.TRANSFORMERS_CACHE_DIR || './transformers_cache';
 const dbDir = process.env.SQLITE_DB_DIR || __dirname; // Default to current dir if not set
 
-if (!openAIApiKey) {
-    console.error("Error: OPENAI_API_KEY environment variable is not set.");
+// Validate configuration
+if (embeddingProvider === 'openai' && !openAIApiKey) {
+    console.error("Error: OPENAI_API_KEY environment variable is required when EMBEDDING_PROVIDER=openai.");
     process.exit(1);
 }
+
 if (!fs.existsSync(dbDir)) {
     console.warn(`Warning: SQLITE_DB_DIR (${dbDir}) does not exist. Databases may not be found.`);
     process.exit(1);
 }
 
-const openai = new OpenAI({
-    apiKey: openAIApiKey,
-});
+// Initialize providers
+let openai: OpenAI | null = null;
+if (embeddingProvider === 'openai') {
+    openai = new OpenAI({
+        apiKey: openAIApiKey!,
+    });
+}
+
+// Transformers.js setup
+if (embeddingProvider === 'transformers') {
+    env.cacheDir = transformersCacheDir;
+    
+    // Ensure cache directory exists
+    if (!fs.existsSync(transformersCacheDir)) {
+        fs.mkdirSync(transformersCacheDir, { recursive: true });
+        console.error(`Created transformers cache directory: ${transformersCacheDir}`);
+    }
+    
+    console.error(`Using transformers.js with model: ${transformersModel}`);
+    console.error(`Cache directory: ${transformersCacheDir}`);
+}
+
+// Global transformers instances (initialized on first use)
+let transformersTokenizer: any = null;
+let transformersModelInstance: any = null;
+let transformersInitialized = false;
 
 export interface QueryResult {
     chunk_id: string;
@@ -45,7 +74,38 @@ export interface QueryResult {
     [key: string]: unknown;
 }
 
-async function createEmbeddings(text: string): Promise<number[]> {
+async function initializeTransformers(): Promise<void> {
+    if (transformersInitialized) return;
+    
+    try {
+        console.error(`Loading transformers model: ${transformersModel}`);
+        const startTime = Date.now();
+        
+        transformersTokenizer = await AutoTokenizer.from_pretrained(transformersModel);
+        transformersModelInstance = await AutoModel.from_pretrained(transformersModel);
+        
+        const duration = Date.now() - startTime;
+        transformersInitialized = true;
+        console.error(`Transformers model loaded successfully in ${duration}ms`);
+    } catch (error) {
+        console.error(`Failed to load transformers model: ${transformersModel}`, error);
+        
+        // Provide helpful error messages for common issues
+        if (error instanceof Error && error.message?.includes('Could not locate file') && error.message?.includes('onnx')) {
+            console.error(`Model ${transformersModel} does not appear to have ONNX format files required by transformers.js`);
+            console.error('Please use a model with "Xenova/" prefix or check the model repository for ONNX files');
+            console.error('Popular working models: Xenova/all-MiniLM-L6-v2, Xenova/all-mpnet-base-v2, Xenova/bge-small-en-v1.5');
+        }
+        
+        throw error;
+    }
+}
+
+async function createEmbeddingsWithOpenAI(text: string): Promise<number[]> {
+    if (!openai) {
+        throw new Error("OpenAI client not initialized");
+    }
+    
     try {
         console.error("Calling OpenAI embeddings API...");
         const startTime = Date.now();
@@ -62,6 +122,57 @@ async function createEmbeddings(text: string): Promise<number[]> {
     } catch (error) {
         console.error("Error creating OpenAI embeddings:", error);
         throw new Error(`Failed to create embeddings: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+async function createEmbeddingsWithTransformers(text: string): Promise<number[]> {
+    await initializeTransformers();
+    
+    try {
+        console.error("Creating embeddings with transformers.js...");
+        const startTime = Date.now();
+        
+        // Tokenize the text
+        const tokens = await transformersTokenizer(text, {
+            truncation: true,
+            padding: true,
+            max_length: 512,
+            return_tensors: 'pt'
+        });
+        
+        // Get model output
+        const output = await transformersModelInstance(tokens);
+        
+        // Mean pooling to get sentence embeddings
+        let embedding: number[];
+        if (output.last_hidden_state) {
+            // Mean pooling over sequence length
+            const tensor = output.last_hidden_state;
+            const meanPooled = tensor.mean(1); // Mean along sequence dimension
+            embedding = Array.from(meanPooled.data) as number[];
+        } else if (output.pooler_output) {
+            // Use pooler output if available
+            embedding = Array.from(output.pooler_output.data) as number[];
+        } else {
+            throw new Error('Unable to extract embeddings from model output');
+        }
+        
+        const duration = Date.now() - startTime;
+        console.error(`Transformers embeddings created in ${duration}ms.`);
+        return embedding;
+    } catch (error) {
+        console.error("Error creating transformers embeddings:", error);
+        throw new Error(`Failed to create embeddings: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+async function createEmbeddings(text: string): Promise<number[]> {
+    if (embeddingProvider === 'openai') {
+        return createEmbeddingsWithOpenAI(text);
+    } else if (embeddingProvider === 'transformers') {
+        return createEmbeddingsWithTransformers(text);
+    } else {
+        throw new Error(`Unsupported embedding provider: ${embeddingProvider}. Use 'openai' or 'transformers'.`);
     }
 }
 
@@ -337,6 +448,11 @@ async function main() {
         const webserver = app.listen(PORT, () => {
             console.error(`MCP server is running on port ${PORT} with HTTP transport`);
             console.error(`Connect to: http://localhost:${PORT}/mcp`);
+            console.error(`Embedding provider: ${embeddingProvider}`);
+            if (embeddingProvider === 'transformers') {
+                console.error(`Transformers model: ${transformersModel}`);
+                console.error(`Cache directory: ${transformersCacheDir}`);
+            }
         });
         
         webserver.keepAliveTimeout = 3000;
