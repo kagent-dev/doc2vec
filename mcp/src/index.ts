@@ -4,6 +4,7 @@ import 'dotenv/config'; // Load .env file
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express, { Request, Response } from "express";
 import { z } from "zod";
 import { randomUUID } from 'crypto';
@@ -188,7 +189,7 @@ server.tool(
 
 // --- Transport Setup ---
 async function main() {
-    const transport_type = process.env.TRANSPORT_TYPE || 'stdio';
+    const transport_type = process.env.TRANSPORT_TYPE || 'sse';
     
     if (transport_type === 'stdio') {
         // Stdio transport for direct communication
@@ -196,6 +197,72 @@ async function main() {
         const transport = new StdioServerTransport();
         await server.connect(transport);
         console.error("MCP server connected via stdio.");
+    } else if (transport_type === 'sse') {
+        // SSE transport for backward compatibility
+        console.error("Starting MCP server with SSE transport...");
+        
+        const app = express();
+        
+        // Storage for SSE transports by session ID
+        const sseTransports: {[sessionId: string]: SSEServerTransport} = {};
+
+        app.get("/sse", async (_: Request, res: Response) => {
+            console.error('Received SSE connection request');
+            const transport = new SSEServerTransport('/messages', res);
+            sseTransports[transport.sessionId] = transport;
+            res.on("close", () => {
+                console.error(`SSE connection closed for session ${transport.sessionId}`);
+                delete sseTransports[transport.sessionId];
+            });
+            await server.connect(transport);
+        });
+
+        app.post("/messages", async (req: Request, res: Response) => {
+            console.error('Received SSE message POST request');
+            const sessionId = req.query.sessionId as string;
+            const transport = sseTransports[sessionId];
+            if (transport) {
+                await transport.handlePostMessage(req, res);
+            } else {
+                console.error(`No SSE transport found for sessionId: ${sessionId}`);
+                res.status(400).send('No transport found for sessionId');
+            }
+        });
+
+        const PORT = process.env.PORT || 3001;
+        const webserver = app.listen(PORT, () => {
+            console.error(`MCP server is running on port ${PORT} with SSE transport`);
+            console.error(`Connect to: http://localhost:${PORT}/sse`);
+        });
+        
+        webserver.keepAliveTimeout = 3000;
+        
+        // Keep the process alive
+        webserver.on('error', (error) => {
+            console.error('HTTP server error:', error);
+        });
+        
+        // Handle server shutdown
+        process.on('SIGINT', async () => {
+            console.error('Shutting down SSE server...');
+            
+            // Close all active SSE transports
+            for (const [sessionId, transport] of Object.entries(sseTransports)) {
+                try {
+                    console.error(`Closing SSE transport for session ${sessionId}`);
+                    // SSE transports typically don't have a close method, cleanup happens via res.on("close")
+                    delete sseTransports[sessionId];
+                } catch (error) {
+                    console.error(`Error cleaning up SSE transport for session ${sessionId}:`, error);
+                }
+            }
+
+            console.error('SSE server shutdown complete');
+            process.exit(0);
+        });
+        
+        // Prevent the process from exiting
+        process.stdin.resume();
     } else if (transport_type === 'http') {
         // Streamable HTTP transport for web-based communication
         console.error("Starting MCP server with HTTP transport...");
@@ -368,7 +435,7 @@ async function main() {
         // Prevent the process from exiting
         process.stdin.resume();
     } else {
-        console.error(`Unknown transport type: ${transport_type}. Use 'stdio' or 'http'.`);
+        console.error(`Unknown transport type: ${transport_type}. Use 'stdio', 'sse', or 'http'.`);
         process.exit(1);
     }
 }
