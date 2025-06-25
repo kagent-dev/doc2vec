@@ -1,5 +1,5 @@
 # Build stage
-FROM cgr.dev/chainguard/wolfi-base:latest AS builder
+FROM --platform=linux/$BUILDARCH cgr.dev/chainguard/wolfi-base:latest AS builder
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
