@@ -1,0 +1,20 @@
+# Image configuration
+DOCKER_REGISTRY ?= ghcr.io
+BASE_IMAGE_REGISTRY ?= cgr.dev
+DOCKER_REPO ?= kagent-dev/doc2vec
+
+BUILD_DATE := $(shell date -u '+%Y-%m-%d')
+GIT_COMMIT := $(shell git rev-parse --short HEAD || echo "unknown")
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/-dirty//' | grep v || echo "v0.0.0-$(GIT_COMMIT)")
+
+MCP_IMAGE_NAME ?= mcp
+
+DOCKER_BUILDER ?= docker buildx
+DOCKER_BUILD_ARGS ?= --progress=plain --builder $(BUILDX_BUILDER_NAME) --pull --load --platform linux/$(LOCALARCH)
+
+BUILDX_NO_DEFAULT_ATTESTATIONS=1
+BUILDX_BUILDER_NAME=kagent-builder
+
+# Build the MCP image
+build-mcp:
+	docker build -t $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):$(VERSION) -t $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):latest -f mcp/Dockerfile ./mcp

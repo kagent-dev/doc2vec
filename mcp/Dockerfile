@@ -61,7 +61,7 @@ COPY --from=builder --chown=kagent:nodejs /app/package.json ./
 
 USER kagent
 
-LABEL org.opencontainers.image.source=https://github.com/kagent-dev/kagent-doc2vec
+LABEL org.opencontainers.image.source=https://github.com/kagent-dev/doc2vec
 LABEL org.opencontainers.image.description="Kagent Doc2Vec MCP"
 LABEL org.opencontainers.image.authors="Kagent Creators 🤖"
 
