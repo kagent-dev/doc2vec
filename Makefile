@@ -21,9 +21,9 @@ BUILDX_BUILDER_NAME=kagent-builder
 # Build the MCP image
 .PHONY: build-mcp
 build-mcp:
-	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -t $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):$(VERSION) -t $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):local -f mcp/Dockerfile ./mcp
+	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -t $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):$(VERSION)  -f mcp/Dockerfile ./mcp
 
 # Run the MCP image
 .PHONY: run-mcp
 run-mcp: build-mcp
-	docker run --rm -t  -e OPENAI_API_KEY=$(OPENAI_API_KEY) -e TRANSPORT_TYPE=http --name mcp -p 3001:3001 $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):local
+	docker run --rm -t  -e OPENAI_API_KEY=$(OPENAI_API_KEY) -e TRANSPORT_TYPE=http --name mcp -p 3001:3001 $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):$(VERSION)
