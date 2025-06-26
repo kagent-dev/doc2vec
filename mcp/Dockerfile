@@ -49,12 +49,12 @@ RUN apk update && apk add --no-cache \
     && rm -rf /var/cache/apk/*
 
 # Create non-root user
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S kagent -u 1001 -G nodejs
+RUN addgroup -g 1001 -S nodejs           && \
+    adduser -S kagent -u 1001 -G nodejs  && \
+    mkdir -p /app/build
 
 WORKDIR /app
 
-#
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/kubernetes.db /app/build/kubernetes.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/istio.db /app/build/istio.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/argo.db /app/build/argo.db
@@ -69,12 +69,16 @@ ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/otel.db /app/build/otel.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/cilium.db /app/build/cilium.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/ambient.db /app/build/ambient.db
 
+#show cheksum for every db file
+RUN for file in /app/build/*.db; do echo "Checksum for $file:";sha256sum "$file";done
+
+# Ensure the app directory is owned by the non-root user
+RUN chown -R kagent:nodejs /app
+
 # Copy built application and production dependencies from builder stage
 COPY --from=builder --chown=kagent:nodejs /app/build ./build
 COPY --from=builder --chown=kagent:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=kagent:nodejs /app/package.json ./
-
-USER kagent
 
 LABEL org.opencontainers.image.source=https://github.com/kagent-dev/doc2vec
 LABEL org.opencontainers.image.description="Kagent Doc2Vec MCP"
