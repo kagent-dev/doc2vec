@@ -16,7 +16,7 @@ ENV NODE_PATH=/app/node_modules
 RUN apk update && apk add --no-cache \
     nodejs \
     ca-certificates \
-    && update-ca-certificates \
+    && update-ca-certificates
 
 WORKDIR /app
 
@@ -39,11 +39,11 @@ RUN echo "Building for platform: $TARGETPLATFORM" && \
         python3                       \
         sqlite-dev                    \
         unzip                      && \
-    echo "Installing dependencies including dev dependencies" && \
+    echo "🤖 Installing ..."       && \
     npm ci --include=dev           && \
-    echo "Building application"    && \
+    echo "🤖 Building   ..."       && \
     npm run build                  && \
-    echo "Cleaning up build... "   && \
+    echo "🤖 Cleaning up..."       && \
     npm prune --production         && \
     apk del                           \
         bash                          \
@@ -57,14 +57,12 @@ RUN echo "Building for platform: $TARGETPLATFORM" && \
         unzip                      && \
     rm -rf /root/.npm /root/.node-gyp /root/.cache /tmp/* /var/tmp/* && \
     rm -rf /app/src /app/package.json /app/package-lock.json /app/tsconfig.json && \
-    echo "Build completed successfully"
+    find /app/build/               && \
+    echo "🤖 Build completed !!!"
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs           && \
-    adduser -S kagent -u 1001 -G nodejs  && \
-    mkdir -p /app/build
-
-WORKDIR /app
+# Create non-root user and verify build directory
+RUN addgroup -g 1001 -S nodejs     && \
+    adduser -S kagent -u 1001 -G nodejs
 
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/kubernetes.db /app/build/kubernetes.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/istio.db /app/build/istio.db
