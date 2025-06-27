@@ -9,6 +9,9 @@ ARG TARGETARCH
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+ENV NODE_ENV=production
+ENV NODE_PATH=/app/node_modules
+
 # Install only runtime dependencies
 RUN apk update && apk add --no-cache \
     nodejs \
@@ -36,8 +39,8 @@ RUN echo "Building for platform: $TARGETPLATFORM" && \
         python3                       \
         sqlite-dev                    \
         unzip                      && \
-    echo "Installing dependencies" && \
-    npm ci                         && \
+    echo "Installing dependencies including dev dependencies" && \
+    npm ci --include=dev           && \
     echo "Building application"    && \
     npm run build                  && \
     echo "Cleaning up build... "   && \
@@ -53,7 +56,7 @@ RUN echo "Building for platform: $TARGETPLATFORM" && \
         sqlite-dev                    \
         unzip                      && \
     rm -rf /root/.npm /root/.node-gyp /root/.cache /tmp/* /var/tmp/* && \
-    rm -rf /app/src /app/package.json /app/package-lock.json /app/tsconfig.json \
+    rm -rf /app/src /app/package.json /app/package-lock.json /app/tsconfig.json && \
     echo "Build completed successfully"
 
 # Create non-root user
