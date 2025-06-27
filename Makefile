@@ -15,7 +15,7 @@ LOCALARCH ?= $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 DOCKER_BUILDER ?= docker buildx
 DOCKER_BUILD_ARGS ?= --progress=plain  --pull --load --platform linux/$(LOCALARCH)
 
-BUILDX_NO_DEFAULT_ATTESTATIONS=1
+export BUILDX_NO_DEFAULT_ATTESTATIONS=1
 BUILDX_BUILDER_NAME=kagent-builder
 
 .PHONY: create-builder
@@ -33,5 +33,5 @@ build-mcp: create-builder
 run-mcp: build-mcp
 	docker run --rm -t  -e OPENAI_API_KEY=$(OPENAI_API_KEY) -e TRANSPORT_TYPE=http --name mcp -p 3001:3001 $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):$(VERSION)
 
-##  To test the MCP image locally
-#    docker run --rm -t -e OPENAI_API_KEY=$OPENAI_API_KEY -e TRANSPORT_TYPE=http -p 3001:3001 ghcr.io/kagent-dev/doc2vec/mcp:1.1.6
+## To test the MCP image locally
+#  docker run --rm -t -e OPENAI_API_KEY=$OPENAI_API_KEY -e TRANSPORT_TYPE=http -p 3001:3001 ghcr.io/kagent-dev/doc2vec/mcp:1.1.6

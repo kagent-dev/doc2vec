@@ -1,24 +1,22 @@
 # Build stage
-FROM --platform=linux/$BUILDARCH cgr.dev/chainguard/wolfi-base:latest AS builder
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/wolfi-base:latest AS builder
+
+# Import build arguments for cross-compilation
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+ENV NODE_ENV=production
+ENV NODE_PATH=/app/node_modules
 
+# Install only runtime dependencies
 RUN apk update && apk add --no-cache \
-    bash \
-    build-base \
-    ca-certificates \
-    curl \
-    make \
-    node-gyp \
     nodejs \
-    npm \
-    openssl \
-    python3 \
-    sqlite-dev \
-    unzip \
-    && update-ca-certificates \
-    && rm -rf /var/cache/apk/*
+    ca-certificates \
+    && update-ca-certificates
 
 WORKDIR /app
 
@@ -27,33 +25,44 @@ COPY package.json package-lock.json tsconfig.json ./
 COPY src/ ./src/
 
 # Install dependencies and build
-RUN --mount=type=cache,target=/root/.npm \
-    npm install typescript && \
-    npm ci --only=production && \
-    npm install --save-dev typescript && \
-    npm run build
+RUN echo "Building for platform: $TARGETPLATFORM" && \
+    apk update && apk add --no-cache  \
+        bash                          \
+        build-base                    \
+        ca-certificates               \
+        curl                          \
+        make                          \
+        node-gyp                      \
+        nodejs                        \
+        npm                           \
+        openssl                       \
+        python3                       \
+        sqlite-dev                    \
+        unzip                      && \
+    echo "🤖 Installing ..."       && \
+    npm ci --include=dev           && \
+    echo "🤖 Building   ..."       && \
+    npm run build                  && \
+    echo "🤖 Cleaning up..."       && \
+    npm prune --production         && \
+    apk del                           \
+        bash                          \
+        build-base                    \
+        curl                          \
+        make                          \
+        node-gyp                      \
+        openssl                       \
+        python3                       \
+        sqlite-dev                    \
+        unzip                      && \
+    rm -rf /root/.npm /root/.node-gyp /root/.cache /tmp/* /var/tmp/* && \
+    rm -rf /app/src /app/package.json /app/package-lock.json /app/tsconfig.json && \
+    find /app/build/               && \
+    echo "🤖 Build completed !!!"
 
-# Production stage
-FROM cgr.dev/chainguard/wolfi-base:latest AS production
-
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
-ENV NODE_ENV=production
-
-# Install only runtime dependencies
-RUN apk update && apk add --no-cache \
-    nodejs \
-    ca-certificates \
-    sqlite \
-    && update-ca-certificates \
-    && rm -rf /var/cache/apk/*
-
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs           && \
-    adduser -S kagent -u 1001 -G nodejs  && \
-    mkdir -p /app/build
-
-WORKDIR /app
+# Create non-root user and verify build directory
+RUN addgroup -g 1001 -S nodejs     && \
+    adduser -S kagent -u 1001 -G nodejs
 
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/kubernetes.db /app/build/kubernetes.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/istio.db /app/build/istio.db
@@ -74,11 +83,6 @@ RUN for file in /app/build/*.db; do echo "Checksum for $file:";sha256sum "$file"
 
 # Ensure the app directory is owned by the non-root user
 RUN chown -R kagent:nodejs /app
-
-# Copy built application and production dependencies from builder stage
-COPY --from=builder --chown=kagent:nodejs /app/build ./build
-COPY --from=builder --chown=kagent:nodejs /app/node_modules ./node_modules
-COPY --from=builder --chown=kagent:nodejs /app/package.json ./
 
 LABEL org.opencontainers.image.source=https://github.com/kagent-dev/doc2vec
 LABEL org.opencontainers.image.description="Kagent Doc2Vec MCP"

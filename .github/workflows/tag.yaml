@@ -37,6 +37,7 @@ jobs:
     - name: 'Build Images'
       env:
         DOCKER_BUILD_ARGS: "--push --platform linux/amd64,linux/arm64"
+        DOCKER_REPO: "${{ github.repository_owner }}/doc2vec"
       run: |
         # if workflow_dispatch is used, use the version input
         if [ -n "${{ github.event.inputs.version }}" ]; then
