@@ -15,7 +15,7 @@ LOCALARCH ?= $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 DOCKER_BUILDER ?= docker buildx
 DOCKER_BUILD_ARGS ?= --progress=plain  --pull --load --platform linux/$(LOCALARCH)
 
-BUILDX_NO_DEFAULT_ATTESTATIONS=1
+export BUILDX_NO_DEFAULT_ATTESTATIONS=1
 BUILDX_BUILDER_NAME=kagent-builder
 
 .PHONY: create-builder

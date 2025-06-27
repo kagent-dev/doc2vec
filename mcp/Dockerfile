@@ -1,5 +1,11 @@
 # Build stage
-FROM --platform=linux/$BUILDARCH cgr.dev/chainguard/wolfi-base:latest AS builder
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/wolfi-base:latest AS builder
+
+# Import build arguments for cross-compilation
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
@@ -36,6 +42,11 @@ RUN --mount=type=cache,target=/root/.npm \
 # Production stage
 FROM cgr.dev/chainguard/wolfi-base:latest AS production
 
+# Import build arguments for target platform
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 ENV NODE_ENV=production
@@ -45,8 +56,7 @@ RUN apk update && apk add --no-cache \
     nodejs \
     ca-certificates \
     sqlite \
-    && update-ca-certificates \
-    && rm -rf /var/cache/apk/*
+    && update-ca-certificates
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs           && \
