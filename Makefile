@@ -33,5 +33,5 @@ build-mcp: create-builder
 run-mcp: build-mcp
 	docker run --rm -t  -e OPENAI_API_KEY=$(OPENAI_API_KEY) -e TRANSPORT_TYPE=http --name mcp -p 3001:3001 $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(MCP_IMAGE_NAME):$(VERSION)
 
-##  To test the MCP image locally
-#    docker run --rm -t -e OPENAI_API_KEY=$OPENAI_API_KEY -e TRANSPORT_TYPE=http -p 3001:3001 ghcr.io/kagent-dev/doc2vec/mcp:1.1.6
+## To test the MCP image locally
+#  docker run --rm -t -e OPENAI_API_KEY=$OPENAI_API_KEY -e TRANSPORT_TYPE=http -p 3001:3001 ghcr.io/kagent-dev/doc2vec/mcp:1.1.6
