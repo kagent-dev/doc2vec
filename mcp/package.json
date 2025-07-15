@@ -24,6 +24,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@azure/openai": "^2.0.0",
+    "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.7",
