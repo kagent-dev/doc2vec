@@ -24,18 +24,10 @@ const __dirname = path.dirname(__filename);
 const openAIApiKey = process.env.OPENAI_API_KEY;
 const dbDir = process.env.SQLITE_DB_DIR || __dirname; // Default to current dir if not set
 
-if (!openAIApiKey) {
-    console.error("Error: OPENAI_API_KEY environment variable is not set.");
-    process.exit(1);
-}
 if (!fs.existsSync(dbDir)) {
     console.warn(`Warning: SQLITE_DB_DIR (${dbDir}) does not exist. Databases may not be found.`);
     process.exit(1);
 }
-
-const openai = new OpenAI({
-    apiKey: openAIApiKey,
-});
 
 export interface QueryResult {
     chunk_id: string;
@@ -48,6 +40,9 @@ export interface QueryResult {
 
 async function createEmbeddings(text: string): Promise<number[]> {
     try {
+        const openai = new OpenAI({
+          apiKey: openAIApiKey,
+        });
         console.error("Calling OpenAI embeddings API...");
         const startTime = Date.now();
         const response = await openai.embeddings.create({
@@ -189,7 +184,7 @@ server.tool(
 
 // --- Transport Setup ---
 async function main() {
-    const transport_type = process.env.TRANSPORT_TYPE || 'sse';
+    const transport_type = process.env.TRANSPORT_TYPE || 'http';
     
     if (transport_type === 'stdio') {
         // Stdio transport for direct communication
