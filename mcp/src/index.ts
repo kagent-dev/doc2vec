@@ -87,9 +87,6 @@ export interface QueryResult {
 }
 
 async function createEmbeddings(text: string): Promise<number[]> {
-    console.error(`Creating embeddings using provider: ${embeddingProvider}`);
-    const startTime = Date.now();
-    
     try {
         let embedding: number[];
         
@@ -98,7 +95,6 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 const openai = new OpenAI({
                     apiKey: openAIApiKey,
                 });
-                console.error("Calling OpenAI embeddings API...");
                 const response = await openai.embeddings.create({
                     model: openAIModel,
                     input: text,
@@ -118,7 +114,6 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 apiVersion: azureApiVersion,
               });
 
-                console.error("Calling Azure OpenAI embeddings API...");
                 const response = await azure.embeddings.create({
                     model: azureDeploymentName, // Use deployment name for Azure
                     input: text,
@@ -132,7 +127,6 @@ async function createEmbeddings(text: string): Promise<number[]> {
             
             case 'gemini': {
                 const genAI = new GoogleGenerativeAI(geminiApiKey!);
-                console.error("Calling Google Gemini embeddings API...");
                 const model = genAI.getGenerativeModel({ model: geminiModel });
                 const result = await model.embedContent(text);
                 if (!result.embedding?.values) {
@@ -145,8 +139,6 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 throw new Error(`Unsupported embedding provider: ${embeddingProvider}. Supported providers: openai, azure, gemini`);
         }
         
-        const duration = Date.now() - startTime;
-        console.error(`${embeddingProvider.toUpperCase()} embeddings received in ${duration}ms.`);
         return embedding;
         
     } catch (error) {
