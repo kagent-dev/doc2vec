@@ -29,6 +29,14 @@ if (!fs.existsSync(dbDir)) {
     process.exit(1);
 }
 
+const strictMode = process.env.STRICT_MODE === 'true';
+if (strictMode) {
+    if (!openAIApiKey) {
+        console.error("Error: OPENAI_API_KEY environment variable is not set.");
+        process.exit(1);
+    }
+}
+
 export interface QueryResult {
     chunk_id: string;
     distance: number;
