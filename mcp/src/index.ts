@@ -2,6 +2,7 @@
 // src/index.ts
 import 'dotenv/config'; // Load .env file
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { AzureOpenAI } from "openai";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -12,6 +13,7 @@ import { randomUUID } from 'crypto';
 import * as sqliteVec from "sqlite-vec";
 import Database, { Database as DatabaseType } from "better-sqlite3";
 import { OpenAI } from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs'; // Import fs for checking file existence
@@ -21,7 +23,25 @@ import fs from 'fs'; // Import fs for checking file existence
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Provider configuration
+// Note: Anthropic does not provide an embeddings API, only text generation
+// Supported providers: 'openai', 'azure', 'gemini'
+const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'openai';
+
+// OpenAI configuration
 const openAIApiKey = process.env.OPENAI_API_KEY;
+const openAIModel = process.env.OPENAI_MODEL || 'text-embedding-3-large';
+
+// Azure OpenAI configuration
+const azureApiKey = process.env.AZURE_OPENAI_KEY;
+const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
+const azureDeploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME || 'text-embedding-3-large';
+
+// Google Gemini configuration
+const geminiApiKey = process.env.GEMINI_API_KEY;
+const geminiModel = process.env.GEMINI_MODEL || 'gemini-embedding-001';
+
 const dbDir = process.env.SQLITE_DB_DIR || __dirname; // Default to current dir if not set
 
 if (!fs.existsSync(dbDir)) {
@@ -31,9 +51,29 @@ if (!fs.existsSync(dbDir)) {
 
 const strictMode = process.env.STRICT_MODE === 'true';
 if (strictMode) {
-    if (!openAIApiKey) {
-        console.error("Error: OPENAI_API_KEY environment variable is not set.");
-        process.exit(1);
+    switch (embeddingProvider) {
+        case 'openai':
+            if (!openAIApiKey) {
+                console.error("Error: OPENAI_API_KEY environment variable is not set.");
+                process.exit(1);
+            }
+            break;
+        case 'azure':
+            if (!azureApiKey || !azureEndpoint) {
+                console.error("Error: AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT environment variables are required for Azure provider.");
+                process.exit(1);
+            }
+            break;
+        case 'gemini':
+            if (!geminiApiKey) {
+                console.error("Error: GEMINI_API_KEY environment variable is not set.");
+                process.exit(1);
+            }
+            break;
+        default:
+            console.error(`Error: Unknown embedding provider '${embeddingProvider}'. Supported providers: openai, azure, gemini`);
+            console.error("Note: Anthropic does not provide an embeddings API, only text generation models.");
+            process.exit(1);
     }
 }
 
@@ -48,24 +88,56 @@ export interface QueryResult {
 
 async function createEmbeddings(text: string): Promise<number[]> {
     try {
-        const openai = new OpenAI({
-          apiKey: openAIApiKey,
-        });
-        console.error("Calling OpenAI embeddings API...");
-        const startTime = Date.now();
-        const response = await openai.embeddings.create({
-            model: 'text-embedding-3-large', // Or your preferred model
-            input: text,
-        });
-        const duration = Date.now() - startTime;
-        console.error(`OpenAI embeddings received in ${duration}ms.`);
-        if (!response.data?.[0]?.embedding) {
-            throw new Error("Failed to get embedding from OpenAI response.");
+
+        switch (embeddingProvider) {
+            case 'openai': {
+                const openai = new OpenAI({
+                    apiKey: openAIApiKey,
+                });
+                const response = await openai.embeddings.create({
+                    model: openAIModel,
+                    input: text,
+                });
+                if (!response.data?.[0]?.embedding) {
+                    throw new Error("Failed to get embedding from OpenAI response.");
+                }
+                return response.data[0].embedding;
+            }
+            
+            case 'azure': {
+              const azure = new AzureOpenAI({
+                apiKey: azureApiKey,
+                endpoint: azureEndpoint,
+                deployment: azureDeploymentName,
+                apiVersion: azureApiVersion,
+              });
+
+                const response = await azure.embeddings.create({
+                    model: azureDeploymentName, // Use deployment name for Azure
+                    input: text,
+                });
+                if (!response.data?.[0]?.embedding) {
+                    throw new Error("Failed to get embedding from Azure OpenAI response.");
+                }
+                return response.data[0].embedding;
+            }
+            
+            case 'gemini': {
+                const genAI = new GoogleGenerativeAI(geminiApiKey!);
+                const model = genAI.getGenerativeModel({ model: geminiModel });
+                const result = await model.embedContent(text);
+                if (!result.embedding?.values) {
+                    throw new Error("Failed to get embedding from Gemini response.");
+                }
+                return result.embedding.values;
+            }
+            default:
+                throw new Error(`Unsupported embedding provider: ${embeddingProvider}. Supported providers: openai, azure, gemini`);
         }
-        return response.data[0].embedding;
+
     } catch (error) {
-        console.error("Error creating OpenAI embeddings:", error);
-        throw new Error(`Failed to create embeddings: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`Error creating ${embeddingProvider} embeddings:`, error);
+        throw new Error(`Failed to create embeddings with ${embeddingProvider}: ${error instanceof Error ? error.message : String(error)}`);
     }
 }
 
