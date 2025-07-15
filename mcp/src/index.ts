@@ -88,8 +88,7 @@ export interface QueryResult {
 
 async function createEmbeddings(text: string): Promise<number[]> {
     try {
-        let embedding: number[];
-        
+
         switch (embeddingProvider) {
             case 'openai': {
                 const openai = new OpenAI({
@@ -102,8 +101,7 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 if (!response.data?.[0]?.embedding) {
                     throw new Error("Failed to get embedding from OpenAI response.");
                 }
-                embedding = response.data[0].embedding;
-                break;
+                return response.data[0].embedding;
             }
             
             case 'azure': {
@@ -121,8 +119,7 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 if (!response.data?.[0]?.embedding) {
                     throw new Error("Failed to get embedding from Azure OpenAI response.");
                 }
-                embedding = response.data[0].embedding;
-                break;
+                return response.data[0].embedding;
             }
             
             case 'gemini': {
@@ -132,15 +129,12 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 if (!result.embedding?.values) {
                     throw new Error("Failed to get embedding from Gemini response.");
                 }
-                embedding = result.embedding.values;
-                break;
+                return result.embedding.values;
             }
             default:
                 throw new Error(`Unsupported embedding provider: ${embeddingProvider}. Supported providers: openai, azure, gemini`);
         }
-        
-        return embedding;
-        
+
     } catch (error) {
         console.error(`Error creating ${embeddingProvider} embeddings:`, error);
         throw new Error(`Failed to create embeddings with ${embeddingProvider}: ${error instanceof Error ? error.message : String(error)}`);
