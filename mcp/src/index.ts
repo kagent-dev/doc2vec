@@ -2,6 +2,7 @@
 // src/index.ts
 import 'dotenv/config'; // Load .env file
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { AzureOpenAI } from "openai";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -110,14 +111,13 @@ async function createEmbeddings(text: string): Promise<number[]> {
             }
             
             case 'azure': {
-                const azure = new OpenAI({
-                    apiKey: azureApiKey,
-                    baseURL: `${azureEndpoint}/openai/deployments/${azureDeploymentName}`,
-                    defaultQuery: { 'api-version': azureApiVersion },
-                    defaultHeaders: {
-                        'api-key': azureApiKey,
-                    },
-                });
+              const azure = new AzureOpenAI({
+                apiKey: azureApiKey,
+                endpoint: azureEndpoint,
+                deployment: azureDeploymentName,
+                apiVersion: azureApiVersion,
+              });
+
                 console.error("Calling Azure OpenAI embeddings API...");
                 const response = await azure.embeddings.create({
                     model: azureDeploymentName, // Use deployment name for Azure

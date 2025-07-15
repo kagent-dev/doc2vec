@@ -24,13 +24,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@azure/identity": "^4.10.2",
     "@azure/openai": "^2.0.0",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
-    "openai": "^4.89.0",
+    "openai": "^4.104.0",
     "sqlite-vec": "0.1.7-alpha.2",
     "zod": "^3.24.2"
   },
