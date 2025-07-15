@@ -35,7 +35,7 @@ const openAIModel = process.env.OPENAI_MODEL || 'text-embedding-3-large';
 // Azure OpenAI configuration
 const azureApiKey = process.env.AZURE_OPENAI_KEY;
 const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
-const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-01';
+const azureApiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
 const azureDeploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME || 'text-embedding-3-large';
 
 // Google Gemini configuration
