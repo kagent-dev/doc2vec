@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/doc2vec.svg)](https://www.npmjs.com/package/doc2vec)
 
-This project provides a configurable tool (`doc2vec`) to crawl specified websites (typically documentation sites), GitHub repositories, and local directories, extract relevant content, convert it to Markdown, chunk it intelligently, generate vector embeddings using OpenAI, and store the chunks along with their embeddings in a vector database (SQLite with `sqlite-vec` or Qdrant).
+This project provides a configurable tool (`doc2vec`) to crawl specified websites (typically documentation sites), GitHub repositories, local directories, and Zendesk support systems, extract relevant content, convert it to Markdown, chunk it intelligently, generate vector embeddings using OpenAI, and store the chunks along with their embeddings in a vector database (SQLite with `sqlite-vec` or Qdrant).
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
 
@@ -12,6 +12,11 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation.
     * **PDF Support:** Automatically downloads and processes PDF files linked from websites.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
+*   **Zendesk Integration:** Fetches support tickets and knowledge base articles from Zendesk, converting them to searchable chunks.
+    * **Support Tickets:** Processes tickets with metadata, descriptions, and comments.
+    * **Knowledge Base Articles:** Converts help center articles from HTML to clean Markdown.
+    * **Incremental Updates:** Only processes tickets/articles updated since the last run.
+    * **Flexible Filtering:** Filter tickets by status and priority.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
@@ -22,9 +27,9 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     *   **SQLite:** Using `better-sqlite3` and the `sqlite-vec` extension for efficient vector search.
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
 *   **Change Detection:** Uses content hashing to detect changes and only re-embeds and updates chunks that have actually been modified.
-*   **Incremental Updates:** For GitHub sources, tracks the last run date to only fetch new or updated issues.
+*   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
-*   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, database types, metadata, and other parameters.
+*   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
 
 ## Prerequisites
@@ -34,6 +39,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **TypeScript:** As the project is written in TypeScript (`ts-node` is used for execution via `npm start`).
 *   **OpenAI API Key:** You need an API key from OpenAI to generate embeddings.
 *   **GitHub Personal Access Token:** Required for accessing GitHub issues (set as `GITHUB_PERSONAL_ACCESS_TOKEN` in your environment).
+*   **Zendesk API Token:** Required for accessing Zendesk tickets and articles (set as `ZENDESK_API_TOKEN` in your environment).
 *   **(Optional) Qdrant Instance:** If using the `qdrant` database type, you need a running Qdrant instance accessible from where you run the script.
 *   **(Optional) Build Tools:** Dependencies like `better-sqlite3` and `sqlite-vec` might require native compilation, which could necessitate build tools like `python`, `make`, and a C++ compiler (like `g++` or Clang) depending on your operating system.
 
@@ -68,6 +74,9 @@ Configuration is managed through two files:
     # Required for GitHub sources
     GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."
 
+    # Required for Zendesk sources
+    ZENDESK_API_TOKEN="your-zendesk-api-token"
+
     # Optional: Required only if using Qdrant
     QDRANT_API_KEY="your-qdrant-api-key"
     ```
@@ -78,7 +87,7 @@ Configuration is managed through two files:
     **Structure:**
 
     *   `sources`: An array of source configurations.
-        *   `type`: Either `'website'`, `'github'`, or `'local_directory'`
+        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, or `'zendesk'`
         
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
@@ -96,6 +105,16 @@ Configuration is managed through two files:
         *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
         *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`). Note: PDF files are processed as binary and this setting doesn't apply to them.
         
+        For Zendesk (`type: 'zendesk'`):
+        *   `zendesk_subdomain`: Your Zendesk subdomain (e.g., `'mycompany'` for mycompany.zendesk.com).
+        *   `email`: Your Zendesk admin email address.
+        *   `api_token`: Your Zendesk API token (reference environment variable as `'${ZENDESK_API_TOKEN}'`).
+        *   `fetch_tickets`: (Optional) Whether to fetch support tickets (defaults to `true`).
+        *   `fetch_articles`: (Optional) Whether to fetch knowledge base articles (defaults to `true`).
+        *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
+        *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved']`).
+        *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
+
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
         *   `version`: A string identifying the product version (used in metadata).
@@ -150,6 +169,24 @@ Configuration is managed through two files:
           params:
             db_path: './project-docs.db'
       
+      # Zendesk example
+      - type: 'zendesk'
+        product_name: 'MyCompany'
+        version: 'latest'
+        zendesk_subdomain: 'mycompany'
+        email: 'admin@mycompany.com'
+        api_token: '${ZENDESK_API_TOKEN}'
+        fetch_tickets: true
+        fetch_articles: true
+        start_date: '2025-01-01'
+        ticket_status: ['open', 'pending']
+        ticket_priority: ['high']
+        max_size: 1048576
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './zendesk-kb.db'
+      
       # Qdrant example
       - type: 'website'
         product_name: 'Istio'
@@ -188,6 +225,7 @@ The script will then:
     - For websites: Crawl the site, process any sitemaps, extract content from HTML pages and download/process PDF files, convert to Markdown
     - For GitHub repos: Fetch issues and comments, convert to Markdown
     - For local directories: Scan files, process content (converting HTML and PDF files to Markdown if needed)
+    - For Zendesk: Fetch tickets and articles, convert to Markdown
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
@@ -296,6 +334,11 @@ If you don't specify a config path, it will look for config.yaml in the current 
           *   Read file content, converting HTML to Markdown if needed.
           *   For PDF files, extract text using Mozilla's PDF.js and convert to Markdown format with proper page structure.
           *   Process each file's content.
+        - **For Zendesk:**
+          *   Fetch tickets and articles using the Zendesk API.
+          *   Convert tickets to formatted Markdown.
+          *   Convert articles to formatted Markdown.
+          *   Track last run date to support incremental updates.
     3.  **Process Content:** For each processed page, issue, or file:
         *   **Chunk:** Split Markdown into smaller `DocumentChunk` objects based on headings and size.
         *   **Hash Check:** Generate a hash of the chunk content. Check if a chunk with the same ID exists in the DB and if its hash matches.

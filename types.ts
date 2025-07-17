@@ -1,6 +1,6 @@
 // Base configuration that applies to all source types
 export interface BaseSourceConfig {
-    type: 'website' | 'github' | 'local_directory';
+    type: 'website' | 'github' | 'local_directory' | 'zendesk';
     product_name: string;
     version: string;
     max_size: number;
@@ -32,8 +32,21 @@ export interface GithubSourceConfig extends BaseSourceConfig {
     start_date?: string;
 }
 
+// Configuration specific to Zendesk sources
+export interface ZendeskSourceConfig extends BaseSourceConfig {
+    type: 'zendesk';
+    zendesk_subdomain: string;     // e.g., 'mycompany' for mycompany.zendesk.com
+    email: string;                 // Zendesk user email for authentication
+    api_token: string;             // Zendesk API token
+    fetch_tickets?: boolean;       // Whether to fetch tickets (default: true)
+    fetch_articles?: boolean;      // Whether to fetch help center articles (default: true)
+    start_date?: string;           // For incremental updates (default: start of current year)
+    ticket_status?: string[];      // Filter tickets by status (default: ['new', 'open', 'pending', 'hold', 'solved'])
+    ticket_priority?: string[];    // Filter tickets by priority (default: all)
+}
+
 // Union type for all possible source configurations
-export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig;
+export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig;
 
 // Database configuration
 export interface DatabaseConfig {
