@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
+import { Buffer } from 'buffer';
 import { OpenAI } from "openai";
 import * as dotenv from "dotenv";
 import { Logger, LogLevel } from './logger';
@@ -17,6 +18,7 @@ import {
     GithubSourceConfig, 
     WebsiteSourceConfig, 
     LocalDirectorySourceConfig,
+    ZendeskSourceConfig,
     DatabaseConnection,
     DocumentChunk
 } from './types';
@@ -50,7 +52,19 @@ class Doc2Vec {
             const logger = this.logger.child('config');
             logger.info(`Loading configuration from ${configPath}`);
             
-            const configFile = fs.readFileSync(configPath, 'utf8');
+            let configFile = fs.readFileSync(configPath, 'utf8');
+            
+            // Substitute environment variables in the format ${VAR_NAME}
+            configFile = configFile.replace(/\$\{([^}]+)\}/g, (match, varName) => {
+                const envValue = process.env[varName];
+                if (envValue === undefined) {
+                    logger.warn(`Environment variable ${varName} not found, keeping placeholder ${match}`);
+                    return match;
+                }
+                logger.debug(`Substituted ${match} with environment variable value`);
+                return envValue;
+            });
+            
             let config = yaml.load(configFile) as any;
             
             const typedConfig = config as Config;
@@ -76,6 +90,8 @@ class Doc2Vec {
                 await this.processWebsite(sourceConfig, sourceLogger);
             } else if (sourceConfig.type === 'local_directory') {
                 await this.processLocalDirectory(sourceConfig, sourceLogger);
+            } else if (sourceConfig.type === 'zendesk') {
+                await this.processZendesk(sourceConfig, sourceLogger);
             } else {
                 sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
             }
@@ -533,6 +549,400 @@ class Doc2Vec {
         }
         
         logger.info(`Finished processing local directory: ${config.path}`);
+    }
+
+    private async processZendesk(config: ZendeskSourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for Zendesk: ${config.zendesk_subdomain}.zendesk.com`);
+        
+        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        
+        // Initialize metadata storage
+        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+        
+        const fetchTickets = config.fetch_tickets !== false; // default true
+        const fetchArticles = config.fetch_articles !== false; // default true
+        
+        if (fetchTickets) {
+            logger.section('ZENDESK TICKETS');
+            await this.fetchAndProcessZendeskTickets(config, dbConnection, logger);
+        }
+        
+        if (fetchArticles) {
+            logger.section('ZENDESK ARTICLES');
+            await this.fetchAndProcessZendeskArticles(config, dbConnection, logger);
+        }
+        
+        logger.info(`Finished processing Zendesk: ${config.zendesk_subdomain}.zendesk.com`);
+    }
+
+    private async fetchAndProcessZendeskTickets(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
+        const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2`;
+        const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
+        
+        // Get the last run date from the database
+        const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
+        const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, `${startDate}T00:00:00Z`, logger);
+        
+        const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    const response = await axios.get(url, {
+                        headers: {
+                            'Authorization': `Basic ${auth}`,
+                            'Content-Type': 'application/json',
+                        },
+                    });
+                    
+                    if (response.status === 429) {
+                        const retryAfter = parseInt(response.headers['retry-after'] || '60');
+                        logger.warn(`Rate limited, waiting ${retryAfter}s before retry`);
+                        await new Promise(res => setTimeout(res, retryAfter * 1000));
+                        continue;
+                    }
+                    
+                    return response.data;
+                } catch (error: any) {
+                    logger.error(`Zendesk API error (attempt ${attempt + 1}):`, error.message);
+                    if (attempt === retries - 1) throw error;
+                    await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
+                }
+            }
+        };
+
+        const generateMarkdownForTicket = (ticket: any, comments: any[]): string => {
+            let md = `# Ticket #${ticket.id}: ${ticket.subject}\n\n`;
+            md += `- **Status:** ${ticket.status}\n`;
+            md += `- **Priority:** ${ticket.priority || 'None'}\n`;
+            md += `- **Type:** ${ticket.type || 'None'}\n`;
+            md += `- **Requester:** ${ticket.requester_id}\n`;
+            md += `- **Assignee:** ${ticket.assignee_id || 'Unassigned'}\n`;
+            md += `- **Created:** ${new Date(ticket.created_at).toDateString()}\n`;
+            md += `- **Updated:** ${new Date(ticket.updated_at).toDateString()}\n`;
+            
+            if (ticket.tags && ticket.tags.length > 0) {
+                md += `- **Tags:** ${ticket.tags.map((tag: string) => `\`${tag}\``).join(', ')}\n`;
+            }
+            
+            // Handle ticket description
+            const description = ticket.description || '';
+            const cleanDescription = description || '_No description._';
+            md += `\n## Description\n\n${cleanDescription}\n\n`;
+            
+            if (comments && comments.length > 0) {
+                md += `## Comments\n\n`;
+                for (const comment of comments) {
+                    if (comment.public) {
+                        md += `### ${comment.author_id} - ${new Date(comment.created_at).toDateString()}\n\n`;
+                        
+                        // Handle comment body
+                        const rawBody = comment.plain_body || comment.html_body || comment.body || '';
+                        const commentBody = rawBody.replace(/&nbsp;/g, " ") || '_No content._';
+                        
+                        md += `${commentBody}\n\n---\n\n`;
+                    }
+                }
+            } else {
+                md += `## Comments\n\n_No comments._\n`;
+            }
+
+            return md;
+        };
+
+        const processTicket = async (ticket: any): Promise<void> => {
+            const ticketId = ticket.id;
+            const url = `https://${config.zendesk_subdomain}.zendesk.com/agent/tickets/${ticketId}`;
+            
+            logger.info(`Processing ticket #${ticketId}`);
+            
+            // Fetch ticket comments
+            const commentsUrl = `${baseUrl}/tickets/${ticketId}/comments.json`;
+            const commentsData = await fetchWithRetry(commentsUrl);
+            const comments = commentsData?.comments || [];
+            
+            // Generate markdown for the ticket
+            const markdown = generateMarkdownForTicket(ticket, comments);
+            
+            // Chunk the markdown content
+            const ticketConfig = {
+                ...config,
+                product_name: config.product_name || `zendesk_${config.zendesk_subdomain}`,
+                max_size: config.max_size || Infinity
+            };
+            
+            const chunks = await this.contentProcessor.chunkMarkdown(markdown, ticketConfig, url);
+            logger.info(`Ticket #${ticketId}: Created ${chunks.length} chunks`);
+            
+            // Process and store each chunk
+            for (const chunk of chunks) {
+                const chunkHash = Utils.generateHash(chunk.content);
+                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+                
+                if (dbConnection.type === 'sqlite') {
+                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
+                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+                    
+                    if (existing && existing.hash === chunkHash) {
+                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                        continue;
+                    }
+
+                    const embeddings = await this.createEmbeddings([chunk.content]);
+                    if (embeddings.length) {
+                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
+                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
+                    } else {
+                        logger.error(`Embedding failed for chunk: ${chunkId}`);
+                    }
+                } else if (dbConnection.type === 'qdrant') {
+                    try {
+                        let pointId: string;
+                        try {
+                            pointId = chunk.metadata.chunk_id;
+                            if (!Utils.isValidUuid(pointId)) {
+                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
+                            }
+                        } catch (e) {
+                            pointId = crypto.randomUUID();
+                        }
+
+                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                            ids: [pointId],
+                            with_payload: true,
+                            with_vector: false,
+                        });
+
+                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
+                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                            continue;
+                        }
+                        
+                        const embeddings = await this.createEmbeddings([chunk.content]);
+                        if (embeddings.length) {
+                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
+                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
+                        } else {
+                            logger.error(`Embedding failed for chunk: ${chunkId}`);
+                        }
+                    } catch (error) {
+                        logger.error(`Error processing chunk in Qdrant:`, error);
+                    }
+                }
+            }
+        };
+
+        logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
+        
+        // Build query parameters
+        const statusFilter = config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved'];
+        const query = `updated>${lastRunDate.split('T')[0]} status:${statusFilter.join(',status:')}`;
+        
+        let nextPage = `${baseUrl}/search.json?query=${encodeURIComponent(query)}&sort_by=updated_at&sort_order=asc`;
+        let totalTickets = 0;
+        
+        while (nextPage) {
+            const data = await fetchWithRetry(nextPage);
+            const tickets = data.results || [];
+            
+            logger.info(`Processing batch of ${tickets.length} tickets`);
+            
+            for (const ticket of tickets) {
+                await processTicket(ticket);
+                totalTickets++;
+            }
+            
+            nextPage = data.next_page;
+            
+            if (nextPage) {
+                logger.debug(`Fetching next page: ${nextPage}`);
+                // Rate limiting: wait between requests
+                await new Promise(res => setTimeout(res, 1000));
+            }
+        }
+
+        // Update the last run date in the database
+        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger);
+        
+        logger.info(`Successfully processed ${totalTickets} tickets`);
+    }
+
+    private async fetchAndProcessZendeskArticles(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
+        const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2/help_center`;
+        const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
+        
+        // Get the start date for filtering
+        const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
+        const startDateObj = new Date(startDate);
+        
+        const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    const response = await axios.get(url, {
+                        headers: {
+                            'Authorization': `Basic ${auth}`,
+                            'Content-Type': 'application/json',
+                        },
+                    });
+                    
+                    if (response.status === 429) {
+                        const retryAfter = parseInt(response.headers['retry-after'] || '60');
+                        logger.warn(`Rate limited, waiting ${retryAfter}s before retry`);
+                        await new Promise(res => setTimeout(res, retryAfter * 1000));
+                        continue;
+                    }
+                    
+                    return response.data;
+                } catch (error: any) {
+                    logger.error(`Zendesk API error (attempt ${attempt + 1}):`, error.message);
+                    if (attempt === retries - 1) throw error;
+                    await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
+                }
+            }
+        };
+
+        const generateMarkdownForArticle = (article: any): string => {
+            let md = `# ${article.title}\n\n`;
+            md += `- **Author:** ${article.author_id}\n`;
+            md += `- **Section:** ${article.section_id}\n`;
+            md += `- **Created:** ${new Date(article.created_at).toDateString()}\n`;
+            md += `- **Updated:** ${new Date(article.updated_at).toDateString()}\n`;
+            md += `- **Vote Sum:** ${article.vote_sum || 0}\n`;
+            md += `- **Vote Count:** ${article.vote_count || 0}\n`;
+            
+            if (article.label_names && article.label_names.length > 0) {
+                md += `- **Labels:** ${article.label_names.map((label: string) => `\`${label}\``).join(', ')}\n`;
+            }
+            
+            // Handle article content - convert HTML to markdown
+            const articleBody = article.body || '';
+            let cleanContent = '_No content._';
+            if (articleBody.trim()) {
+                if (articleBody.includes('<')) {
+                    // HTML content - use ContentProcessor to convert to markdown
+                    cleanContent = this.contentProcessor.convertHtmlToMarkdown(articleBody);
+                } else {
+                    // Plain text content
+                    cleanContent = articleBody;
+                }
+            }
+            
+            md += `\n## Content\n\n${cleanContent}\n`;
+
+            return md;
+        };
+
+        const processArticle = async (article: any): Promise<void> => {
+            const articleId = article.id;
+            const url = article.html_url || `https://${config.zendesk_subdomain}.zendesk.com/hc/articles/${articleId}`;
+            
+            logger.info(`Processing article #${articleId}: ${article.title}`);
+            
+            // Generate markdown for the article
+            const markdown = generateMarkdownForArticle(article);
+            
+            // Chunk the markdown content
+            const articleConfig = {
+                ...config,
+                product_name: config.product_name || `zendesk_${config.zendesk_subdomain}`,
+                max_size: config.max_size || Infinity
+            };
+            
+            const chunks = await this.contentProcessor.chunkMarkdown(markdown, articleConfig, url);
+            logger.info(`Article #${articleId}: Created ${chunks.length} chunks`);
+            
+            // Process and store each chunk (similar to ticket processing)
+            for (const chunk of chunks) {
+                const chunkHash = Utils.generateHash(chunk.content);
+                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+                
+                if (dbConnection.type === 'sqlite') {
+                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
+                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+                    
+                    if (existing && existing.hash === chunkHash) {
+                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                        continue;
+                    }
+
+                    const embeddings = await this.createEmbeddings([chunk.content]);
+                    if (embeddings.length) {
+                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
+                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
+                    } else {
+                        logger.error(`Embedding failed for chunk: ${chunkId}`);
+                    }
+                } else if (dbConnection.type === 'qdrant') {
+                    try {
+                        let pointId: string;
+                        try {
+                            pointId = chunk.metadata.chunk_id;
+                            if (!Utils.isValidUuid(pointId)) {
+                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
+                            }
+                        } catch (e) {
+                            pointId = crypto.randomUUID();
+                        }
+
+                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                            ids: [pointId],
+                            with_payload: true,
+                            with_vector: false,
+                        });
+
+                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
+                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                            continue;
+                        }
+                        
+                        const embeddings = await this.createEmbeddings([chunk.content]);
+                        if (embeddings.length) {
+                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
+                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
+                        } else {
+                            logger.error(`Embedding failed for chunk: ${chunkId}`);
+                        }
+                    } catch (error) {
+                        logger.error(`Error processing chunk in Qdrant:`, error);
+                    }
+                }
+            }
+        };
+
+        logger.info(`Fetching Zendesk help center articles updated since ${startDate}`);
+        
+        let nextPage = `${baseUrl}/articles.json`;
+        let totalArticles = 0;
+        let processedArticles = 0;
+        
+        while (nextPage) {
+            const data = await fetchWithRetry(nextPage);
+            const articles = data.articles || [];
+            
+            logger.info(`Processing batch of ${articles.length} articles`);
+            
+            for (const article of articles) {
+                totalArticles++;
+                
+                // Check if article was updated since the start date
+                const updatedAt = new Date(article.updated_at);
+                if (updatedAt >= startDateObj) {
+                    await processArticle(article);
+                    processedArticles++;
+                } else {
+                    logger.debug(`Skipping article #${article.id} (updated ${article.updated_at}, before ${startDate})`);
+                }
+            }
+            
+            nextPage = data.next_page;
+            
+            if (nextPage) {
+                logger.debug(`Fetching next page: ${nextPage}`);
+                // Rate limiting: wait between requests
+                await new Promise(res => setTimeout(res, 1000));
+            }
+        }
+        
+        logger.info(`Successfully processed ${processedArticles} of ${totalArticles} articles (filtered by date >= ${startDate})`);
     }
 
     private async createEmbeddings(texts: string[]): Promise<number[][]> {

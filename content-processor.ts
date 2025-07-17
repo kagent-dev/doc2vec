@@ -129,6 +129,32 @@ export class ContentProcessor {
         logger.debug('Turndown rules setup complete');
     }
 
+    public convertHtmlToMarkdown(html: string): string {
+        if (!html || !html.trim()) {
+            return '';
+        }
+
+        // Sanitize the HTML first
+        const cleanHtml = sanitizeHtml(html, {
+            allowedTags: [
+                'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+                'blockquote', 'br'
+            ],
+            allowedAttributes: {
+                'a': ['href'],
+                'pre': ['class', 'data-language'],
+                'code': ['class', 'data-language'],
+                'div': ['class'],
+                'span': ['class']
+            }
+        });
+
+        // Convert to markdown using TurndownService
+        return this.turndownService.turndown(cleanHtml).trim();
+    }
+
     async parseSitemap(sitemapUrl: string, logger: Logger): Promise<string[]> {
         logger.info(`Parsing sitemap from ${sitemapUrl}`);
         try {
