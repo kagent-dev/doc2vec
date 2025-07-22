@@ -529,6 +529,10 @@ async function main() {
                 }
             }
         });
+
+        app.get("/health", (_: Request, res: Response) => {
+            res.status(200).send("OK");
+        });
         
         const PORT = process.env.PORT || 3001;
         webserver = app.listen(PORT, () => {
