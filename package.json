@@ -27,6 +27,7 @@
     "license": "ISC",
     "dependencies": {
         "@mozilla/readability": "^0.4.4",
+        "@notionhq/client": "^2.3.0",
         "@qdrant/js-client-rest": "^1.13.0",
         "@qdrant/qdrant-js": "^1.13.0",
         "axios": "^1.6.2",
@@ -36,6 +37,7 @@
         "dotenv": "^16.3.1",
         "js-yaml": "^4.1.0",
         "jsdom": "^26.0.0",
+        "notion-to-md": "^4.0.0-alpha.7",
         "openai": "^4.20.1",
         "pdfjs-dist": "^5.3.31",
         "puppeteer": "^24.1.1",
