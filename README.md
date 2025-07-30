@@ -17,6 +17,8 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     * **Knowledge Base Articles:** Converts help center articles from HTML to clean Markdown.
     * **Incremental Updates:** Only processes tickets/articles updated since the last run.
     * **Flexible Filtering:** Filter tickets by status and priority.
+*   **Notion Integration:** Fetches entries from a Notion database, converting them to searchable chunks.
+    * **Flexible Filtering:** filter returned entries from the database using specified criteria.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
@@ -114,6 +116,12 @@ Configuration is managed through two files:
         *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
         *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved']`).
         *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
+        
+        For Notion (`type: 'notion'`):
+        *   `api_token`: Your Notion API token (reference environment variable
+            as `'${NOTION_API_TOKEN}'`).
+        *   `database_id`: The ID of the Notion database to query
+        *   `filter`: Filter to apply when querying the database
 
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
@@ -186,6 +194,21 @@ Configuration is managed through two files:
           type: 'sqlite'
           params:
             db_path: './zendesk-kb.db'
+
+      # Notion example
+      - type: notion
+        product_name: 'notion-database'
+        version: 'latest'
+        database_id: '897e5a76ae524b489fdfe71f5945d1af'
+        api_token: '${NOTION_API_TOKEN}'
+        filter:
+          property: 'Status'
+          status:
+            equals: 'Current'
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './notion-database.db'
       
       # Qdrant example
       - type: 'website'
