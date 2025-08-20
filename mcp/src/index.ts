@@ -18,11 +18,15 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs'; // Import fs for checking file existence
+import { Logger } from './logger.js';
 
 // --- Configuration & Environment Check ---
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Initialize logger
+const logger = new Logger();
 
 // Provider configuration
 // Note: Anthropic does not provide an embeddings API, only text generation
@@ -46,7 +50,7 @@ const geminiModel = process.env.GEMINI_MODEL || 'gemini-embedding-001';
 const dbDir = process.env.SQLITE_DB_DIR || __dirname; // Default to current dir if not set
 
 if (!fs.existsSync(dbDir)) {
-    console.warn(`Warning: SQLITE_DB_DIR (${dbDir}) does not exist. Databases may not be found.`);
+    logger.warn(`SQLITE_DB_DIR (${dbDir}) does not exist. Databases may not be found.`);
     process.exit(1);
 }
 
@@ -55,25 +59,25 @@ if (strictMode) {
     switch (embeddingProvider) {
         case 'openai':
             if (!openAIApiKey) {
-                console.error("Error: OPENAI_API_KEY environment variable is not set.");
+                logger.error("OPENAI_API_KEY environment variable is not set.");
                 process.exit(1);
             }
             break;
         case 'azure':
             if (!azureApiKey || !azureEndpoint) {
-                console.error("Error: AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT environment variables are required for Azure provider.");
+                logger.error("AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT environment variables are required for Azure provider.");
                 process.exit(1);
             }
             break;
         case 'gemini':
             if (!geminiApiKey) {
-                console.error("Error: GEMINI_API_KEY environment variable is not set.");
+                logger.error("GEMINI_API_KEY environment variable is not set.");
                 process.exit(1);
             }
             break;
         default:
-            console.error(`Error: Unknown embedding provider '${embeddingProvider}'. Supported providers: openai, azure, gemini`);
-            console.error("Note: Anthropic does not provide an embeddings API, only text generation models.");
+            logger.error(`Unknown embedding provider '${embeddingProvider}'. Supported providers: openai, azure, gemini`);
+            logger.error("Note: Anthropic does not provide an embeddings API, only text generation models.");
             process.exit(1);
     }
 }
@@ -88,8 +92,9 @@ export interface QueryResult {
 }
 
 async function createEmbeddings(text: string): Promise<number[]> {
-    try {
+    logger.debug("Creating embeddings");
 
+    try {
         switch (embeddingProvider) {
             case 'openai': {
                 const openai = new OpenAI({
@@ -137,12 +142,14 @@ async function createEmbeddings(text: string): Promise<number[]> {
         }
 
     } catch (error) {
-        console.error(`Error creating ${embeddingProvider} embeddings:`, error);
+        logger.error(`Error creating ${embeddingProvider} embeddings:`, error);
         throw new Error(`Failed to create embeddings with ${embeddingProvider}: ${error instanceof Error ? error.message : String(error)}`);
     }
 }
 
 function queryCollection(queryEmbedding: number[], filter: { product_name: string; version?: string }, topK: number = 10): QueryResult[] {
+    logger.debug("Querying collection");
+    
     const dbPath = path.join(dbDir, `${filter.product_name}.db`);
 
     if (!fs.existsSync(dbPath)) {
@@ -152,9 +159,9 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
     let db: DatabaseType | null = null;
     try {
         db = new Database(dbPath);
-        console.error(`[DB ${dbPath}] Opened connection.`);
+        logger.debug(`[DB ${dbPath}] Opened connection.`);
         sqliteVec.load(db);
-        console.error(`[DB ${dbPath}] sqliteVec loaded.`);
+        logger.debug(`[DB ${dbPath}] sqliteVec loaded.`);
         let query = `
               SELECT
                   *,
@@ -170,7 +177,7 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
               LIMIT @top_k;`;
       
         const stmt = db.prepare(query);
-        console.error(`[DB ${dbPath}] Query prepared. Executing...`);
+        logger.debug(`[DB ${dbPath}] Query prepared. Executing...`);
         const startTime = Date.now();
         const rows = stmt.all({
           query_embedding: new Float32Array(queryEmbedding),
@@ -179,7 +186,7 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
           top_k: topK,
         });
         const duration = Date.now() - startTime;
-        console.error(`[DB ${dbPath}] Query executed in ${duration}ms. Found ${rows.length} rows.`);
+        logger.debug(`[DB ${dbPath}] Query executed in ${duration}ms. Found ${rows.length} rows.`);
       
         rows.forEach((row: any) => {
           delete row.embedding;
@@ -187,7 +194,7 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
       
         return rows as QueryResult[];
     } catch (error) {
-        console.error(`Error querying collection in ${dbPath}:`, error);
+        logger.error(`Error querying collection in ${dbPath}:`, error);
         throw new Error(`Database query failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
         if (db) {
@@ -218,15 +225,15 @@ const server = new McpServer({
 
 // --- Define the MCP Tool Logic ---
 const queryDocumentationToolHandler = async ({ queryText, productName, version, limit }: { queryText: string; productName: string; version?: string; limit: number }) => {
-    console.error(`Received query: text="${queryText}", product="${productName}", version="${version || 'any'}", limit=${limit}`);
+    logger.info(`Received query: text="${queryText}", product="${productName}", version="${version || 'any'}", limit=${limit}`);
 
     try {
         const results = await queryDocumentation(queryText, productName, version, limit);
 
         if (results.length === 0) {
-        return {
-            content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
-        };
+            return {
+                content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
+            };
         }
 
         const formattedResults = results.map((r, index) =>
@@ -240,15 +247,15 @@ const queryDocumentationToolHandler = async ({ queryText, productName, version, 
         ).join("\n");
 
         const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
-        console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
+        logger.debug(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
 
         return {
-            content: [{ type: "text" as const, text: responseText }],
+            content: [{ type: "text", text: responseText }],
         };
     } catch (error: any) {
-        console.error("Error processing 'query_documentation' tool:", error);
+        logger.error("Error processing 'query_documentation' tool:", error);
         return {
-            content: [{ type: "text" as const, text: `Error querying documentation: ${error.message}` }],
+            content: [{ type: "text", text: `Error querying documentation: ${error.message}` }],
         };
     }
 };
@@ -274,11 +281,11 @@ async function main() {
     // Common graceful shutdown handler
     const createGracefulShutdownHandler = (transportCleanup: () => Promise<void>) => {
         return async (signal: string) => {
-            console.error(`Received ${signal}, initiating graceful shutdown...`);
+            logger.info(`Received ${signal}, initiating graceful shutdown...`);
             
             const shutdownTimeout = parseInt(process.env.SHUTDOWN_TIMEOUT || '5000', 10);
             const forceExitTimeout = setTimeout(() => {
-                console.error(`Shutdown timeout (${shutdownTimeout}ms) exceeded, force exiting...`);
+                logger.warn(`Shutdown timeout (${shutdownTimeout}ms) exceeded, force exiting...`);
                 process.exit(1);
             }, shutdownTimeout);
 
@@ -288,10 +295,10 @@ async function main() {
                     await new Promise<void>((resolve, reject) => {
                         webserver.close((err: any) => {
                             if (err) {
-                                console.error('Error closing HTTP server:', err);
+                                logger.error('Error closing HTTP server:', err);
                                 reject(err);
                             } else {
-                                console.error('HTTP server closed');
+                                logger.info('HTTP server closed');
                                 resolve();
                             }
                         });
@@ -302,10 +309,10 @@ async function main() {
                 await transportCleanup();
 
                 clearTimeout(forceExitTimeout);
-                console.error('Graceful shutdown complete');
+                logger.info('Graceful shutdown complete');
                 process.exit(0);
             } catch (error) {
-                console.error('Error during graceful shutdown:', error);
+                logger.error('Error during graceful shutdown:', error);
                 clearTimeout(forceExitTimeout);
                 process.exit(1);
             }
@@ -314,14 +321,14 @@ async function main() {
     
     if (transport_type === 'stdio') {
         // Stdio transport for direct communication
-        console.error("Starting MCP server with stdio transport...");
+        logger.info("Starting MCP server with stdio transport...");
         const transport = new StdioServerTransport();
         await server.connect(transport);
-        console.error("MCP server connected via stdio.");
+        logger.info("MCP server connected via stdio.");
         
         // Add shutdown handler for stdio transport
         const shutdownHandler = createGracefulShutdownHandler(async () => {
-            console.error('Closing stdio transport...');
+            logger.info('Closing stdio transport...');
             // StdioServerTransport doesn't have a close method, but we can clean up the connection
             // The transport will be cleaned up when the process exits
         });
@@ -331,7 +338,7 @@ async function main() {
         
     } else if (transport_type === 'sse') {
         // SSE transport for backward compatibility
-        console.error("Starting MCP server with SSE transport...");
+        logger.info("Starting MCP server with SSE transport...");
         
         const app = express();
         
@@ -339,24 +346,24 @@ async function main() {
         const sseTransports: {[sessionId: string]: SSEServerTransport} = {};
 
         app.get("/sse", async (_: Request, res: Response) => {
-            console.error('Received SSE connection request');
+            logger.debug('Received SSE connection request');
             const transport = new SSEServerTransport('/messages', res);
             sseTransports[transport.sessionId] = transport;
             res.on("close", () => {
-                console.error(`SSE connection closed for session ${transport.sessionId}`);
+                logger.debug(`SSE connection closed for session ${transport.sessionId}`);
                 delete sseTransports[transport.sessionId];
             });
             await server.connect(transport);
         });
 
         app.post("/messages", async (req: Request, res: Response) => {
-            console.error('Received SSE message POST request');
+            logger.debug('Received SSE message POST request');
             const sessionId = req.query.sessionId as string;
             const transport = sseTransports[sessionId];
             if (transport) {
                 await transport.handlePostMessage(req, res);
             } else {
-                console.error(`No SSE transport found for sessionId: ${sessionId}`);
+                logger.warn(`No SSE transport found for sessionId: ${sessionId}`);
                 res.status(400).send('No transport found for sessionId');
             }
         });
@@ -367,29 +374,29 @@ async function main() {
 
         const PORT = process.env.PORT || 3001;
         webserver = app.listen(PORT, () => {
-            console.error(`MCP server is running on port ${PORT} with SSE transport`);
-            console.error(`Connect to: http://localhost:${PORT}/sse`);
+            logger.info(`MCP server is running on port ${PORT} with SSE transport`);
+            logger.info(`Connect to: http://localhost:${PORT}/sse`);
         });
         
         webserver.keepAliveTimeout = 3000;
         
         // Keep the process alive
         webserver.on('error', (error: any) => {
-            console.error('HTTP server error:', error);
+            logger.error('HTTP server error:', error);
         });
         
         // Handle server shutdown with proper SIGTERM/SIGINT support
         const shutdownHandler = createGracefulShutdownHandler(async () => {
-            console.error('Closing SSE transports...');
+            logger.info('Closing SSE transports...');
             
             // Close all active SSE transports
             for (const [sessionId, transport] of Object.entries(sseTransports)) {
                 try {
-                    console.error(`Closing SSE transport for session ${sessionId}`);
+                    logger.debug(`Closing SSE transport for session ${sessionId}`);
                     // SSE transports typically don't have a close method, cleanup happens via res.on("close")
                     delete sseTransports[sessionId];
                 } catch (error) {
-                    console.error(`Error cleaning up SSE transport for session ${sessionId}:`, error);
+                    logger.error(`Error cleaning up SSE transport for session ${sessionId}:`, error);
                 }
             }
         });
@@ -399,7 +406,7 @@ async function main() {
         
     } else if (transport_type === 'http') {
         // Streamable HTTP transport for web-based communication
-        console.error("Starting MCP server with HTTP transport...");
+        logger.info("Starting MCP server with HTTP transport...");
         
         const app = express();
         
@@ -408,7 +415,7 @@ async function main() {
         
         // Handle POST requests for MCP initialization and method calls
         app.post('/mcp', async (req: Request, res: Response) => {
-            console.error('Received MCP POST request');
+            logger.debug('Received MCP POST request');
             try {
                 // Check for existing session ID
                 const sessionId = req.headers['mcp-session-id'] as string | undefined;
@@ -444,8 +451,8 @@ async function main() {
                     transport = new StreamableHTTPServerTransport({
                         sessionIdGenerator: () => randomUUID(),
                         onsessioninitialized: (sessionId: string) => {
-                            // Store the transport and server by session ID when session is initialized
-                            console.error(`Session initialized with ID: ${sessionId}`);
+                            // Store the transport by session ID when session is initialized
+                            logger.debug(`Session initialized with ID: ${sessionId}`);
                             transports.set(sessionId, transport);
                             servers.set(sessionId, sessionServer);
                         }
@@ -455,7 +462,7 @@ async function main() {
                     transport.onclose = async () => {
                         const sid = transport.sessionId;
                         if (sid && transports.has(sid)) {
-                            console.error(`Transport closed for session ${sid}, removing from transports and servers map`);
+                            logger.debug(`Transport closed for session ${sid}, removing from transports map`);
                             transports.delete(sid);
                             servers.delete(sid);
                         }
@@ -483,7 +490,7 @@ async function main() {
                 // Handle the request with existing transport
                 await transport.handleRequest(req, res);
             } catch (error) {
-                console.error('Error handling MCP request:', error);
+                logger.error('Error handling MCP request:', error);
                 if (!res.headersSent) {
                     res.status(500).json({
                         jsonrpc: '2.0',
@@ -499,7 +506,7 @@ async function main() {
 
         // Handle GET requests for SSE streams
         app.get('/mcp', async (req: Request, res: Response) => {
-            console.error('Received MCP GET request');
+            logger.debug('Received MCP GET request');
             const sessionId = req.headers['mcp-session-id'] as string | undefined;
             if (!sessionId || !transports.has(sessionId)) {
                 res.status(400).json({
@@ -516,9 +523,9 @@ async function main() {
             // Check for Last-Event-ID header for resumability
             const lastEventId = req.headers['last-event-id'] as string | undefined;
             if (lastEventId) {
-                console.error(`Client reconnecting with Last-Event-ID: ${lastEventId}`);
+                logger.debug(`Client reconnecting with Last-Event-ID: ${lastEventId}`);
             } else {
-                console.error(`Establishing new SSE stream for session ${sessionId}`);
+                logger.debug(`Establishing new SSE stream for session ${sessionId}`);
             }
 
             const transport = transports.get(sessionId);
@@ -540,13 +547,13 @@ async function main() {
                 return;
             }
 
-            console.error(`Received session termination request for session ${sessionId}`);
+            logger.info(`Received session termination request for session ${sessionId}`);
 
             try {
                 const transport = transports.get(sessionId);
                 await transport!.handleRequest(req, res);
             } catch (error) {
-                console.error('Error handling session termination:', error);
+                logger.error('Error handling session termination:', error);
                 if (!res.headersSent) {
                     res.status(500).json({
                         jsonrpc: '2.0',
@@ -566,25 +573,25 @@ async function main() {
         
         const PORT = process.env.PORT || 3001;
         webserver = app.listen(PORT, () => {
-            console.error(`MCP server is running on port ${PORT} with HTTP transport`);
-            console.error(`Connect to: http://localhost:${PORT}/mcp`);
+            logger.info(`MCP server is running on port ${PORT} with HTTP transport`);
+            logger.info(`Connect to: http://localhost:${PORT}/mcp`);
         });
         
         webserver.keepAliveTimeout = 3000;
         
         // Keep the process alive
         webserver.on('error', (error: any) => {
-            console.error('HTTP server error:', error);
+            logger.error('HTTP server error:', error);
         });
         
         // Handle server shutdown with proper SIGTERM/SIGINT support and timeout
         const shutdownHandler = createGracefulShutdownHandler(async () => {
-            console.error('Closing HTTP transports and servers...');
+            logger.info('Closing HTTP transports...');
 
             // Close all active transports and servers with individual timeouts
             const transportClosePromises = Array.from(transports.entries()).map(async ([sessionId, transport]) => {
                 try {
-                    console.error(`Closing transport and server for session ${sessionId}`);
+                    logger.debug(`Closing transport for session ${sessionId}`);
                     
                     // Add timeout to individual transport close operations
                     const closeTimeout = new Promise<void>((_, reject) => {
@@ -597,11 +604,10 @@ async function main() {
                     ]);
                     
                     transports.delete(sessionId);
-                    servers.delete(sessionId);
-                    console.error(`Transport and server closed for session ${sessionId}`);
+                    logger.debug(`Transport closed for session ${sessionId}`);
                 } catch (error) {
-                    console.error(`Error closing transport for session ${sessionId}:`, error);
-                    // Still remove from maps even if close failed
+                    logger.error(`Error closing transport for session ${sessionId}:`, error);
+                    // Still remove from map even if close failed
                     transports.delete(sessionId);
                     servers.delete(sessionId);
                 }
@@ -609,20 +615,20 @@ async function main() {
 
             // Wait for all transports to close, but with overall timeout handled by outer function
             await Promise.allSettled(transportClosePromises);
-            console.error('All transports and servers cleanup completed');
+            logger.info('All transports cleanup completed');
         });
         
         process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
         process.on('SIGINT', () => shutdownHandler('SIGINT'));
         
     } else {
-        console.error(`Unknown transport type: ${transport_type}. Use 'stdio', 'sse', or 'http'.`);
+        logger.error(`Unknown transport type: ${transport_type}. Use 'stdio', 'sse', or 'http'.`);
         process.exit(1);
     }
 }
 
 // Run main when this module is executed directly
 main().catch((error) => {
-    console.error("Failed to start MCP server:", error);
+    logger.error("Failed to start MCP server:", error);
     process.exit(1);
 });
