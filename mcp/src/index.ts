@@ -420,8 +420,8 @@ async function main() {
                 } else if (!sessionId) {
                     // New initialization request - create a new server instance for this session
                     const sessionServer = new McpServer({
-                        name: 'sqlite-vec-mcp-server',
-                        version: '1.0.0',
+                        name: serverName,
+                        version: serverVersion,
                     }, {
                         capabilities: {
                             tools: {},
