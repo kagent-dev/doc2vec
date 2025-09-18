@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+require('dotenv').config()
+
 import axios from 'axios';
 import crypto from 'crypto';
 import * as yaml from 'js-yaml';
@@ -7,25 +9,27 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Buffer } from 'buffer';
 import { OpenAI } from "openai";
-import * as dotenv from "dotenv";
 import { Logger, LogLevel } from './logger';
 import { Utils } from './utils';
 import { DatabaseManager } from './database';
 import { ContentProcessor } from './content-processor';
+
+import { isFullPage, Client as NotionClient } from '@notionhq/client';
+import { NotionConverter } from 'notion-to-md';
+
 import { 
     Config, 
-    SourceConfig, 
     GithubSourceConfig, 
     WebsiteSourceConfig, 
     LocalDirectorySourceConfig,
     ZendeskSourceConfig,
+    NotionSourceConfig,
     DatabaseConnection,
     DocumentChunk
 } from './types';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
 
-dotenv.config();
 
 class Doc2Vec {
     private config: Config;
@@ -35,7 +39,6 @@ class Doc2Vec {
 
     constructor(configPath: string) {
         this.logger = new Logger('Doc2Vec', {
-            level: LogLevel.DEBUG,
             useTimestamp: true,
             useColor: true,
             prettyPrint: true
@@ -92,6 +95,8 @@ class Doc2Vec {
                 await this.processLocalDirectory(sourceConfig, sourceLogger);
             } else if (sourceConfig.type === 'zendesk') {
                 await this.processZendesk(sourceConfig, sourceLogger);
+            } else if (sourceConfig.type === 'notion') {
+                await this.processNotionDatabase(sourceConfig, sourceLogger);
             } else {
                 sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
             }
@@ -210,61 +215,7 @@ class Doc2Vec {
             logger.info(`Issue #${issueNumber}: Created ${chunks.length} chunks`);
             
             // Process and store each chunk immediately
-            for (const chunk of chunks) {
-                const chunkHash = Utils.generateHash(chunk.content);
-                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
-
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
-                } else if (dbConnection.type === 'qdrant') {
-                    try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
-
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
-                    }
-                }
-            }
+            await this.processAndStoreChunks(issueNumber, chunks, dbConnection, logger);
         };
 
         logger.info(`Fetching GitHub issues for ${repo} since ${lastRunDate}`);
@@ -320,74 +271,10 @@ class Doc2Vec {
                 logger.info(`Created ${chunks.length} chunks`);
 
                 if (chunks.length > 0) {
-                    const chunkProgress = logger.progress(`Embedding chunks for ${url}`, chunks.length);
+                    // Track valid chunk IDs
+                    chunks.forEach(chunk => validChunkIds.add(chunk.metadata.chunk_id));
 
-                    for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
-                        validChunkIds.add(chunk.metadata.chunk_id);
-
-                        const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-
-                        let needsEmbedding = true;
-                        const chunkHash = Utils.generateHash(chunk.content);
-
-                        if (dbConnection.type === 'sqlite') {
-                            const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                            const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-
-                            if (existing && existing.hash === chunkHash) {
-                                needsEmbedding = false;
-                                chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            }
-                        } else if (dbConnection.type === 'qdrant') {
-                            try {
-                                let pointId: string;
-                                try {
-                                    pointId = chunk.metadata.chunk_id;
-                                    if (!Utils.isValidUuid(pointId)) {
-                                        pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                                    }
-                                } catch (e) {
-                                    pointId = crypto.randomUUID();
-                                }
-
-                                const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                                    ids: [pointId],
-                                    with_payload: true,
-                                    with_vector: false,
-                                });
-
-                                if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                                    needsEmbedding = false;
-                                    chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                    logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                }
-                            } catch (error) {
-                                logger.error(`Error checking existing point in Qdrant:`, error);
-                            }
-                        }
-
-
-                        if (needsEmbedding) {
-                            const embeddings = await this.createEmbeddings([chunk.content]);
-                            if (embeddings.length > 0) {
-                                const embedding = embeddings[0];
-                                if (dbConnection.type === 'sqlite') {
-                                    DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
-                                    chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
-                                } else if (dbConnection.type === 'qdrant') {
-                                    await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
-                                    chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                                }
-                            } else {
-                                logger.error(`Embedding failed for chunk: ${chunkId}`);
-                                chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
-                            }
-                        }
-                    }
-
-                    chunkProgress.complete();
+                    await this.processAndStoreChunks(url, chunks, dbConnection, logger);
                 }
 
             } catch (error) {
@@ -464,73 +351,10 @@ class Doc2Vec {
                     logger.info(`Created ${chunks.length} chunks`);
                     
                     if (chunks.length > 0) {
-                        const chunkProgress = logger.progress(`Embedding chunks for ${filePath}`, chunks.length);
-                        
-                        for (let i = 0; i < chunks.length; i++) {
-                            const chunk = chunks[i];
-                            validChunkIds.add(chunk.metadata.chunk_id);
-                            
-                            const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                            
-                            let needsEmbedding = true;
-                            const chunkHash = Utils.generateHash(chunk.content);
-                            
-                            if (dbConnection.type === 'sqlite') {
-                                const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                                const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                                
-                                if (existing && existing.hash === chunkHash) {
-                                    needsEmbedding = false;
-                                    chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                    logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                }
-                            } else if (dbConnection.type === 'qdrant') {
-                                try {
-                                    let pointId: string;
-                                    try {
-                                        pointId = chunk.metadata.chunk_id;
-                                        if (!Utils.isValidUuid(pointId)) {
-                                            pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                                        }
-                                    } catch (e) {
-                                        pointId = crypto.randomUUID();
-                                    }
-                                    
-                                    const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                                        ids: [pointId],
-                                        with_payload: true,
-                                        with_vector: false,
-                                    });
-                                    
-                                    if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                                        needsEmbedding = false;
-                                        chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                    }
-                                } catch (error) {
-                                    logger.error(`Error checking existing point in Qdrant:`, error);
-                                }
-                            }
-                            
-                            if (needsEmbedding) {
-                                const embeddings = await this.createEmbeddings([chunk.content]);
-                                if (embeddings.length > 0) {
-                                    const embedding = embeddings[0];
-                                    if (dbConnection.type === 'sqlite') {
-                                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
-                                        chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
-                                    } else if (dbConnection.type === 'qdrant') {
-                                        await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
-                                        chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                                    }
-                                } else {
-                                    logger.error(`Embedding failed for chunk: ${chunkId}`);
-                                    chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
-                                }
-                            }
-                        }
-                        
-                        chunkProgress.complete();
+                        // Track valid chunk IDs
+                        chunks.forEach(chunk => validChunkIds.add(chunk.metadata.chunk_id));
+
+                        await this.processAndStoreChunks(filePath, chunks, dbConnection, logger);
                     }
                 } catch (error) {
                     logger.error(`Error during chunking or embedding for ${filePath}:`, error);
@@ -674,61 +498,7 @@ class Doc2Vec {
             logger.info(`Ticket #${ticketId}: Created ${chunks.length} chunks`);
             
             // Process and store each chunk
-            for (const chunk of chunks) {
-                const chunkHash = Utils.generateHash(chunk.content);
-                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
-
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
-                } else if (dbConnection.type === 'qdrant') {
-                    try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
-
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
-                    }
-                }
-            }
+            await this.processAndStoreChunks(ticketId, chunks, dbConnection, logger);
         };
 
         logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
@@ -851,61 +621,7 @@ class Doc2Vec {
             logger.info(`Article #${articleId}: Created ${chunks.length} chunks`);
             
             // Process and store each chunk (similar to ticket processing)
-            for (const chunk of chunks) {
-                const chunkHash = Utils.generateHash(chunk.content);
-                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
-
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
-                } else if (dbConnection.type === 'qdrant') {
-                    try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
-
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
-                    }
-                }
-            }
+            await this.processAndStoreChunks(articleId, chunks, dbConnection, logger);
         };
 
         logger.info(`Fetching Zendesk help center articles updated since ${startDate}`);
@@ -945,6 +661,112 @@ class Doc2Vec {
         logger.info(`Successfully processed ${processedArticles} of ${totalArticles} articles (filtered by date >= ${startDate})`);
     }
 
+    private async processNotionDatabase(config: NotionSourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for Notion: ${config.database_id}`);
+        
+        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        
+        // Initialize metadata storage
+        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+
+        const notion = new NotionClient({
+            auth: config.api_token,
+        });
+    
+        // Create a NotionConverter instance
+        const n2m = new NotionConverter(notion);
+
+        // Chunk the markdown content   
+        const pageConfig = {
+            ...config,
+            product_name: config.product_name || 'notion',
+            max_size: config.max_size || Infinity
+        };
+
+        const getMarkdownForPage = async (page_id: string): Promise<[string, string]> => {          
+            let pageUrl = '';
+            try {
+                logger.debug(`Retrieving Notion page: ${page_id}`);
+                
+                // Retrieve the page and convert to markdown
+                const page = await notion.pages.retrieve({ page_id: page_id });
+                if (!isFullPage(page)) {
+                    logger.info(`Skipping partial page #${page_id}`);
+                    return ['', ''];
+                }
+    
+                const nameProperty = page.properties.Name;
+                const pageTitle = nameProperty && nameProperty.type === 'title' && nameProperty.title?.[0]?.plain_text || 'Untitled';
+                
+                pageUrl = page.url;
+
+                logger.debug(`Generating markdown for page: ${pageUrl}`);
+                
+                const md = await n2m.convert(page_id);
+                const mdWithNoImages = md.content.replace(/!\[.*?\]\(.*?\)[\s\n]*/g, ''); 
+
+                return [page.url, `# ${pageTitle}${mdWithNoImages}`];
+            } catch (error) {
+                logger.error(`Failed to generate markdown for Notion page ${page_id} (${pageUrl}):`, error);
+                return ['', ''];
+            }
+        }
+
+        const processPage = async (page_id: string): Promise<void> => {
+            logger.info(`Processing Notion page: ${page_id}`);
+            
+            const [url, md] = await getMarkdownForPage(page_id);
+            if (!md) {
+                logger.info(`No markdown for Notion page: ${page_id}`);
+                return
+            }
+
+            const chunks = await this.contentProcessor.chunkMarkdown(md, pageConfig, url);
+            
+            // Process and store each chunk immediately
+            await this.processAndStoreChunks(page_id, chunks, dbConnection, logger);
+            
+            logger.debug(`Finished processing Notion page: ${page_id}`);
+        }
+
+        const processDatabase = async (database_id: string): Promise<void> => {
+            logger.info(`Processing Notion database: ${database_id}`);
+            
+            let next_cursor = undefined;
+
+            try {
+                do {
+                    const response = await notion.databases.query({
+                        database_id: database_id,
+                        start_cursor: next_cursor,
+                        filter: config.filter,
+                    });
+        
+                    for (const res of response.results) {
+                        if (res.object === "database") {
+                            await processDatabase(res.id);
+                        } else if (res.object === "page") {
+                            await processPage(res.id);
+                        } else {
+                            logger.error("unknown database object: ${res.object}");
+                        }
+                    }
+        
+                    next_cursor = response.next_cursor;
+                } while (next_cursor)
+
+                logger.debug(`Finished processing Notion database: ${database_id}`);
+            } catch (error) {
+                logger.error(`Failed to process Notion database ${database_id}:`, error);
+            }
+        }
+
+        await processDatabase(config.database_id);
+
+        logger.info(`Completed processing Notion database: ${config.database_id}`);
+    }
+
     private async createEmbeddings(texts: string[]): Promise<number[][]> {
         const logger = this.logger.child('embeddings');
         try {
@@ -959,6 +781,88 @@ class Doc2Vec {
             logger.error('Failed to create embeddings:', error);
             return [];
         }
+    }
+
+    private async processAndStoreChunks(
+        itemId: string,
+        chunks: DocumentChunk[], 
+        dbConnection: DatabaseConnection, 
+        logger: Logger, 
+    ): Promise<void> {
+        const chunkProgress = logger.progress(`Processing chunks for ${itemId}`, chunks.length);
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+            const chunkHash = Utils.generateHash(chunk.content);
+
+            try {
+                const existing = await this.checkExistingChunk(chunk, chunkHash, dbConnection);
+
+                if (existing) {
+                    chunkProgress.update(1, `Skipping unchanged chunk: ${chunkId}`);
+                    continue;
+                }
+            } catch (error) {
+                const message = `Error checking existing point in database for chunk ${chunkId}: ${error}`
+                logger.error(message);
+                chunkProgress.update(1, message);
+                continue;
+            }
+            
+            const embeddings = await this.createEmbeddings([chunk.content]);
+            if (embeddings.length == 0) {
+                chunkProgress.update(1, `Embedding failed for chunk: ${chunkId}`);
+                continue;
+            }
+
+            const embedding = embeddings[0];
+            let message = '';
+            if (dbConnection.type === 'sqlite') {
+                DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
+                message = `Stored chunk ${chunkId} in SQLite`;
+            } else if (dbConnection.type === 'qdrant') {
+                await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
+                message = `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`;
+            }
+
+            chunkProgress.update(1, message);
+        }
+
+        chunkProgress.complete();
+    }
+
+    private async checkExistingChunk(chunk: DocumentChunk, chunkHash: string, dbConnection: DatabaseConnection): Promise<boolean> {
+        if (dbConnection.type === 'sqlite') {
+            const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
+            const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+            
+            if (existing && existing.hash === chunkHash) {
+                return true;
+            }
+        } else if (dbConnection.type === 'qdrant') {
+            let pointId: string;
+            try {
+                pointId = chunk.metadata.chunk_id;
+                if (!Utils.isValidUuid(pointId)) {
+                    pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
+                }
+            } catch (e) {
+                pointId = crypto.randomUUID();
+            }
+
+            const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                ids: [pointId],
+                with_payload: true,
+                with_vector: false,
+            });
+
+            if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
 
