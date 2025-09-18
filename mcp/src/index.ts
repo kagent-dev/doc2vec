@@ -2,6 +2,7 @@
 // src/index.ts
 import 'dotenv/config'; // Load .env file
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { AzureOpenAI } from "openai";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -215,6 +216,43 @@ const server = new McpServer({
     capabilities: {},
 });
 
+// --- Define the MCP Tool Logic ---
+const queryDocumentationToolHandler = async ({ queryText, productName, version, limit }: { queryText: string; productName: string; version?: string; limit: number }) => {
+    console.error(`Received query: text="${queryText}", product="${productName}", version="${version || 'any'}", limit=${limit}`);
+
+    try {
+        const results = await queryDocumentation(queryText, productName, version, limit);
+
+        if (results.length === 0) {
+        return {
+            content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
+        };
+        }
+
+        const formattedResults = results.map((r, index) =>
+            [
+                `Result ${index + 1}:`,
+                `  Content: ${r.content}`,
+                `  Distance: ${r.distance.toFixed(4)}`,
+                r.url ? `  URL: ${r.url}` : null,
+                "---"
+            ].filter(line => line !== null).join("\n")
+        ).join("\n");
+
+        const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
+        console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
+
+        return {
+            content: [{ type: "text" as const, text: responseText }],
+        };
+    } catch (error: any) {
+        console.error("Error processing 'query_documentation' tool:", error);
+        return {
+            content: [{ type: "text" as const, text: `Error querying documentation: ${error.message}` }],
+        };
+    }
+};
+
 // --- Define the MCP Tool ---
 server.tool(
     "query_documentation",
@@ -225,41 +263,7 @@ server.tool(
         version: z.string().optional().describe("The specific version of the product documentation (e.g., '1.2.0'). Optional."),
         limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
     },
-    async ({ queryText, productName, version, limit }: { queryText: string; productName: string; version?: string; limit: number }) => {
-        console.error(`Received query: text="${queryText}", product="${productName}", version="${version || 'any'}", limit=${limit}`);
-
-        try {
-            const results = await queryDocumentation(queryText, productName, version, limit);
-
-            if (results.length === 0) {
-                return {
-                    content: [{ type: "text", text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
-                };
-            }
-
-            const formattedResults = results.map((r, index) =>
-                [
-                    `Result ${index + 1}:`,
-                    `  Content: ${r.content}`,
-                    `  Distance: ${r.distance.toFixed(4)}`,
-                    r.url ? `  URL: ${r.url}` : null,
-                    "---"
-                ].filter(line => line !== null).join("\n")
-            ).join("\n");
-
-            const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
-            console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
-
-            return {
-                content: [{ type: "text", text: responseText }],
-            };
-        } catch (error: any) {
-            console.error("Error processing 'query_documentation' tool:", error);
-            return {
-                content: [{ type: "text", text: `Error querying documentation: ${error.message}` }],
-            };
-        }
-    }
+    queryDocumentationToolHandler
 );
 
 // --- Transport Setup ---
@@ -400,6 +404,7 @@ async function main() {
         const app = express();
         
         const transports: Map<string, StreamableHTTPServerTransport> = new Map<string, StreamableHTTPServerTransport>();
+        const servers: Map<string, McpServer> = new Map<string, McpServer>();
         
         // Handle POST requests for MCP initialization and method calls
         app.post('/mcp', async (req: Request, res: Response) => {
@@ -413,27 +418,52 @@ async function main() {
                     // Reuse existing transport
                     transport = transports.get(sessionId)!;
                 } else if (!sessionId) {
-                    // New initialization request
+                    // New initialization request - create a new server instance for this session
+                    const sessionServer = new McpServer({
+                        name: serverName,
+                        version: serverVersion,
+                    }, {
+                        capabilities: {
+                            tools: {},
+                        },
+                    });
+
+                    // Add the query_documentation tool to this server instance using the shared handler
+                    sessionServer.tool(
+                        "query_documentation",
+                        "Query documentation stored in a sqlite-vec database using vector search.",
+                        {
+                            queryText: z.string().min(1).describe("The natural language query to search for."),
+                            productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+                            version: z.string().optional().describe("The specific version of the product documentation (e.g., '1.2.0'). Optional."),
+                            limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
+                        },
+                        queryDocumentationToolHandler
+                    );
+
                     transport = new StreamableHTTPServerTransport({
                         sessionIdGenerator: () => randomUUID(),
                         onsessioninitialized: (sessionId: string) => {
-                            // Store the transport by session ID when session is initialized
+                            // Store the transport and server by session ID when session is initialized
                             console.error(`Session initialized with ID: ${sessionId}`);
                             transports.set(sessionId, transport);
+                            servers.set(sessionId, sessionServer);
                         }
                     });
 
-                    // Set up onclose handler to clean up transport when closed
+                    // Set up onclose handler to clean up transport and server when closed
                     transport.onclose = async () => {
                         const sid = transport.sessionId;
                         if (sid && transports.has(sid)) {
-                            console.error(`Transport closed for session ${sid}, removing from transports map`);
+                            console.error(`Transport closed for session ${sid}, removing from transports and servers map`);
                             transports.delete(sid);
+                            servers.delete(sid);
                         }
                     };
 
-                    // Connect the transport to the MCP server BEFORE handling the request
-                    await server.connect(transport);
+                    // Connect the transport to the session-specific MCP s
+                    // erver BEFORE handling the request
+                    await sessionServer.connect(transport);
 
                     await transport.handleRequest(req, res);
                     return; // Already handled
@@ -549,12 +579,12 @@ async function main() {
         
         // Handle server shutdown with proper SIGTERM/SIGINT support and timeout
         const shutdownHandler = createGracefulShutdownHandler(async () => {
-            console.error('Closing HTTP transports...');
+            console.error('Closing HTTP transports and servers...');
 
-            // Close all active transports with individual timeouts
+            // Close all active transports and servers with individual timeouts
             const transportClosePromises = Array.from(transports.entries()).map(async ([sessionId, transport]) => {
                 try {
-                    console.error(`Closing transport for session ${sessionId}`);
+                    console.error(`Closing transport and server for session ${sessionId}`);
                     
                     // Add timeout to individual transport close operations
                     const closeTimeout = new Promise<void>((_, reject) => {
@@ -567,17 +597,19 @@ async function main() {
                     ]);
                     
                     transports.delete(sessionId);
-                    console.error(`Transport closed for session ${sessionId}`);
+                    servers.delete(sessionId);
+                    console.error(`Transport and server closed for session ${sessionId}`);
                 } catch (error) {
                     console.error(`Error closing transport for session ${sessionId}:`, error);
-                    // Still remove from map even if close failed
+                    // Still remove from maps even if close failed
                     transports.delete(sessionId);
+                    servers.delete(sessionId);
                 }
             });
 
             // Wait for all transports to close, but with overall timeout handled by outer function
             await Promise.allSettled(transportClosePromises);
-            console.error('All transports cleanup completed');
+            console.error('All transports and servers cleanup completed');
         });
         
         process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
