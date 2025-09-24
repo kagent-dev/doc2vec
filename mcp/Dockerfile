@@ -60,6 +60,31 @@ RUN echo "Building for platform: $TARGETPLATFORM" && \
     find /app/build/               && \
     echo "🤖 Build completed !!!"
 
+# Final stage - use target platform
+FROM cgr.dev/chainguard/wolfi-base:latest
+
+# Import build arguments for cross-compilation
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV NODE_ENV=production
+ENV NODE_PATH=/app/node_modules
+
+# Install only runtime dependencies for target platform
+RUN apk update && apk add --no-cache \
+    nodejs \
+    ca-certificates
+
+WORKDIR /app
+
+# Copy built artifacts from builder stage
+COPY --from=builder /app/build /app/build
+COPY --from=builder /app/node_modules /app/node_modules
+
 # Create non-root user and verify build directory
 RUN addgroup -g 1001 -S nodejs     && \
     adduser -S kagent -u 1001 -G nodejs
