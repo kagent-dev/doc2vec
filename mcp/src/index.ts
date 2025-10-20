@@ -15,6 +15,7 @@ import * as sqliteVec from "sqlite-vec";
 import Database, { Database as DatabaseType } from "better-sqlite3";
 import { OpenAI } from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import axios from 'axios';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs'; // Import fs for checking file existence
@@ -26,7 +27,7 @@ const __dirname = path.dirname(__filename);
 
 // Provider configuration
 // Note: Anthropic does not provide an embeddings API, only text generation
-// Supported providers: 'openai', 'azure', 'gemini'
+// Supported providers: 'openai', 'azure', 'gemini', 'custom'
 const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'openai';
 
 // OpenAI configuration
@@ -42,6 +43,9 @@ const azureDeploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME || 'text-em
 // Google Gemini configuration
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const geminiModel = process.env.GEMINI_MODEL || 'gemini-embedding-001';
+
+// Custom endpoint configuration
+const customEndpoint = process.env.CUSTOM_ENDPOINT;
 
 const dbDir = process.env.SQLITE_DB_DIR || __dirname; // Default to current dir if not set
 
@@ -71,8 +75,14 @@ if (strictMode) {
                 process.exit(1);
             }
             break;
+        case 'custom':
+            if (!customEndpoint || !openAIApiKey) {
+                console.error("Error: CUSTOM_ENDPOINT and OPENAI_API_KEY environment variables are required for custom provider.");
+                process.exit(1);
+            }
+            break;
         default:
-            console.error(`Error: Unknown embedding provider '${embeddingProvider}'. Supported providers: openai, azure, gemini`);
+            console.error(`Error: Unknown embedding provider '${embeddingProvider}'. Supported providers: openai, azure, gemini, custom`);
             console.error("Note: Anthropic does not provide an embeddings API, only text generation models.");
             process.exit(1);
     }
@@ -104,14 +114,14 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 }
                 return response.data[0].embedding;
             }
-            
+
             case 'azure': {
-              const azure = new AzureOpenAI({
-                apiKey: azureApiKey,
-                endpoint: azureEndpoint,
-                deployment: azureDeploymentName,
-                apiVersion: azureApiVersion,
-              });
+                const azure = new AzureOpenAI({
+                    apiKey: azureApiKey,
+                    endpoint: azureEndpoint,
+                    deployment: azureDeploymentName,
+                    apiVersion: azureApiVersion,
+                });
 
                 const response = await azure.embeddings.create({
                     model: azureDeploymentName, // Use deployment name for Azure
@@ -122,7 +132,7 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 }
                 return response.data[0].embedding;
             }
-            
+
             case 'gemini': {
                 const genAI = new GoogleGenerativeAI(geminiApiKey!);
                 const model = genAI.getGenerativeModel({ model: geminiModel });
@@ -132,8 +142,24 @@ async function createEmbeddings(text: string): Promise<number[]> {
                 }
                 return result.embedding.values;
             }
+
+            case 'custom': {
+                const response = await axios.post(`${customEndpoint}/embeddings`, {
+                    model: openAIModel,
+                    input: text,
+                }, {
+                    headers: {
+                        'Authorization': `Bearer ${openAIApiKey}`,
+                        'Content-Type': 'application/json',
+                    },
+                });
+                if (!response.data?.data?.[0]?.embedding) {
+                    throw new Error("Failed to get embedding from custom endpoint response.");
+                }
+                return response.data.data[0].embedding;
+            }
             default:
-                throw new Error(`Unsupported embedding provider: ${embeddingProvider}. Supported providers: openai, azure, gemini`);
+                throw new Error(`Unsupported embedding provider: ${embeddingProvider}. Supported providers: openai, azure, gemini, custom`);
         }
 
     } catch (error) {
@@ -161,30 +187,30 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
                   distance
               FROM vec_items
               WHERE embedding MATCH @query_embedding`;
-      
+
         if (filter.product_name) query += ` AND product_name = @product_name`;
         if (filter.version) query += ` AND version = @version`;
-      
+
         query += `
               ORDER BY distance
               LIMIT @top_k;`;
-      
+
         const stmt = db.prepare(query);
         console.error(`[DB ${dbPath}] Query prepared. Executing...`);
         const startTime = Date.now();
         const rows = stmt.all({
-          query_embedding: new Float32Array(queryEmbedding),
-          product_name: filter.product_name,
-          version: filter.version,
-          top_k: topK,
+            query_embedding: new Float32Array(queryEmbedding),
+            product_name: filter.product_name,
+            version: filter.version,
+            top_k: topK,
         });
         const duration = Date.now() - startTime;
         console.error(`[DB ${dbPath}] Query executed in ${duration}ms. Found ${rows.length} rows.`);
-      
+
         rows.forEach((row: any) => {
-          delete row.embedding;
+            delete row.embedding;
         })
-      
+
         return rows as QueryResult[];
     } catch (error) {
         console.error(`Error querying collection in ${dbPath}:`, error);
@@ -224,9 +250,9 @@ const queryDocumentationToolHandler = async ({ queryText, productName, version, 
         const results = await queryDocumentation(queryText, productName, version, limit);
 
         if (results.length === 0) {
-        return {
-            content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
-        };
+            return {
+                content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
+            };
         }
 
         const formattedResults = results.map((r, index) =>
@@ -270,12 +296,12 @@ server.tool(
 async function main() {
     const transport_type = process.env.TRANSPORT_TYPE || 'http';
     let webserver: any = null; // Store server reference for proper shutdown
-    
+
     // Common graceful shutdown handler
     const createGracefulShutdownHandler = (transportCleanup: () => Promise<void>) => {
         return async (signal: string) => {
             console.error(`Received ${signal}, initiating graceful shutdown...`);
-            
+
             const shutdownTimeout = parseInt(process.env.SHUTDOWN_TIMEOUT || '5000', 10);
             const forceExitTimeout = setTimeout(() => {
                 console.error(`Shutdown timeout (${shutdownTimeout}ms) exceeded, force exiting...`);
@@ -311,32 +337,32 @@ async function main() {
             }
         };
     };
-    
+
     if (transport_type === 'stdio') {
         // Stdio transport for direct communication
         console.error("Starting MCP server with stdio transport...");
         const transport = new StdioServerTransport();
         await server.connect(transport);
         console.error("MCP server connected via stdio.");
-        
+
         // Add shutdown handler for stdio transport
         const shutdownHandler = createGracefulShutdownHandler(async () => {
             console.error('Closing stdio transport...');
             // StdioServerTransport doesn't have a close method, but we can clean up the connection
             // The transport will be cleaned up when the process exits
         });
-        
+
         process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
         process.on('SIGINT', () => shutdownHandler('SIGINT'));
-        
+
     } else if (transport_type === 'sse') {
         // SSE transport for backward compatibility
         console.error("Starting MCP server with SSE transport...");
-        
+
         const app = express();
-        
+
         // Storage for SSE transports by session ID
-        const sseTransports: {[sessionId: string]: SSEServerTransport} = {};
+        const sseTransports: { [sessionId: string]: SSEServerTransport } = {};
 
         app.get("/sse", async (_: Request, res: Response) => {
             console.error('Received SSE connection request');
@@ -370,18 +396,18 @@ async function main() {
             console.error(`MCP server is running on port ${PORT} with SSE transport`);
             console.error(`Connect to: http://localhost:${PORT}/sse`);
         });
-        
+
         webserver.keepAliveTimeout = 3000;
-        
+
         // Keep the process alive
         webserver.on('error', (error: any) => {
             console.error('HTTP server error:', error);
         });
-        
+
         // Handle server shutdown with proper SIGTERM/SIGINT support
         const shutdownHandler = createGracefulShutdownHandler(async () => {
             console.error('Closing SSE transports...');
-            
+
             // Close all active SSE transports
             for (const [sessionId, transport] of Object.entries(sseTransports)) {
                 try {
@@ -393,19 +419,19 @@ async function main() {
                 }
             }
         });
-        
+
         process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
         process.on('SIGINT', () => shutdownHandler('SIGINT'));
-        
+
     } else if (transport_type === 'http') {
         // Streamable HTTP transport for web-based communication
         console.error("Starting MCP server with HTTP transport...");
-        
+
         const app = express();
-        
+
         const transports: Map<string, StreamableHTTPServerTransport> = new Map<string, StreamableHTTPServerTransport>();
         const servers: Map<string, McpServer> = new Map<string, McpServer>();
-        
+
         // Handle POST requests for MCP initialization and method calls
         app.post('/mcp', async (req: Request, res: Response) => {
             console.error('Received MCP POST request');
@@ -563,20 +589,20 @@ async function main() {
         app.get("/health", (_: Request, res: Response) => {
             res.status(200).send("OK");
         });
-        
+
         const PORT = process.env.PORT || 3001;
         webserver = app.listen(PORT, () => {
             console.error(`MCP server is running on port ${PORT} with HTTP transport`);
             console.error(`Connect to: http://localhost:${PORT}/mcp`);
         });
-        
+
         webserver.keepAliveTimeout = 3000;
-        
+
         // Keep the process alive
         webserver.on('error', (error: any) => {
             console.error('HTTP server error:', error);
         });
-        
+
         // Handle server shutdown with proper SIGTERM/SIGINT support and timeout
         const shutdownHandler = createGracefulShutdownHandler(async () => {
             console.error('Closing HTTP transports and servers...');
@@ -585,17 +611,17 @@ async function main() {
             const transportClosePromises = Array.from(transports.entries()).map(async ([sessionId, transport]) => {
                 try {
                     console.error(`Closing transport and server for session ${sessionId}`);
-                    
+
                     // Add timeout to individual transport close operations
                     const closeTimeout = new Promise<void>((_, reject) => {
                         setTimeout(() => reject(new Error(`Transport close timeout for ${sessionId}`)), 2000);
                     });
-                    
+
                     await Promise.race([
                         transport.close(),
                         closeTimeout
                     ]);
-                    
+
                     transports.delete(sessionId);
                     servers.delete(sessionId);
                     console.error(`Transport and server closed for session ${sessionId}`);
@@ -611,10 +637,10 @@ async function main() {
             await Promise.allSettled(transportClosePromises);
             console.error('All transports and servers cleanup completed');
         });
-        
+
         process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
         process.on('SIGINT', () => shutdownHandler('SIGINT'));
-        
+
     } else {
         console.error(`Unknown transport type: ${transport_type}. Use 'stdio', 'sse', or 'http'.`);
         process.exit(1);
