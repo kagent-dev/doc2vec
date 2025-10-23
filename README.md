@@ -68,8 +68,20 @@ Configuration is managed through two files:
     ```dotenv
     # .env
 
-    # Required: Your OpenAI API Key
+    # Required: Your OpenAI API Key (used for both OpenAI and custom providers)
     OPENAI_API_KEY="sk-..."
+
+    # Optional: Embedding provider (defaults to "openai")
+    PROVIDER="openai"  # or "custom"
+
+    # Optional: Custom embedding model (defaults based on provider)
+    EMBEDDING_MODEL="text-embedding-3-large"  # or your preferred model
+
+    # Required if using custom provider: Custom endpoint URL
+    CUSTOM_ENDPOINT="http://localhost:8000/v1/embeddings"
+
+    # Optional: Vector size of custom embedding model
+    EMBEDDING_VECTOR_SIZE=1024
 
     # Required for GitHub sources
     GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."
@@ -84,19 +96,25 @@ Configuration is managed through two files:
 2.  **`config.yaml` file:**
     This file defines the sources to process and how to handle them. Create a `config.yaml` file (or use a different name and pass it as an argument).
 
+    **Embedding Provider Configuration:**
+
+    Embedding providers are now configured via environment variables:
+    - `OPENAI_API_KEY`: API key used for both providers
+    - `PROVIDER`: Set to "openai" (default) or "custom"
+    - `EMBEDDING_MODEL`: Model to use (default: "text-embedding-3-large")
+    - `EMBEDDING_VECTOR_SIZE`: Vector size of the custom embedding model (default: 3072)
+    - `CUSTOM_ENDPOINT`: Required when using custom provider (e.g., "http://localhost:8000/v1/embeddings")
+
     **Structure:**
 
     *   `sources`: An array of source configurations.
         *   `type`: Either `'website'`, `'github'`, `'local_directory'`, or `'zendesk'`
-        
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
         *   `sitemap_url`: (Optional) URL to the site's XML sitemap for discovering additional pages not linked in navigation.
-        
         For GitHub repositories (`type: 'github'`):
         *   `repo`: Repository name in the format `'owner/repo'` (e.g., `'istio/istio'`).
         *   `start_date`: (Optional) Starting date to fetch issues from (e.g., `'2025-01-01'`).
-        
         For local directories (`type: 'local_directory'`):
         *   `path`: Path to the local directory to process.
         *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf']`.
@@ -104,7 +122,6 @@ Configuration is managed through two files:
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
         *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`). Note: PDF files are processed as binary and this setting doesn't apply to them.
-        
         For Zendesk (`type: 'zendesk'`):
         *   `zendesk_subdomain`: Your Zendesk subdomain (e.g., `'mycompany'` for mycompany.zendesk.com).
         *   `email`: Your Zendesk admin email address.
@@ -131,6 +148,21 @@ Configuration is managed through two files:
 
     **Example (`config.yaml`):**
     ```yaml
+    # Example with OpenAI embedding provider (default)
+    embedding_config:
+      provider: "openai"
+      openai:
+        api_key_env: "OPENAI_API_KEY"
+
+    # Example with custom embedding provider (LiteLLM)
+    # embedding_config:
+    #   provider: "custom"
+    #   custom:
+    #     endpoint: "http://localhost:8000/v1/embeddings"
+    #     model: "text-embedding-ada-002"
+    #     api_key_env: "LITELLM_API_KEY"
+    #     timeout: 30000
+
     sources:
       # Website source example
       - type: 'website'
@@ -155,7 +187,6 @@ Configuration is managed through two files:
           type: 'sqlite'
           params:
             db_path: './istio-issues.db'
-      
       # Local directory source example
       - type: 'local_directory'
         product_name: 'project-docs'
@@ -168,7 +199,6 @@ Configuration is managed through two files:
           type: 'sqlite'
           params:
             db_path: './project-docs.db'
-      
       # Zendesk example
       - type: 'zendesk'
         product_name: 'MyCompany'
@@ -186,7 +216,6 @@ Configuration is managed through two files:
           type: 'sqlite'
           params:
             db_path: './zendesk-kb.db'
-      
       # Qdrant example
       - type: 'website'
         product_name: 'Istio'

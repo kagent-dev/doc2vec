@@ -5,11 +5,11 @@ import * as sqliteVec from "sqlite-vec";
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { Logger } from './logger';
 import { Utils } from './utils';
-import { 
-    SourceConfig, 
-    DatabaseConnection, 
-    SqliteDB, 
-    QdrantDB, 
+import {
+    SourceConfig,
+    DatabaseConnection,
+    SqliteDB,
+    QdrantDB,
     DocumentChunk,
     SqliteDatabaseParams,
     QdrantDatabaseParams,
@@ -17,23 +17,36 @@ import {
 } from './types';
 
 export class DatabaseManager {
+    private static getEmbeddingSize(): number {
+        const envSize = process.env.EMBEDDING_VECTOR_SIZE;
+        if (envSize) {
+            const parsed = parseInt(envSize, 10);
+            if (isNaN(parsed) || parsed <= 0) {
+                throw new Error(`Invalid EMBEDDING_VECTOR_SIZE: ${envSize}. Must be a positive integer.`);
+            }
+            return parsed;
+        }
+        return 3072; // Default value
+    }
+
     static async initDatabase(config: SourceConfig, parentLogger: Logger): Promise<DatabaseConnection> {
         const logger = parentLogger.child('database');
         const dbConfig = config.database_config;
-        
+
         if (dbConfig.type === 'sqlite') {
             const params = dbConfig.params as SqliteDatabaseParams;
             const dbPath = params.db_path || path.join(process.cwd(), `${config.product_name.replace(/\s+/g, '_')}-${config.version}.db`);
-            
+
             logger.info(`Opening SQLite database at ${dbPath}`);
-            
+
             const db = new BetterSqlite3(dbPath, { allowExtension: true } as any);
             sqliteVec.load(db);
 
-            logger.debug(`Creating vec_items table if it doesn't exist`);
+            const embeddingSize = this.getEmbeddingSize();
+            logger.debug(`Creating vec_items table if it doesn't exist with embedding size: ${embeddingSize}`);
             db.exec(`
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-                    embedding FLOAT[3072],
+                    embedding FLOAT[${embeddingSize}],
                     product_name TEXT,
                     version TEXT,
                     heading_hierarchy TEXT,
@@ -51,7 +64,7 @@ export class DatabaseManager {
             const qdrantUrl = params.qdrant_url || 'http://localhost:6333';
             const qdrantPort = params.qdrant_port || 443;
             const collectionName = params.collection_name || `${config.product_name.toLowerCase().replace(/\s+/g, '_')}_${config.version}`;
-            
+
             logger.info(`Connecting to Qdrant at ${qdrantUrl}:${qdrantPort}, collection: ${collectionName}`);
             const qdrantClient = new QdrantClient({ url: qdrantUrl, apiKey: process.env.QDRANT_API_KEY, port: qdrantPort });
 
@@ -72,16 +85,17 @@ export class DatabaseManager {
             const collectionExists = collections.collections.some(
                 (collection: any) => collection.name === collectionName
             );
-            
+
             if (collectionExists) {
                 logger.info(`Collection ${collectionName} already exists`);
                 return;
             }
-            
-            logger.info(`Creating new collection ${collectionName}`);
+
+            const embeddingSize = this.getEmbeddingSize();
+            logger.info(`Creating new collection ${collectionName} with embedding size: ${embeddingSize}`);
             await qdrantClient.createCollection(collectionName, {
                 vectors: {
-                    size: 3072,
+                    size: embeddingSize,
                     distance: "Cosine",
                 },
             });
@@ -90,9 +104,9 @@ export class DatabaseManager {
             if (error instanceof Error) {
                 const errorMsg = error.message.toLowerCase();
                 const errorString = JSON.stringify(error).toLowerCase();
-                
+
                 if (
-                    errorMsg.includes("already exists") || 
+                    errorMsg.includes("already exists") ||
                     errorString.includes("already exists") ||
                     (error as any)?.status === 409 ||
                     errorString.includes("conflict")
@@ -101,7 +115,7 @@ export class DatabaseManager {
                     return;
                 }
             }
-            
+
             logger.error(`Error creating Qdrant collection:`, error);
             logger.warn(`Continuing with existing collection...`);
         }
@@ -127,12 +141,12 @@ export class DatabaseManager {
 
     static async getLastRunDate(dbConnection: DatabaseConnection, repo: string, defaultDate: string, logger: Logger): Promise<string> {
         const metadataKey = `last_run_${repo.replace('/', '_')}`;
-        
+
         try {
             if (dbConnection.type === 'sqlite') {
                 const stmt = dbConnection.db.prepare('SELECT value FROM vec_metadata WHERE key = ?');
                 const result = stmt.get(metadataKey) as { value: string } | undefined;
-                
+
                 if (result) {
                     logger.info(`Retrieved last run date for ${repo}: ${result.value}`);
                     return result.value;
@@ -141,7 +155,7 @@ export class DatabaseManager {
                 // Generate a UUID for this repo's metadata
                 const metadataUUID = Utils.generateMetadataUUID(repo);
                 logger.debug(`Looking up metadata with UUID: ${metadataUUID}`);
-                
+
                 try {
                     // Try to retrieve the metadata point for this repo
                     const response = await dbConnection.client.retrieve(dbConnection.collectionName, {
@@ -149,7 +163,7 @@ export class DatabaseManager {
                         with_payload: true,
                         with_vector: false
                     });
-                    
+
                     if (response.length > 0 && response[0].payload?.metadata_value) {
                         const lastRunDate = response[0].payload.metadata_value as string;
                         logger.info(`Retrieved last run date for ${repo}: ${lastRunDate}`);
@@ -162,14 +176,14 @@ export class DatabaseManager {
         } catch (error) {
             logger.warn(`Error retrieving last run date:`, error);
         }
-        
+
         logger.info(`No saved run date found for ${repo}, using default: ${defaultDate}`);
         return defaultDate;
     }
 
     static async updateLastRunDate(dbConnection: DatabaseConnection, repo: string, logger: Logger): Promise<void> {
         const now = new Date().toISOString();
-        
+
         try {
             if (dbConnection.type === 'sqlite') {
                 const metadataKey = `last_run_${repo.replace('/', '_')}`;
@@ -183,13 +197,13 @@ export class DatabaseManager {
                 // Generate UUID for this repo's metadata
                 const metadataUUID = Utils.generateMetadataUUID(repo);
                 const metadataKey = `last_run_${repo.replace('/', '_')}`;
-                
+
                 logger.debug(`Using UUID: ${metadataUUID} for metadata`);
-                
+
                 // Generate a dummy embedding (all zeros)
-                const dummyEmbeddingSize = 3072; // Same size as your content embeddings
+                const dummyEmbeddingSize = this.getEmbeddingSize(); // Same size as your content embeddings
                 const dummyEmbedding = new Array(dummyEmbeddingSize).fill(0);
-                
+
                 // Create a point with special metadata payload
                 const metadataPoint = {
                     id: metadataUUID,
@@ -204,12 +218,12 @@ export class DatabaseManager {
                         url: 'metadata://' + repo
                     }
                 };
-                
+
                 await dbConnection.client.upsert(dbConnection.collectionName, {
                     wait: true,
                     points: [metadataPoint]
                 });
-                
+
                 logger.info(`Updated last run date for ${repo} to ${now}`);
             }
         } catch (error) {
@@ -236,7 +250,7 @@ export class DatabaseManager {
     static insertVectorsSQLite(db: Database, chunk: DocumentChunk, embedding: number[], logger: Logger, chunkHash?: string) {
         const { insertStmt, updateStmt } = this.prepareSQLiteStatements(db);
         const hash = chunkHash || Utils.generateHash(chunk.content);
-        
+
         const transaction = db.transaction(() => {
             const params = [
                 new Float32Array(embedding),
@@ -272,9 +286,9 @@ export class DatabaseManager {
             } catch (e) {
                 pointId = crypto.randomUUID();
             }
-            
+
             const hash = chunkHash || Utils.generateHash(chunk.content);
-            
+
             const pointItem = {
                 id: pointId,
                 vector: embedding,
@@ -376,9 +390,9 @@ export class DatabaseManager {
     }
 
     static removeObsoleteFilesSQLite(
-        db: Database, 
-        processedFiles: Set<string>, 
-        pathConfig: { path: string; url_rewrite_prefix?: string } | string, 
+        db: Database,
+        processedFiles: Set<string>,
+        pathConfig: { path: string; url_rewrite_prefix?: string } | string,
         logger: Logger
     ) {
         const getChunksForPathStmt = db.prepare(`
@@ -386,10 +400,10 @@ export class DatabaseManager {
             WHERE url LIKE ? || '%'
         `);
         const deleteChunkStmt = db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`);
-        
+
         // Determine if we're using URL rewriting or direct file paths
         const isRewriteMode = typeof pathConfig === 'object' && pathConfig.url_rewrite_prefix;
-        
+
         // Set up the URL prefix for searching
         let urlPrefix: string;
         if (isRewriteMode) {
@@ -402,19 +416,19 @@ export class DatabaseManager {
             const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
             urlPrefix = `file://${cleanedDirPrefix}`;
         }
-        
+
         logger.debug(`Searching for chunks with URL prefix: ${urlPrefix}`);
         const existingChunks = getChunksForPathStmt.all(urlPrefix) as { chunk_id: string; url: string }[];
         let deletedCount = 0;
-        
+
         const transaction = db.transaction(() => {
             for (const { chunk_id, url } of existingChunks) {
                 // Skip if it's not from our URL prefix (safety check)
                 if (!url.startsWith(urlPrefix)) continue;
-                
+
                 let filePath: string;
                 let shouldDelete = false;
-                
+
                 if (isRewriteMode) {
                     // URL rewrite mode: extract relative path and construct full file path
                     const config = pathConfig as { path: string; url_rewrite_prefix?: string };
@@ -426,7 +440,7 @@ export class DatabaseManager {
                     filePath = url.substring(7); // Remove 'file://' prefix
                     shouldDelete = !processedFiles.has(filePath);
                 }
-                
+
                 if (shouldDelete) {
                     logger.debug(`Deleting obsolete chunk from SQLite: ${chunk_id.substring(0, 8)}... (File not processed: ${filePath})`);
                     deleteChunkStmt.run(chunk_id);
@@ -435,21 +449,21 @@ export class DatabaseManager {
             }
         });
         transaction();
-        
+
         logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for URL prefix ${urlPrefix}`);
     }
 
     static async removeObsoleteFilesQdrant(
-        db: QdrantDB, 
-        processedFiles: Set<string>, 
-        pathConfig: { path: string; url_rewrite_prefix?: string } | string, 
+        db: QdrantDB,
+        processedFiles: Set<string>,
+        pathConfig: { path: string; url_rewrite_prefix?: string } | string,
         logger: Logger
     ) {
         const { client, collectionName } = db;
         try {
             // Determine if we're using URL rewriting or direct file paths
             const isRewriteMode = typeof pathConfig === 'object' && pathConfig.url_rewrite_prefix;
-            
+
             // Set up the URL prefix for searching
             let urlPrefix: string;
             if (isRewriteMode) {
@@ -462,7 +476,7 @@ export class DatabaseManager {
                 const cleanedDirPrefix = dirPrefix.replace(/^\.\/+/, '');
                 urlPrefix = `file://${cleanedDirPrefix}`;
             }
-            
+
             logger.debug(`Checking for obsolete chunks with URL prefix: ${urlPrefix}`);
             const response = await client.scroll(collectionName, {
                 limit: 10000,
@@ -487,7 +501,7 @@ export class DatabaseManager {
                     ]
                 }
             });
-            
+
             const obsoletePointIds = response.points
                 .filter((point: any) => {
                     const url = point.payload?.url;
@@ -495,13 +509,13 @@ export class DatabaseManager {
                     if (point.payload?.is_metadata === true) {
                         return false;
                     }
-                    
+
                     if (!url || !url.startsWith(urlPrefix)) {
                         return false;
                     }
-                    
+
                     let filePath: string;
-                    
+
                     if (isRewriteMode) {
                         // URL rewrite mode: extract relative path and construct full file path
                         const config = pathConfig as { path: string; url_rewrite_prefix?: string };
@@ -511,11 +525,11 @@ export class DatabaseManager {
                         // Direct file path mode: remove file:// prefix to match with processedFiles
                         filePath = url.startsWith('file://') ? url.substring(7) : '';
                     }
-                    
+
                     return filePath && !processedFiles.has(filePath);
                 })
                 .map((point: any) => point.id);
-            
+
             if (obsoletePointIds.length > 0) {
                 await client.delete(collectionName, {
                     points: obsoletePointIds,
@@ -528,4 +542,4 @@ export class DatabaseManager {
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
         }
     }
-} 
+}
