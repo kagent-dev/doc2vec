@@ -1,6 +1,6 @@
 // Base configuration that applies to all source types
 export interface BaseSourceConfig {
-    type: 'website' | 'github' | 'local_directory' | 'zendesk';
+    type: 'website' | 'github' | 'local_directory' | 'zendesk' | 'notion';
     product_name: string;
     version: string;
     max_size: number;
@@ -45,8 +45,15 @@ export interface ZendeskSourceConfig extends BaseSourceConfig {
     ticket_priority?: string[];    // Filter tickets by priority (default: all)
 }
 
+export interface NotionSourceConfig extends BaseSourceConfig {
+    type: 'notion';
+    api_token: string;   // Notion API token
+    database_id: string; // Notion Database ID
+    filter?: any;        // Filter for the database query - see https://developers.notion.com/reference/post-database-query for more details
+}
+
 // Union type for all possible source configurations
-export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig;
+export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig | NotionSourceConfig;
 
 // Database configuration
 export interface DatabaseConfig {
