@@ -36,7 +36,7 @@
         "dotenv": "^16.3.1",
         "js-yaml": "^4.1.0",
         "jsdom": "^26.0.0",
-        "openai": "^4.20.1",
+        "openai": "^4.104.0",
         "pdfjs-dist": "^5.3.31",
         "puppeteer": "^24.1.1",
         "sanitize-html": "^2.11.0",
