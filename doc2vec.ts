@@ -112,6 +112,8 @@ class Doc2Vec {
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, repo, `${startDate}T00:00:00Z`, logger);
 
         const fetchWithRetry = async (url: string, params = {}, retries = 5, delay = 5000): Promise<any> => {
+            const retryableCodes = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH'];
+            
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
                     const response = await axios.get(url, {
@@ -120,15 +122,26 @@ class Doc2Vec {
                             Accept: 'application/vnd.github.v3+json',
                         },
                         params,
+                        timeout: 30000, // 30 second timeout
                     });
                     return response.data;
                 } catch (error: any) {
-                    if (error.response && error.response.status === 403) {
+                    const isLastAttempt = attempt === retries - 1;
+                    const errorCode = error.code || (error.cause && error.cause.code);
+                    const isRetryableNetworkError = retryableCodes.includes(errorCode);
+                    const isRateLimitError = error.response && error.response.status === 403;
+                    const isServerError = error.response && error.response.status >= 500;
+                    
+                    if (isRateLimitError) {
                         const resetTime = error.response.headers['x-ratelimit-reset'];
                         const currentTime = Math.floor(Date.now() / 1000);
                         const waitTime = resetTime ? (resetTime - currentTime) * 1000 : delay * 2;
-                        logger.warn(`GitHub rate limit exceeded. Waiting ${waitTime / 1000}s`);
+                        logger.warn(`GitHub rate limit exceeded. Waiting ${waitTime / 1000}s (attempt ${attempt + 1}/${retries})`);
                         await new Promise(res => setTimeout(res, waitTime));
+                    } else if ((isRetryableNetworkError || isServerError) && !isLastAttempt) {
+                        const backoffTime = delay * Math.pow(2, attempt); // Exponential backoff
+                        logger.warn(`Network error (${errorCode || error.message}). Retrying in ${backoffTime / 1000}s (attempt ${attempt + 1}/${retries})`);
+                        await new Promise(res => setTimeout(res, backoffTime));
                     } else {
                         logger.error(`GitHub fetch failed: ${error.message}`);
                         throw error;
