@@ -114,15 +114,30 @@ class Doc2Vec {
         const fetchWithRetry = async (url: string, params = {}, retries = 5, delay = 5000): Promise<any> => {
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
+                    // Only log on retries to reduce noise during pagination
+                    if (attempt > 0) {
+                        logger.debug(`GitHub API retry: ${url} (attempt ${attempt + 1}/${retries})`);
+                    }
                     const response = await axios.get(url, {
                         headers: {
                             Authorization: `token ${GITHUB_TOKEN}`,
                             Accept: 'application/vnd.github.v3+json',
                         },
                         params,
+                        timeout: 30000, // 30 second timeout
                     });
                     return response.data;
                 } catch (error: any) {
+                    // Enhanced error logging for debugging
+                    const errorDetails = {
+                        code: error.code,
+                        message: error.message,
+                        status: error.response?.status,
+                        isTimeout: error.code === 'ECONNABORTED' || error.message?.includes('timeout'),
+                        isNetworkError: !error.response && error.code,
+                    };
+                    logger.debug(`GitHub API error details: ${JSON.stringify(errorDetails)}`);
+                    
                     if (error.response && error.response.status === 403) {
                         // Check if this is actually a rate limit error
                         const rateLimitRemaining = error.response.headers['x-ratelimit-remaining'];
@@ -155,7 +170,7 @@ class Doc2Vec {
                             logger.warn(`GitHub fetch failed (attempt ${attempt + 1}/${retries}): ${error.message}. Retrying in ${backoffDelay}ms`);
                             await new Promise(res => setTimeout(res, backoffDelay));
                         } else {
-                            logger.error(`GitHub fetch failed: ${error.message}`);
+                            logger.error(`GitHub fetch failed after ${retries} attempts: ${error.message} (code: ${error.code || 'unknown'})`);
                             throw error;
                         }
                     }
@@ -171,6 +186,11 @@ class Doc2Vec {
             const sinceTimestamp = new Date(sinceDate);
 
             while (true) {
+                // Log progress every 10 pages to reduce noise
+                if (page === 1 || page % 10 === 0) {
+                    logger.debug(`Fetching issues page ${page}... (${issues.length} issues so far)`);
+                }
+                
                 const data = await fetchWithRetry(GITHUB_API_URL, {
                     per_page: perPage,
                     page,

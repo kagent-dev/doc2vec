@@ -78,6 +78,8 @@ export interface DocumentChunk {
         chunk_id: string;
         url: string;
         hash?: string;
+        chunk_index: number;   // Position of this chunk within the page (0-based)
+        total_chunks: number;  // Total number of chunks for this page, allows knowing if more chunks exist
     };
 }
 

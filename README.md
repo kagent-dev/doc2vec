@@ -20,7 +20,10 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
+    *   **Smart H1 Preservation:** Automatically extracts and preserves page titles (H1 headings) that Readability might strip as "page chrome", ensuring proper heading hierarchy.
+    *   **Flexible Content Selectors:** Supports multiple content container patterns (`.docs-content`, `.doc-content`, `.markdown-body`, `article`, etc.) for better compatibility with various documentation sites.
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
+    *   **Clean Heading Text:** Automatically removes anchor links (like `[](#section-id)`) from heading text for cleaner hierarchy display.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
 *   **Vector Embeddings:** Generates embeddings for each chunk using OpenAI's `text-embedding-3-large` model.
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
@@ -31,6 +34,58 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
+
+## Chunk Metadata & Page Reconstruction
+
+Each chunk stored in the database includes rich metadata that enables powerful retrieval and page reconstruction capabilities.
+
+### Metadata Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `product_name` | string | Product identifier from config |
+| `version` | string | Version identifier from config |
+| `heading_hierarchy` | string[] | Hierarchical breadcrumb trail (e.g., `["Installation", "Prerequisites", "Docker"]`) |
+| `section` | string | Current section heading |
+| `chunk_id` | string | Unique hash identifier for the chunk |
+| `url` | string | Source URL/path of the original document |
+| `hash` | string | Content hash for change detection |
+| `chunk_index` | number | Position of this chunk within the page (0-based) |
+| `total_chunks` | number | Total number of chunks for this page |
+
+### Page Reconstruction
+
+The `chunk_index` and `total_chunks` fields enable you to reconstruct full pages from chunks:
+
+```typescript
+// Example: Retrieve all chunks for a URL and reconstruct the page
+const chunks = await db.query({
+  filter: { url: "https://docs.example.com/guide" },
+  sort: { chunk_index: "asc" }
+});
+
+// Check if there are more chunks after the current one
+if (currentChunk.chunk_index < currentChunk.total_chunks - 1) {
+  // More chunks available - fetch the next one
+  const nextChunkIndex = currentChunk.chunk_index + 1;
+}
+
+// Reconstruct full page content
+const fullPageContent = chunks
+  .sort((a, b) => a.chunk_index - b.chunk_index)
+  .map(c => c.content)
+  .join("\n\n");
+```
+
+### Heading Hierarchy (Breadcrumbs)
+
+Each chunk includes a `heading_hierarchy` array that provides context about where the content appears in the document structure. This is injected as a `[Topic: ...]` prefix in the chunk content to improve vector search relevance.
+
+For example, a chunk under "Installation > Prerequisites > Docker" will have:
+- `heading_hierarchy`: `["Installation", "Prerequisites", "Docker"]`
+- Content prefix: `[Topic: Installation > Prerequisites > Docker]`
+
+This ensures that searches for parent topics (like "Installation") will also match relevant child content.
 
 ## Prerequisites
 
@@ -346,3 +401,26 @@ If you don't specify a config path, it will look for config.yaml in the current 
         *   **Store:** Insert or update the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
     4.  **Cleanup:** After processing, remove any obsolete chunks from the database.
 4.  **Complete:** Log completion status.
+
+## Recent Changes
+
+### Page Reconstruction Support
+- Added `chunk_index` field to track each chunk's position within a page (0-based)
+- Added `total_chunks` field to indicate the total number of chunks per page
+- Enables AI agents and applications to fetch additional context or reconstruct full pages
+- Works consistently across all content types: websites, GitHub, Zendesk, and local directories
+
+### Improved H1/Title Handling
+- Smart H1 preservation ensures page titles aren't stripped by Readability
+- Falls back to `article.title` when H1 extraction fails
+- Proper heading hierarchy starting from H1 through the document structure
+
+### Enhanced Content Extraction
+- Added support for multiple content container selectors (`.docs-content`, `.doc-content`, `.markdown-body`, `article`)
+- Cleaner heading text by removing anchor links like `[](#section-id)`
+- Better handling of pages where H1 is outside the main content container
+
+### Heading Hierarchy Improvements
+- Fixed sparse array issues that caused `NULL` values in heading hierarchy
+- Proper breadcrumb generation for nested sections
+- Hierarchical context preserved across chunk boundaries

@@ -839,6 +839,7 @@ export class ContentProcessor {
         let buffer = ""; 
         let headingHierarchy: string[] = [];
         let bufferHeadings: Array<{ level: number; text: string }> = []; // Track headings in current buffer
+        let chunkCounter = 0; // Tracks chunk position within this page for ordering
     
         /**
          * Computes the topic hierarchy for merged content.
@@ -879,11 +880,9 @@ export class ContentProcessor {
             const breadcrumbs = hierarchy.filter(h => h).join(" > ");
             const contextPrefix = breadcrumbs ? `[Topic: ${breadcrumbs}]\n` : "";
             const searchableText = contextPrefix + content.trim();
-            console.log(searchableText);
-            console.log(hierarchy);
             const chunkId = Utils.generateHash(searchableText);
             
-            return {
+            const chunk: DocumentChunk = {
                 content: searchableText,
                 metadata: {
                     product_name: sourceConfig.product_name,
@@ -892,9 +891,13 @@ export class ContentProcessor {
                     section: hierarchy[hierarchy.length - 1] || "Introduction",
                     chunk_id: chunkId,
                     url: url,
-                    hash: chunkId
+                    hash: chunkId,
+                    chunk_index: chunkCounter,
+                    total_chunks: 0  // Placeholder, will be updated after all chunks are created
                 }
             };
+            chunkCounter++; // Increment for next chunk
+            return chunk;
         };
     
         /**
@@ -993,6 +996,12 @@ export class ContentProcessor {
     
         // Final sweep
         flushBuffer(true); 
+        
+        // Update all chunks with the final total count
+        const totalChunks = chunks.length;
+        for (const chunk of chunks) {
+            chunk.metadata.total_chunks = totalChunks;
+        }
         
         logger.debug(`Chunking complete: ${chunks.length} rich context chunks created.`);
         return chunks;
