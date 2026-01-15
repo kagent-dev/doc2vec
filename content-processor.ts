@@ -364,7 +364,18 @@ export class ContentProcessor {
         // Original HTML page processing logic
         let browser: Browser | null = null;
         try {
+            // Use system Chromium if available (for Docker environments)
+            let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
+            if (!executablePath) {
+                if (fs.existsSync('/usr/bin/chromium')) {
+                    executablePath = '/usr/bin/chromium';
+                } else if (fs.existsSync('/usr/bin/chromium-browser')) {
+                    executablePath = '/usr/bin/chromium-browser';
+                }
+            }
+            
             browser = await puppeteer.launch({
+                executablePath,
                 args: ['--no-sandbox', '--disable-setuid-sandbox'],
             });
             const page: Page = await browser.newPage();
@@ -372,7 +383,15 @@ export class ContentProcessor {
             await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
             const htmlContent: string = await page.evaluate(() => {
-                const mainContentElement = document.querySelector('div[role="main"].document') || document.querySelector('main') || document.body;
+                // 💡 Try specific content selectors first, then fall back to broader ones
+                const mainContentElement = 
+                    document.querySelector('.docs-content') ||        // Common docs pattern
+                    document.querySelector('.doc-content') ||         // Alternative docs pattern
+                    document.querySelector('.markdown-body') ||       // GitHub-style
+                    document.querySelector('article') ||              // Semantic article
+                    document.querySelector('div[role="main"].document') || 
+                    document.querySelector('main') || 
+                    document.body;
                 return mainContentElement.innerHTML;
             });
 
@@ -392,10 +411,25 @@ export class ContentProcessor {
                 this.markCodeParents(pre.parentElement);
             });
 
+            // 💡 Extract H1s BEFORE Readability - it often strips them as "chrome"
+            // We'll inject them back after Readability processing
+            const h1Elements = document.querySelectorAll('h1');
+            const extractedH1s: string[] = [];
+            logger.debug(`[Readability Debug] Found ${h1Elements.length} H1 elements before Readability`);
+            h1Elements.forEach((h1: Element, index: number) => {
+                const h1Text = h1.textContent?.trim() || '';
+                // Skip empty H1s or icon-only H1s (like "link" anchors)
+                if (h1Text && h1Text.length > 3 && !h1Text.match(/^(link|#|menu|close)$/i)) {
+                    extractedH1s.push(h1Text);
+                    logger.debug(`[Readability Debug] Extracted H1[${index}]: "${h1Text.substring(0, 50)}..."`);
+                }
+                h1.classList.add('original-h1');
+            });
+
             logger.debug(`Applying Readability to extract main content`);
             const reader = new Readability(document, {
                 charThreshold: 20,
-                classesToPreserve: ['article-content'],
+                classesToPreserve: ['article-content', 'original-h1'],
             });
             const article = reader.parse();
 
@@ -404,9 +438,38 @@ export class ContentProcessor {
                 await browser.close();
                 return null;
             }
+            
+            // Debug: Log what Readability extracted
+            logger.debug(`[Readability Debug] article.title: "${article.title}"`);
+            logger.debug(`[Readability Debug] article.content length: ${article.content?.length}`);
+            logger.debug(`[Readability Debug] article.content starts with: "${article.content?.substring(0, 200)}..."`);
+            logger.debug(`[Readability Debug] Contains H1 tag: ${article.content?.includes('<h1')}`);
+            logger.debug(`[Readability Debug] Contains H2 tag: ${article.content?.includes('<h2')}`);
+            logger.debug(`[Readability Debug] Contains original-h1 class: ${article.content?.includes('original-h1')}`);
 
-            logger.debug(`Sanitizing HTML (${article.content.length} chars)`);
-            const cleanHtml = sanitizeHtml(article.content, {
+            // 💡 Restore H1s: find elements with our marker class and convert back from H2
+            const articleDom = new JSDOM(article.content);
+            const articleDoc = articleDom.window.document;
+            const originalH1Elements = articleDoc.querySelectorAll('.original-h1');
+            logger.debug(`[Readability Debug] Found ${originalH1Elements.length} elements with .original-h1 class to restore`);
+            originalH1Elements.forEach((heading: Element, index: number) => {
+                logger.debug(`[Readability Debug] Restoring[${index}]: tagName=${heading.tagName}, text="${heading.textContent?.trim().substring(0, 50)}..."`);
+                // Create a new H1 element with the same content
+                const h1 = articleDoc.createElement('h1');
+                h1.innerHTML = heading.innerHTML;
+                // Copy other attributes except class
+                Array.from(heading.attributes).forEach(attr => {
+                    if (attr.name !== 'class') {
+                        h1.setAttribute(attr.name, attr.value);
+                    }
+                });
+                heading.replaceWith(h1);
+            });
+            const restoredContent = articleDoc.body.innerHTML;
+            logger.debug(`[Readability Debug] Restored content contains H1: ${restoredContent.includes('<h1')}`);
+
+            logger.debug(`Sanitizing HTML (${restoredContent.length} chars)`);
+            const cleanHtml = sanitizeHtml(restoredContent, {
                  allowedTags: [
                     'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
                     'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
@@ -422,7 +485,28 @@ export class ContentProcessor {
             });
 
             logger.debug(`Converting HTML to Markdown`);
-            const markdown = this.turndownService.turndown(cleanHtml);
+            let markdown = this.turndownService.turndown(cleanHtml);
+            
+            // 💡 Inject extracted H1s back if they're not in the markdown
+            // Readability often strips them as "page chrome"
+            // Use article.title as fallback if no H1 was extracted
+            const pageTitle = extractedH1s.length > 0 ? extractedH1s[0] : (article.title?.trim() || '');
+            if (pageTitle) {
+                // Check if markdown already starts with this exact H1 (allowing for leading whitespace)
+                const normalizedTitle = pageTitle.replace(/\s+/g, ' ');
+                const markdownFirstLine = markdown.trimStart().split('\n')[0] || '';
+                const existingH1Match = markdownFirstLine.match(/^#\s+(.+)$/);
+                const existingH1Text = existingH1Match ? existingH1Match[1].replace(/\s+/g, ' ').trim() : '';
+                
+                // Only inject if markdown doesn't already start with this H1
+                if (!existingH1Match || existingH1Text !== normalizedTitle) {
+                    markdown = `# ${pageTitle}\n\n${markdown}`;
+                    logger.debug(`[Readability Debug] Injected page title as H1: "${pageTitle}"`);
+                } else {
+                    logger.debug(`[Readability Debug] H1 "${pageTitle}" already present in markdown`);
+                }
+            }
+            
             logger.debug(`Markdown conversion complete (${markdown.length} chars)`);
             return markdown;
         } catch (error) {
@@ -743,91 +827,174 @@ export class ContentProcessor {
 
     async chunkMarkdown(markdown: string, sourceConfig: SourceConfig, url: string): Promise<DocumentChunk[]> {
         const logger = this.logger.child('chunker');
-        logger.debug(`Chunking markdown from ${url} (${markdown.length} chars)`);
         
+        // --- Configuration ---
         const MAX_TOKENS = 1000;
+        const MIN_TOKENS = 150;      // 💡 Merges "OpenAI-compatible" sentence into the next block
+        const OVERLAP_PERCENT = 0.1; // 10% overlap for large splits
+        
         const chunks: DocumentChunk[] = [];
         const lines = markdown.split("\n");
-        let currentChunk = "";
+        
+        let buffer = ""; 
         let headingHierarchy: string[] = [];
-
-        const processChunk = () => {
-            if (currentChunk.trim()) {
-                const tokens = Utils.tokenize(currentChunk);
-                if (tokens.length > MAX_TOKENS) {
-                    logger.debug(`Chunk exceeds max token count (${tokens.length}), splitting into smaller chunks`);
-                    let subChunk = "";
-                    let tokenCount = 0;
-                    const overlapSize = Math.floor(MAX_TOKENS * 0.05);
-                    let lastTokens: string[] = [];
-
-                    for (const token of tokens) {
-                        if (tokenCount + 1 > MAX_TOKENS) {
-                            chunks.push(createDocumentChunk(subChunk, headingHierarchy));
-                            subChunk = lastTokens.join("") + token;
-                            tokenCount = lastTokens.length + 1;
-                            lastTokens = [];
-                        } else {
-                            subChunk += token;
-                            tokenCount++;
-                            lastTokens.push(token);
-                            if (lastTokens.length > overlapSize) {
-                                lastTokens.shift();
-                            }
-                        }
-                    }
-                    if (subChunk) {
-                        chunks.push(createDocumentChunk(subChunk, headingHierarchy));
-                    }
-                } else {
-                    chunks.push(createDocumentChunk(currentChunk, headingHierarchy));
-                }
+        let bufferHeadings: Array<{ level: number; text: string }> = []; // Track headings in current buffer
+    
+        /**
+         * Computes the topic hierarchy for merged content.
+         * When merging sibling sections (same level), uses their parent heading.
+         * Otherwise uses the current hierarchy.
+         */
+        const computeTopicHierarchy = (): string[] => {
+            if (bufferHeadings.length === 0) {
+                return headingHierarchy;
             }
-            currentChunk = "";
+            
+            // Find the deepest level (most recent headings)
+            const deepestLevel = Math.max(...bufferHeadings.map(h => h.level));
+            
+            // Get all headings at the deepest level
+            const deepestHeadings = bufferHeadings.filter(h => h.level === deepestLevel);
+            
+            // If we have multiple sibling headings at the deepest level, use their parent
+            if (deepestHeadings.length > 1 && deepestLevel > 1) {
+                // Use parent heading (one level up from the sibling headings)
+                // headingHierarchy still contains the parent at index (deepestLevel - 2)
+                // We want everything up to (but not including) the deepest level
+                return headingHierarchy.slice(0, deepestLevel - 1);
+            }
+            
+            // Single heading or different levels: use the current hierarchy
+            // This reflects the most recent heading which is appropriate
+            return headingHierarchy;
         };
-
+    
+        /**
+         * Internal helper to create the final chunk object with injected context.
+         */
         const createDocumentChunk = (content: string, hierarchy: string[]): DocumentChunk => {
-            const chunkId = Utils.generateHash(content);
-            logger.debug(`Created chunk ${chunkId.substring(0, 8)}... with ${content.length} chars`);
+            // 💡 BREADCRUMB INJECTION
+            // We prepend the hierarchy to the text. This makes the vector highly relevant 
+            // to searches for parent topics even if the body doesn't mention them.
+            const breadcrumbs = hierarchy.filter(h => h).join(" > ");
+            const contextPrefix = breadcrumbs ? `[Topic: ${breadcrumbs}]\n` : "";
+            const searchableText = contextPrefix + content.trim();
+            console.log(searchableText);
+            console.log(hierarchy);
+            const chunkId = Utils.generateHash(searchableText);
             
             return {
-                content,
+                content: searchableText,
                 metadata: {
                     product_name: sourceConfig.product_name,
                     version: sourceConfig.version,
-                    heading_hierarchy: [...hierarchy],
+                    heading_hierarchy: hierarchy.filter(h => h),
                     section: hierarchy[hierarchy.length - 1] || "Introduction",
                     chunk_id: chunkId,
                     url: url,
-                    hash: Utils.generateHash(content)
+                    hash: chunkId
                 }
             };
         };
-
-        for (const line of lines) {
-            if (line.startsWith("#")) {
-                processChunk();
-                const levelMatch = line.match(/^(#+)/);
-                let level = levelMatch ? levelMatch[1].length : 1;
-                const heading = line.replace(/^#+\s*/, "").trim();
-
-                logger.debug(`Found heading (level ${level}): ${heading}`);
+    
+        /**
+         * Flushes the current buffer into the chunks array.
+         * Uses sub-splitting logic if the buffer exceeds MAX_TOKENS.
+         */
+        const flushBuffer = (force = false) => {
+            const trimmedBuffer = buffer.trim();
+            if (!trimmedBuffer) return;
+    
+            const tokenCount = Utils.tokenize(trimmedBuffer).length;
+    
+            // 💡 SEMANTIC MERGING
+            // If the current section is too short (like just a title or a one-liner),
+            // we don't flush yet unless it's the end of the file (force=true).
+            if (tokenCount < MIN_TOKENS && !force) {
+                return; 
+            }
+    
+            // Compute the appropriate topic hierarchy for merged content
+            const topicHierarchy = computeTopicHierarchy();
+    
+            if (tokenCount > MAX_TOKENS) {
+                // 💡 RECURSIVE OVERLAP SPLITTING
+                // If the section is a massive guide, split it but keep headers on every sub-piece.
+                const tokens = Utils.tokenize(trimmedBuffer);
+                const overlapSize = Math.floor(MAX_TOKENS * OVERLAP_PERCENT);
                 
-                while (headingHierarchy.length < level - 1) {
-                    headingHierarchy.push("");
+                for (let i = 0; i < tokens.length; i += (MAX_TOKENS - overlapSize)) {
+                    const subTokens = tokens.slice(i, i + MAX_TOKENS);
+                    const subContent = subTokens.join("");
+                    chunks.push(createDocumentChunk(subContent, topicHierarchy));
                 }
-
-                if (level <= headingHierarchy.length) {
-                    headingHierarchy = headingHierarchy.slice(0, level - 1);
-                }
-                headingHierarchy[level - 1] = heading;
             } else {
-                currentChunk += `${line}\n`;
+                chunks.push(createDocumentChunk(trimmedBuffer, topicHierarchy));
+            }
+            
+            buffer = ""; // Reset buffer after successful flush
+            bufferHeadings = []; // Reset tracked headings
+        };
+    
+        // --- Main Processing Loop ---
+        for (const line of lines) {
+            const isHeading = line.startsWith("#");
+    
+            if (isHeading) {
+                // Update Hierarchy Stack for the new heading
+                const levelMatch = line.match(/^(#+)/);
+                const level = levelMatch ? levelMatch[1].length : 1;
+                // Clean heading: remove markdown prefix and anchor links like [](#anchor-id)
+                const headingText = line
+                    .replace(/^#+\s*/, "")           // Remove ## prefix
+                    .replace(/\[.*?\]\(#[^)]*\)/g, "") // Remove [text](#anchor) patterns
+                    .replace(/\[\]\(#[^)]*\)/g, "")    // Remove [](#anchor) patterns  
+                    .trim();
+                
+                // Check if we should merge with previous content
+                const currentTokenCount = Utils.tokenize(buffer.trim()).length;
+                const hasBufferContent = currentTokenCount > 0;
+                const bufferIsSmall = currentTokenCount < MIN_TOKENS;
+                
+                // Only merge if:
+                // 1. Buffer has content and is small
+                // 2. Buffer has tracked headings (we're merging sections, not just content)
+                // 3. New heading is at same or deeper level than the deepest heading in buffer (siblings or children)
+                //    If new heading is shallower (e.g., H2 after H3), it's a new section - flush first
+                const deepestBufferLevel = bufferHeadings.length > 0 
+                    ? Math.max(...bufferHeadings.map(h => h.level)) 
+                    : 0;
+                const shouldMerge = hasBufferContent && bufferIsSmall && bufferHeadings.length > 0 &&
+                    level >= deepestBufferLevel;
+                
+                if (!shouldMerge && hasBufferContent) {
+                    // Buffer is large enough OR new heading starts a new section - flush first
+                    flushBuffer();
+                }
+                // If shouldMerge is true, we keep the buffer and merge the sections
+    
+                // Reset hierarchy below this level (e.g., H2 reset should clear previous H3s)
+                headingHierarchy = headingHierarchy.slice(0, level - 1);
+                headingHierarchy[level - 1] = headingText;
+    
+                // Track this heading in the buffer
+                bufferHeadings.push({ level, text: headingText });
+    
+                buffer += `${line}\n`;
+            } else {
+                buffer += `${line}\n`;
+                
+                // Safety valve: if a single section is huge, flush it periodically
+                if (Utils.tokenize(buffer).length >= MAX_TOKENS) {
+                    flushBuffer();
+                }
             }
         }
-        processChunk();
+    
+        // Final sweep
+        flushBuffer(true); 
         
-        logger.debug(`Chunking complete, created ${chunks.length} chunks`);
+        logger.debug(`Chunking complete: ${chunks.length} rich context chunks created.`);
         return chunks;
     }
 } 

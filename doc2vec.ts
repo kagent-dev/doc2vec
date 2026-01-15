@@ -124,14 +124,40 @@ class Doc2Vec {
                     return response.data;
                 } catch (error: any) {
                     if (error.response && error.response.status === 403) {
+                        // Check if this is actually a rate limit error
+                        const rateLimitRemaining = error.response.headers['x-ratelimit-remaining'];
                         const resetTime = error.response.headers['x-ratelimit-reset'];
-                        const currentTime = Math.floor(Date.now() / 1000);
-                        const waitTime = resetTime ? (resetTime - currentTime) * 1000 : delay * 2;
-                        logger.warn(`GitHub rate limit exceeded. Waiting ${waitTime / 1000}s`);
-                        await new Promise(res => setTimeout(res, waitTime));
+                        
+                        if (rateLimitRemaining === '0' && resetTime) {
+                            const currentTime = Math.floor(Date.now() / 1000);
+                            const resetTimestamp = parseInt(resetTime, 10);
+                            let waitTime = (resetTimestamp - currentTime) * 1000;
+                            
+                            // Ensure waitTime is at least 1 second (in case resetTime is in the past)
+                            if (waitTime < 1000) {
+                                waitTime = 1000;
+                            }
+                            
+                            logger.warn(`GitHub rate limit exceeded. Waiting ${Math.ceil(waitTime / 1000)}s (attempt ${attempt + 1}/${retries})`);
+                            await new Promise(res => setTimeout(res, waitTime));
+                            
+                            // Retry the request after waiting
+                            continue;
+                        } else {
+                            // Other 403 errors (e.g., forbidden access)
+                            logger.error(`GitHub API returned 403 (not rate limit): ${error.message}`);
+                            throw error;
+                        }
                     } else {
-                        logger.error(`GitHub fetch failed: ${error.message}`);
-                        throw error;
+                        // For non-403 errors, wait before retrying (exponential backoff)
+                        if (attempt < retries - 1) {
+                            const backoffDelay = delay * Math.pow(2, attempt);
+                            logger.warn(`GitHub fetch failed (attempt ${attempt + 1}/${retries}): ${error.message}. Retrying in ${backoffDelay}ms`);
+                            await new Promise(res => setTimeout(res, backoffDelay));
+                        } else {
+                            logger.error(`GitHub fetch failed: ${error.message}`);
+                            throw error;
+                        }
                     }
                 }
             }
