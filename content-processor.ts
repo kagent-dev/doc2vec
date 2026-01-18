@@ -530,6 +530,84 @@ export class ContentProcessor {
         this.markCodeParents(node.parentElement);
     }
 
+    private async convertDocToMarkdown(filePath: string, logger: Logger): Promise<string> {
+        logger.debug(`Converting DOC to markdown: ${filePath}`);
+        
+        try {
+            // Dynamic import for word-extractor
+            const WordExtractor = (await import('word-extractor')).default;
+            const extractor = new WordExtractor();
+            
+            const extracted = await extractor.extract(filePath);
+            const text = extracted.getBody();
+            
+            // Create markdown with filename as title
+            let markdown = `# ${path.basename(filePath, '.doc')}\n\n`;
+            
+            // Clean up the text and add to markdown
+            const cleanedText = text
+                .replace(/\r\n/g, '\n')  // Normalize line endings
+                .replace(/\n{3,}/g, '\n\n')  // Remove excessive line breaks
+                .trim();
+            
+            markdown += cleanedText;
+            
+            logger.debug(`Converted DOC to ${markdown.length} characters of markdown`);
+            return markdown;
+            
+        } catch (error) {
+            logger.error(`Failed to convert DOC ${filePath}:`, error);
+            throw error;
+        }
+    }
+
+    private async convertDocxToMarkdown(filePath: string, logger: Logger): Promise<string> {
+        logger.debug(`Converting DOCX to markdown: ${filePath}`);
+        
+        try {
+            // Dynamic import for mammoth
+            const mammoth = await import('mammoth');
+            
+            const result = await mammoth.convertToHtml({ path: filePath });
+            const html = result.value;
+            
+            // Log any warnings from mammoth
+            if (result.messages.length > 0) {
+                logger.debug(`Mammoth warnings: ${result.messages.map(m => m.message).join(', ')}`);
+            }
+            
+            // Create markdown with filename as title
+            let markdown = `# ${path.basename(filePath, '.docx')}\n\n`;
+            
+            // Convert HTML to Markdown using turndown
+            const cleanHtml = sanitizeHtml(html, {
+                allowedTags: [
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'br'
+                ],
+                allowedAttributes: {
+                    'a': ['href'],
+                    'pre': ['class'],
+                    'code': ['class']
+                }
+            });
+            
+            const convertedContent = this.turndownService.turndown(cleanHtml);
+            markdown += convertedContent;
+            
+            // Clean up excessive line breaks
+            markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+            
+            logger.debug(`Converted DOCX to ${markdown.length} characters of markdown`);
+            return markdown;
+            
+        } catch (error) {
+            logger.error(`Failed to convert DOCX ${filePath}:`, error);
+            throw error;
+        }
+    }
+
     private async convertPdfToMarkdown(filePath: string, logger: Logger): Promise<string> {
         logger.debug(`Converting PDF to markdown: ${filePath}`);
         
@@ -771,6 +849,14 @@ export class ContentProcessor {
                             // Handle PDF files
                             logger.debug(`Processing PDF file: ${filePath}`);
                             processedContent = await this.convertPdfToMarkdown(filePath, logger);
+                        } else if (extension === '.doc') {
+                            // Handle legacy Word DOC files
+                            logger.debug(`Processing DOC file: ${filePath}`);
+                            processedContent = await this.convertDocToMarkdown(filePath, logger);
+                        } else if (extension === '.docx') {
+                            // Handle modern Word DOCX files
+                            logger.debug(`Processing DOCX file: ${filePath}`);
+                            processedContent = await this.convertDocxToMarkdown(filePath, logger);
                         } else {
                             // Handle text-based files
                             content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });

@@ -36,12 +36,14 @@
         "dotenv": "^16.3.1",
         "js-yaml": "^4.1.0",
         "jsdom": "^26.0.0",
+        "mammoth": "^1.11.0",
         "openai": "^4.20.1",
         "pdfjs-dist": "^5.3.31",
         "puppeteer": "^24.1.1",
         "sanitize-html": "^2.11.0",
         "sqlite-vec": "0.1.7-alpha.2",
-        "turndown": "^7.1.2"
+        "turndown": "^7.1.2",
+        "word-extractor": "^1.0.4"
     },
     "devDependencies": {
         "@types/better-sqlite3": "^7.6.12",

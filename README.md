@@ -19,6 +19,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     * **Flexible Filtering:** Filter tickets by status and priority.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
+    * **Word Document Support:** Processes both legacy `.doc` and modern `.docx` files, extracting text and formatting.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
     *   **Smart H1 Preservation:** Automatically extracts and preserves page titles (H1 headings) that Readability might strip as "page chrome", ensuring proper heading hierarchy.
     *   **Flexible Content Selectors:** Supports multiple content container patterns (`.docs-content`, `.doc-content`, `.markdown-body`, `article`, etc.) for better compatibility with various documentation sites.
@@ -154,7 +155,7 @@ Configuration is managed through two files:
         
         For local directories (`type: 'local_directory'`):
         *   `path`: Path to the local directory to process.
-        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf']`.
+        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf', '.doc', '.docx']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf']`.
         *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
@@ -216,9 +217,9 @@ Configuration is managed through two files:
         product_name: 'project-docs'
         version: 'current'
         path: './docs'
-        include_extensions: ['.md', '.txt', '.pdf']
+        include_extensions: ['.md', '.txt', '.pdf', '.doc', '.docx']
         recursive: true
-        max_size: 10485760  # 10MB recommended for PDF files
+        max_size: 10485760  # 10MB recommended for PDF/Word files
         database_config:
           type: 'sqlite'
           params:
@@ -346,6 +347,67 @@ A PDF file named "user-guide.pdf" will be converted to Markdown format like:
 
 The resulting Markdown is then chunked and embedded using the same process as other text content.
 
+## Word Document Processing
+
+Doc2Vec supports processing Microsoft Word documents in both legacy `.doc` format and modern `.docx` format.
+
+### Supported Formats
+
+| Extension | Format | Library Used |
+|-----------|--------|--------------|
+| `.doc` | Legacy Word (97-2003) | [word-extractor](https://github.com/morungos/node-word-extractor) |
+| `.docx` | Modern Word (2007+) | [mammoth](https://github.com/mwilliamson/mammoth.js) |
+
+### Features
+
+*   **Legacy .doc Support:** Extracts plain text from older Word documents using binary parsing
+*   **Modern .docx Support:** Converts DOCX files to HTML first (preserving formatting), then to clean Markdown
+*   **Formatting Preservation:** For `.docx` files, headings, lists, bold, italic, and links are preserved
+*   **Automatic Title:** Uses the filename as an H1 heading for proper document structure
+*   **Local File Support:** Processes Word files found in local directories alongside other documents
+
+### Configuration
+
+Include `.doc` and/or `.docx` in your `include_extensions` array:
+
+```yaml
+- type: 'local_directory'
+  product_name: 'company-docs'
+  version: 'current'
+  path: './documents'
+  include_extensions: ['.doc', '.docx', '.pdf', '.md']
+  recursive: true
+  max_size: 10485760  # 10MB recommended
+  database_config:
+    type: 'sqlite'
+    params:
+      db_path: './company-docs.db'
+```
+
+### Example Output
+
+A Word document named "meeting-notes.docx" will be converted to Markdown like:
+
+```markdown
+# meeting-notes
+
+## Agenda
+
+1. Review Q4 results
+2. Discuss roadmap
+
+## Action Items
+
+- **John:** Prepare budget report
+- **Sarah:** Schedule follow-up meeting
+```
+
+### Notes
+
+*   **`.doc` files:** Only plain text is extracted. Formatting like bold/italic is not preserved in legacy Word format.
+*   **`.docx` files:** Full formatting is preserved including headings, lists, bold, italic, links, and tables.
+*   **Embedded Images:** Images embedded in Word documents are not extracted (text-only).
+
 ## Now Available via npx
 
 You can run `doc2vec` without cloning the repo or installing it globally. Just use:
@@ -388,6 +450,7 @@ If you don't specify a config path, it will look for config.yaml in the current 
           *   Recursively scan directories for files matching the configured extensions.
           *   Read file content, converting HTML to Markdown if needed.
           *   For PDF files, extract text using Mozilla's PDF.js and convert to Markdown format with proper page structure.
+          *   For Word documents, extract text from `.doc` files or convert `.docx` files to Markdown with formatting.
           *   Process each file's content.
         - **For Zendesk:**
           *   Fetch tickets and articles using the Zendesk API.
@@ -403,6 +466,12 @@ If you don't specify a config path, it will look for config.yaml in the current 
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Word Document Support
+- Added support for legacy `.doc` files using the `word-extractor` library
+- Added support for modern `.docx` files using the `mammoth` library
+- DOCX files preserve formatting (headings, lists, bold, italic, links)
+- Both formats are converted to clean Markdown for embedding
 
 ### Page Reconstruction Support
 - Added `chunk_index` field to track each chunk's position within a page (0-based)
