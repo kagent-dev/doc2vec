@@ -240,30 +240,38 @@ export class DatabaseManager {
         const hash = chunkHash || Utils.generateHash(chunk.content);
         
         const transaction = db.transaction(() => {
-            const params = [
-                new Float32Array(embedding),
-                chunk.metadata.product_name,
-                chunk.metadata.version,
-                JSON.stringify(chunk.metadata.heading_hierarchy),
-                chunk.metadata.section,
-                chunk.metadata.chunk_id,
-                chunk.content,
-                chunk.metadata.url,
-                hash,
-                chunk.metadata.chunk_index,
-                chunk.metadata.total_chunks
-            ];
+            // Use BigInt for true integer representation in SQLite vec0
+            const chunkIndex = BigInt(chunk.metadata.chunk_index | 0);
+            const totalChunks = BigInt(chunk.metadata.total_chunks | 0);
 
             try {
-                insertStmt.run(params);
+                insertStmt.run(
+                    new Float32Array(embedding),
+                    chunk.metadata.product_name,
+                    chunk.metadata.version,
+                    JSON.stringify(chunk.metadata.heading_hierarchy),
+                    chunk.metadata.section,
+                    chunk.metadata.chunk_id,
+                    chunk.content,
+                    chunk.metadata.url,
+                    hash,
+                    chunkIndex,
+                    totalChunks
+                );
             } catch (error) {
-                // Update params: all fields except chunk_id (which is the WHERE clause), then chunk_id at end for WHERE
-                const updateParams = [
-                    ...params.slice(0, 5),  // embedding through section
-                    ...params.slice(6),     // content through total_chunks (skip chunk_id)
-                    chunk.metadata.chunk_id // WHERE clause
-                ];
-                updateStmt.run(updateParams);
+                updateStmt.run(
+                    new Float32Array(embedding),
+                    chunk.metadata.product_name,
+                    chunk.metadata.version,
+                    JSON.stringify(chunk.metadata.heading_hierarchy),
+                    chunk.metadata.section,
+                    chunk.content,
+                    chunk.metadata.url,
+                    hash,
+                    chunkIndex,
+                    totalChunks,
+                    chunk.metadata.chunk_id
+                );
             }
         });
 

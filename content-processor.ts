@@ -892,7 +892,7 @@ export class ContentProcessor {
                     chunk_id: chunkId,
                     url: url,
                     hash: chunkId,
-                    chunk_index: chunkCounter,
+                    chunk_index: Math.floor(chunkCounter),
                     total_chunks: 0  // Placeholder, will be updated after all chunks are created
                 }
             };
@@ -998,7 +998,7 @@ export class ContentProcessor {
         flushBuffer(true); 
         
         // Update all chunks with the final total count
-        const totalChunks = chunks.length;
+        const totalChunks = Math.floor(chunks.length);
         for (const chunk of chunks) {
             chunk.metadata.total_chunks = totalChunks;
         }
