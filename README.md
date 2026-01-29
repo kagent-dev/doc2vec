@@ -6,6 +6,8 @@ This project provides a configurable tool (`doc2vec`) to crawl specified website
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
 
+> **⚠️ Version 2.0.0 Breaking Change:** Version 2.0.0 introduced enhanced chunking with new metadata fields (`chunk_index` and `total_chunks`) that enable page reconstruction and improved chunk ordering. The database schema has changed, and databases created with versions prior to 2.0.0 use a different format. **If you're upgrading to version 2.0.0 or later, you should start with fresh databases** to take advantage of the new features. While the MCP server maintains backward compatibility for querying old databases, doc2vec itself will create databases in the new format. If you need to migrate existing data, consider re-running doc2vec on your sources to regenerate the databases with the enhanced chunking format.
+
 ## Key Features
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.

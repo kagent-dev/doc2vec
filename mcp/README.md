@@ -18,6 +18,25 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
 - OpenAI API key
 - Documentation stored in SQLite vector databases (using `sqlite-vec`)
 
+## Backward Compatibility
+
+The MCP server is **backward compatible** with databases created using older versions of doc2vec that don't include the `chunk_index` and `total_chunks` columns.
+
+### Database Format Support
+
+**New Format (with `chunk_index` and `total_chunks`):**
+- Full functionality including range filtering with `startIndex` and `endIndex`
+- Chunk ordering and pagination support
+- Metadata available for page reconstruction
+
+**Old Format (without `chunk_index` and `total_chunks`):**
+- `query_documentation` tool works fully (uses `SELECT *` and handles optional fields)
+- `get_chunks` tool works but returns all chunks for a document
+- Range filtering (`startIndex`/`endIndex`) is gracefully ignored with a warning if requested
+- No errors or failures - the server automatically detects missing columns and adapts
+
+The server automatically detects the database schema and adapts its queries accordingly. No migration or database updates are required to use older databases.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -239,14 +258,33 @@ kubectl apply -f service.yaml
 
 ## Using the MCP Server
 
-The server implements a tool called `query-documentation` that can be used to query documentation.
+The server implements two tools:
+- `query_documentation` to search documentation
+- `get_chunks` to retrieve specific chunks by file path and chunk index
 
-### Tool Parameters
+### query_documentation
 
+**Parameters**
 - `queryText` (string, required): The natural language query to search for
 - `productName` (string, required): The name of the product documentation database to search within
 - `version` (string, optional): The specific version of the product documentation
 - `limit` (number, optional, default: 4): Maximum number of results to return
+
+**Notes**
+- Results include `chunk_index` and `total_chunks` when available, so clients can request neighboring chunks.
+
+### get_chunks
+
+**Parameters**
+- `productName` (string, required): The name of the product documentation database to search within
+- `filePath` (string, required): The document path (stored as `url` in the DB)
+- `startIndex` (number, optional): Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning
+- `endIndex` (number, optional): End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end
+- `version` (string, optional): The specific version of the product documentation
+
+**Notes**
+- Range filtering (`startIndex`/`endIndex`) requires the `chunk_index` column in the database. For older databases without this column, the tool will return all chunks and log a warning if range parameters are provided.
+- Results include `chunk_index` and `total_chunks` metadata when available (new format databases only).
 
 ## Integration Examples
 
