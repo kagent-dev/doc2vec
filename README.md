@@ -6,6 +6,8 @@ This project provides a configurable tool (`doc2vec`) to crawl specified website
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
 
+> **⚠️ Version 2.0.0 Breaking Change:** Version 2.0.0 introduced enhanced chunking with new metadata fields (`chunk_index` and `total_chunks`) that enable page reconstruction and improved chunk ordering. The database schema has changed, and databases created with versions prior to 2.0.0 use a different format. **If you're upgrading to version 2.0.0 or later, you should start with fresh databases** to take advantage of the new features. While the MCP server maintains backward compatibility for querying old databases, doc2vec itself will create databases in the new format. If you need to migrate existing data, consider re-running doc2vec on your sources to regenerate the databases with the enhanced chunking format.
+
 ## Key Features
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
@@ -19,8 +21,12 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     * **Flexible Filtering:** Filter tickets by status and priority.
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
+    * **Word Document Support:** Processes both legacy `.doc` and modern `.docx` files, extracting text and formatting.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
+    *   **Smart H1 Preservation:** Automatically extracts and preserves page titles (H1 headings) that Readability might strip as "page chrome", ensuring proper heading hierarchy.
+    *   **Flexible Content Selectors:** Supports multiple content container patterns (`.docs-content`, `.doc-content`, `.markdown-body`, `article`, etc.) for better compatibility with various documentation sites.
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
+    *   **Clean Heading Text:** Automatically removes anchor links (like `[](#section-id)`) from heading text for cleaner hierarchy display.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
 *   **Vector Embeddings:** Generates embeddings for each chunk using OpenAI's `text-embedding-3-large` model.
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
@@ -31,6 +37,58 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
+
+## Chunk Metadata & Page Reconstruction
+
+Each chunk stored in the database includes rich metadata that enables powerful retrieval and page reconstruction capabilities.
+
+### Metadata Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `product_name` | string | Product identifier from config |
+| `version` | string | Version identifier from config |
+| `heading_hierarchy` | string[] | Hierarchical breadcrumb trail (e.g., `["Installation", "Prerequisites", "Docker"]`) |
+| `section` | string | Current section heading |
+| `chunk_id` | string | Unique hash identifier for the chunk |
+| `url` | string | Source URL/path of the original document |
+| `hash` | string | Content hash for change detection |
+| `chunk_index` | number | Position of this chunk within the page (0-based) |
+| `total_chunks` | number | Total number of chunks for this page |
+
+### Page Reconstruction
+
+The `chunk_index` and `total_chunks` fields enable you to reconstruct full pages from chunks:
+
+```typescript
+// Example: Retrieve all chunks for a URL and reconstruct the page
+const chunks = await db.query({
+  filter: { url: "https://docs.example.com/guide" },
+  sort: { chunk_index: "asc" }
+});
+
+// Check if there are more chunks after the current one
+if (currentChunk.chunk_index < currentChunk.total_chunks - 1) {
+  // More chunks available - fetch the next one
+  const nextChunkIndex = currentChunk.chunk_index + 1;
+}
+
+// Reconstruct full page content
+const fullPageContent = chunks
+  .sort((a, b) => a.chunk_index - b.chunk_index)
+  .map(c => c.content)
+  .join("\n\n");
+```
+
+### Heading Hierarchy (Breadcrumbs)
+
+Each chunk includes a `heading_hierarchy` array that provides context about where the content appears in the document structure. This is injected as a `[Topic: ...]` prefix in the chunk content to improve vector search relevance.
+
+For example, a chunk under "Installation > Prerequisites > Docker" will have:
+- `heading_hierarchy`: `["Installation", "Prerequisites", "Docker"]`
+- Content prefix: `[Topic: Installation > Prerequisites > Docker]`
+
+This ensures that searches for parent topics (like "Installation") will also match relevant child content.
 
 ## Prerequisites
 
@@ -99,7 +157,7 @@ Configuration is managed through two files:
         
         For local directories (`type: 'local_directory'`):
         *   `path`: Path to the local directory to process.
-        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf']`.
+        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf', '.doc', '.docx']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf']`.
         *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
@@ -161,9 +219,9 @@ Configuration is managed through two files:
         product_name: 'project-docs'
         version: 'current'
         path: './docs'
-        include_extensions: ['.md', '.txt', '.pdf']
+        include_extensions: ['.md', '.txt', '.pdf', '.doc', '.docx']
         recursive: true
-        max_size: 10485760  # 10MB recommended for PDF files
+        max_size: 10485760  # 10MB recommended for PDF/Word files
         database_config:
           type: 'sqlite'
           params:
@@ -291,6 +349,67 @@ A PDF file named "user-guide.pdf" will be converted to Markdown format like:
 
 The resulting Markdown is then chunked and embedded using the same process as other text content.
 
+## Word Document Processing
+
+Doc2Vec supports processing Microsoft Word documents in both legacy `.doc` format and modern `.docx` format.
+
+### Supported Formats
+
+| Extension | Format | Library Used |
+|-----------|--------|--------------|
+| `.doc` | Legacy Word (97-2003) | [word-extractor](https://github.com/morungos/node-word-extractor) |
+| `.docx` | Modern Word (2007+) | [mammoth](https://github.com/mwilliamson/mammoth.js) |
+
+### Features
+
+*   **Legacy .doc Support:** Extracts plain text from older Word documents using binary parsing
+*   **Modern .docx Support:** Converts DOCX files to HTML first (preserving formatting), then to clean Markdown
+*   **Formatting Preservation:** For `.docx` files, headings, lists, bold, italic, and links are preserved
+*   **Automatic Title:** Uses the filename as an H1 heading for proper document structure
+*   **Local File Support:** Processes Word files found in local directories alongside other documents
+
+### Configuration
+
+Include `.doc` and/or `.docx` in your `include_extensions` array:
+
+```yaml
+- type: 'local_directory'
+  product_name: 'company-docs'
+  version: 'current'
+  path: './documents'
+  include_extensions: ['.doc', '.docx', '.pdf', '.md']
+  recursive: true
+  max_size: 10485760  # 10MB recommended
+  database_config:
+    type: 'sqlite'
+    params:
+      db_path: './company-docs.db'
+```
+
+### Example Output
+
+A Word document named "meeting-notes.docx" will be converted to Markdown like:
+
+```markdown
+# meeting-notes
+
+## Agenda
+
+1. Review Q4 results
+2. Discuss roadmap
+
+## Action Items
+
+- **John:** Prepare budget report
+- **Sarah:** Schedule follow-up meeting
+```
+
+### Notes
+
+*   **`.doc` files:** Only plain text is extracted. Formatting like bold/italic is not preserved in legacy Word format.
+*   **`.docx` files:** Full formatting is preserved including headings, lists, bold, italic, links, and tables.
+*   **Embedded Images:** Images embedded in Word documents are not extracted (text-only).
+
 ## Now Available via npx
 
 You can run `doc2vec` without cloning the repo or installing it globally. Just use:
@@ -333,6 +452,7 @@ If you don't specify a config path, it will look for config.yaml in the current 
           *   Recursively scan directories for files matching the configured extensions.
           *   Read file content, converting HTML to Markdown if needed.
           *   For PDF files, extract text using Mozilla's PDF.js and convert to Markdown format with proper page structure.
+          *   For Word documents, extract text from `.doc` files or convert `.docx` files to Markdown with formatting.
           *   Process each file's content.
         - **For Zendesk:**
           *   Fetch tickets and articles using the Zendesk API.
@@ -346,3 +466,32 @@ If you don't specify a config path, it will look for config.yaml in the current 
         *   **Store:** Insert or update the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
     4.  **Cleanup:** After processing, remove any obsolete chunks from the database.
 4.  **Complete:** Log completion status.
+
+## Recent Changes
+
+### Word Document Support
+- Added support for legacy `.doc` files using the `word-extractor` library
+- Added support for modern `.docx` files using the `mammoth` library
+- DOCX files preserve formatting (headings, lists, bold, italic, links)
+- Both formats are converted to clean Markdown for embedding
+
+### Page Reconstruction Support
+- Added `chunk_index` field to track each chunk's position within a page (0-based)
+- Added `total_chunks` field to indicate the total number of chunks per page
+- Enables AI agents and applications to fetch additional context or reconstruct full pages
+- Works consistently across all content types: websites, GitHub, Zendesk, and local directories
+
+### Improved H1/Title Handling
+- Smart H1 preservation ensures page titles aren't stripped by Readability
+- Falls back to `article.title` when H1 extraction fails
+- Proper heading hierarchy starting from H1 through the document structure
+
+### Enhanced Content Extraction
+- Added support for multiple content container selectors (`.docs-content`, `.doc-content`, `.markdown-body`, `article`)
+- Cleaner heading text by removing anchor links like `[](#section-id)`
+- Better handling of pages where H1 is outside the main content container
+
+### Heading Hierarchy Improvements
+- Fixed sparse array issues that caused `NULL` values in heading hierarchy
+- Proper breadcrumb generation for nested sections
+- Hierarchical context preserved across chunk boundaries

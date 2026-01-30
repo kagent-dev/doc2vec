@@ -83,6 +83,10 @@ export interface QueryResult {
     distance: number;
     content: string;
     url?: string;
+    section?: string;
+    heading_hierarchy?: string;
+    chunk_index?: number;
+    total_chunks?: number;
     embedding?: Float32Array | number[];
     [key: string]: unknown;
 }
@@ -196,14 +200,145 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
     }
 }
 
-async function queryDocumentation(queryText: string, productName: string, version?: string, limit: number = 4): Promise<{ distance: number, content: string, url?: string }[]> {
+async function queryDocumentation(
+    queryText: string,
+    productName: string,
+    version?: string,
+    limit: number = 4
+): Promise<{
+    distance: number;
+    content: string;
+    url?: string;
+    section?: string;
+    chunk_index?: number;
+    total_chunks?: number;
+}[]> {
     const queryEmbedding = await createEmbeddings(queryText);
     const results = queryCollection(queryEmbedding, { product_name: productName, version: version }, limit);
     return results.map((qr: QueryResult) => ({
         distance: qr.distance,
         content: qr.content,
         ...(qr.url && { url: qr.url }),
+        ...(qr.section && { section: qr.section }),
+        ...(typeof qr.chunk_index === 'number' && { chunk_index: qr.chunk_index }),
+        ...(typeof qr.total_chunks === 'number' && { total_chunks: qr.total_chunks }),
     }));
+}
+
+function getChunksForDocument(
+    productName: string,
+    filePath: string,
+    startIndex?: number,
+    endIndex?: number,
+    version?: string
+): QueryResult[] {
+    const dbPath = path.join(dbDir, `${productName}.db`);
+
+    if (!fs.existsSync(dbPath)) {
+        throw new Error(`Database file not found at ${dbPath}`);
+    }
+
+    let db: DatabaseType | null = null;
+    try {
+        db = new Database(dbPath);
+        sqliteVec.load(db);
+
+        const hasRange = typeof startIndex === 'number' && typeof endIndex === 'number';
+        
+        // Try to build and execute query with chunk_index/total_chunks first
+        // If it fails, retry without those columns (backward compatibility)
+        let selectColumns = [
+            'chunk_id',
+            'content',
+            'url',
+            'section',
+            'heading_hierarchy',
+            'chunk_index',
+            'total_chunks'
+        ];
+        
+        let query = `
+              SELECT
+                  ${selectColumns.join(', ')}
+              FROM vec_items
+              WHERE url = ?`;
+
+        if (version) query += ` AND version = ?`;
+        if (hasRange) {
+            query += ` AND chunk_index >= ? AND chunk_index <= ?`;
+        }
+
+        query += `
+              ORDER BY chunk_index;`;
+
+        let stmt;
+        let params: (string | number)[] = [filePath];
+        if (version) params.push(version);
+        if (hasRange) {
+            params.push(startIndex);
+            params.push(endIndex);
+        }
+
+        try {
+            stmt = db.prepare(query);
+            const rows = stmt.all(...params) as QueryResult[];
+            return rows;
+        } catch (error: any) {
+            // If query fails due to missing chunk_index column, retry without it
+            const errorMessage = error?.message || String(error);
+            const errorStr = String(error);
+            const isChunkIndexError = (errorMessage.includes('no such column') && errorMessage.includes('chunk_index')) ||
+                                     (errorStr.includes('no such column') && errorStr.includes('chunk_index'));
+            
+            if (isChunkIndexError) {
+                console.error(`Warning: chunk_index column doesn't exist in database. Using backward compatible query.`);
+                
+                if (hasRange) {
+                    console.error(`Warning: startIndex/endIndex provided but chunk_index column doesn't exist. Ignoring range filter.`);
+                }
+                
+                // Build query without chunk_index/total_chunks
+                selectColumns = [
+                    'chunk_id',
+                    'content',
+                    'url',
+                    'section',
+                    'heading_hierarchy'
+                ];
+                
+                query = `
+                      SELECT
+                          ${selectColumns.join(', ')}
+                      FROM vec_items
+                      WHERE url = ?`;
+
+                if (version) query += ` AND version = ?`;
+                query += `;`;
+
+                params = [filePath];
+                if (version) params.push(version);
+                
+                try {
+                    stmt = db.prepare(query);
+                    const rows = stmt.all(...params) as QueryResult[];
+                    return rows;
+                } catch (retryError: any) {
+                    // If retry also fails, throw the original error
+                    throw error;
+                }
+            } else {
+                // Re-throw if it's a different error
+                throw error;
+            }
+        }
+    } catch (error) {
+        console.error(`Error retrieving chunks in ${dbPath}:`, error);
+        throw new Error(`Chunk retrieval failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+        if (db) {
+            db.close();
+        }
+    }
 }
 
 // --- MCP Server Setup ---
@@ -217,7 +352,17 @@ const server = new McpServer({
 });
 
 // --- Define the MCP Tool Logic ---
-const queryDocumentationToolHandler = async ({ queryText, productName, version, limit }: { queryText: string; productName: string; version?: string; limit: number }) => {
+const queryDocumentationToolHandler = async ({
+    queryText,
+    productName,
+    version,
+    limit,
+}: {
+    queryText: string;
+    productName: string;
+    version?: string;
+    limit: number;
+}) => {
     console.error(`Received query: text="${queryText}", product="${productName}", version="${version || 'any'}", limit=${limit}`);
 
     try {
@@ -235,6 +380,9 @@ const queryDocumentationToolHandler = async ({ queryText, productName, version, 
                 `  Content: ${r.content}`,
                 `  Distance: ${r.distance.toFixed(4)}`,
                 r.url ? `  URL: ${r.url}` : null,
+                typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number'
+                    ? `  Chunk: ${r.chunk_index + 1} of ${r.total_chunks}`
+                    : null,
                 "---"
             ].filter(line => line !== null).join("\n")
         ).join("\n");
@@ -253,6 +401,51 @@ const queryDocumentationToolHandler = async ({ queryText, productName, version, 
     }
 };
 
+const getChunksToolHandler = async ({
+    productName,
+    filePath,
+    startIndex,
+    endIndex,
+    version,
+}: {
+    productName: string;
+    filePath: string;
+    startIndex?: number;
+    endIndex?: number;
+    version?: string;
+}) => {
+    console.error(`Received get_chunks: filePath="${filePath}", product="${productName}", version="${version || 'any'}", startIndex=${startIndex}, endIndex=${endIndex}`);
+
+    try {
+        const results = getChunksForDocument(productName, filePath, startIndex, endIndex, version);
+
+        if (results.length === 0) {
+            return {
+                content: [{ type: "text" as const, text: `No chunks found for "${filePath}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
+            };
+        }
+
+        const formattedResults = results.map((r) =>
+            [
+                `Chunk ${typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number' ? `${r.chunk_index + 1} of ${r.total_chunks}` : ''}`.trim(),
+                `  Content: ${r.content}`,
+                r.section ? `  Section: ${r.section}` : null,
+                r.url ? `  URL: ${r.url}` : null,
+                "---"
+            ].filter(line => line !== null).join("\n")
+        ).join("\n");
+
+        return {
+            content: [{ type: "text" as const, text: `Retrieved ${results.length} chunk(s) for "${filePath}":\n\n${formattedResults}` }],
+        };
+    } catch (error: any) {
+        console.error("Error processing 'get_chunks' tool:", error);
+        return {
+            content: [{ type: "text" as const, text: `Error retrieving chunks: ${error.message}` }],
+        };
+    }
+};
+
 // --- Define the MCP Tool ---
 server.tool(
     "query_documentation",
@@ -264,6 +457,19 @@ server.tool(
         limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
     },
     queryDocumentationToolHandler
+);
+
+server.tool(
+    "get_chunks",
+    "Retrieve specific chunks from a document by file path.",
+    {
+        productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+        filePath: z.string().min(1).describe("The file path (url) of the document to retrieve chunks from."),
+        startIndex: z.number().int().nonnegative().optional().describe("Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning."),
+        endIndex: z.number().int().nonnegative().optional().describe("End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end."),
+        version: z.string().optional().describe("The specific version of the product documentation (e.g., '1.2.0'). Optional."),
+    },
+    getChunksToolHandler
 );
 
 // --- Transport Setup ---
@@ -428,7 +634,7 @@ async function main() {
                         },
                     });
 
-                    // Add the query_documentation tool to this server instance using the shared handler
+                    // Add tools to this server instance using shared handlers
                     sessionServer.tool(
                         "query_documentation",
                         "Query documentation stored in a sqlite-vec database using vector search.",
@@ -439,6 +645,19 @@ async function main() {
                             limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
                         },
                         queryDocumentationToolHandler
+                    );
+                    
+                    sessionServer.tool(
+                        "get_chunks",
+                        "Retrieve specific chunks from a document by file path.",
+                        {
+                            productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+                            filePath: z.string().min(1).describe("The file path (url) of the document to retrieve chunks from."),
+                            startIndex: z.number().int().nonnegative().optional().describe("Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning."),
+                            endIndex: z.number().int().nonnegative().optional().describe("End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end."),
+                            version: z.string().optional().describe("The specific version of the product documentation (e.g., '1.2.0'). Optional."),
+                        },
+                        getChunksToolHandler
                     );
 
                     transport = new StreamableHTTPServerTransport({

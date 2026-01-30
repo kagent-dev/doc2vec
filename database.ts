@@ -41,7 +41,9 @@ export class DatabaseManager {
                     chunk_id TEXT UNIQUE,
                     content TEXT,
                     url TEXT,
-                    hash TEXT
+                    hash TEXT,
+                    chunk_index INTEGER,
+                    total_chunks INTEGER
                 );
             `);
             logger.info(`SQLite database initialized successfully`);
@@ -220,12 +222,12 @@ export class DatabaseManager {
     static prepareSQLiteStatements(db: Database) {
         return {
             insertStmt: db.prepare(`
-                INSERT INTO vec_items (embedding, product_name, version, heading_hierarchy, section, chunk_id, content, url, hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO vec_items (embedding, product_name, version, heading_hierarchy, section, chunk_id, content, url, hash, chunk_index, total_chunks)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `),
             checkHashStmt: db.prepare(`SELECT hash FROM vec_items WHERE chunk_id = ?`),
             updateStmt: db.prepare(`
-                UPDATE vec_items SET embedding = ?, product_name = ?, version = ?, heading_hierarchy = ?, section = ?, content = ?, url = ?, hash = ?
+                UPDATE vec_items SET embedding = ?, product_name = ?, version = ?, heading_hierarchy = ?, section = ?, content = ?, url = ?, hash = ?, chunk_index = ?, total_chunks = ?
                 WHERE chunk_id = ?
             `),
             getAllChunkIdsStmt: db.prepare(`SELECT chunk_id FROM vec_items`),
@@ -238,22 +240,38 @@ export class DatabaseManager {
         const hash = chunkHash || Utils.generateHash(chunk.content);
         
         const transaction = db.transaction(() => {
-            const params = [
-                new Float32Array(embedding),
-                chunk.metadata.product_name,
-                chunk.metadata.version,
-                JSON.stringify(chunk.metadata.heading_hierarchy),
-                chunk.metadata.section,
-                chunk.metadata.chunk_id,
-                chunk.content,
-                chunk.metadata.url,
-                hash
-            ];
+            // Use BigInt for true integer representation in SQLite vec0
+            const chunkIndex = BigInt(chunk.metadata.chunk_index | 0);
+            const totalChunks = BigInt(chunk.metadata.total_chunks | 0);
 
             try {
-                insertStmt.run(params);
+                insertStmt.run(
+                    new Float32Array(embedding),
+                    chunk.metadata.product_name,
+                    chunk.metadata.version,
+                    JSON.stringify(chunk.metadata.heading_hierarchy),
+                    chunk.metadata.section,
+                    chunk.metadata.chunk_id,
+                    chunk.content,
+                    chunk.metadata.url,
+                    hash,
+                    chunkIndex,
+                    totalChunks
+                );
             } catch (error) {
-                updateStmt.run([...params.slice(0, 8), chunk.metadata.chunk_id]);
+                updateStmt.run(
+                    new Float32Array(embedding),
+                    chunk.metadata.product_name,
+                    chunk.metadata.version,
+                    JSON.stringify(chunk.metadata.heading_hierarchy),
+                    chunk.metadata.section,
+                    chunk.content,
+                    chunk.metadata.url,
+                    hash,
+                    chunkIndex,
+                    totalChunks,
+                    chunk.metadata.chunk_id
+                );
             }
         });
 
@@ -287,6 +305,8 @@ export class DatabaseManager {
                     url: chunk.metadata.url,
                     hash: hash,
                     original_chunk_id: chunk.metadata.chunk_id,
+                    chunk_index: chunk.metadata.chunk_index,
+                    total_chunks: chunk.metadata.total_chunks,
                 },
             };
 

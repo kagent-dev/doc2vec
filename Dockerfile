@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
   curl \
   ca-certificates \
   chromium \
+  chromium-sandbox \
   fonts-freefont-ttf \
   fonts-ipafont-gothic \
   fonts-kacst \
@@ -26,4 +27,13 @@ RUN apt-get update && apt-get install -y \
   libxrandr2 \
   libxshmfence1 \
   libxtst6 \
-  && apt-get clean
+  && apt-get clean \
+  && ln -s /usr/bin/chromium /usr/bin/chromium-browser || true
+
+COPY package*.json ./
+RUN npm install --ignore-scripts
+# Install Chrome via Puppeteer as fallback (system Chromium will be used first)
+RUN npx puppeteer browsers install chrome || true
+COPY . .
+
+RUN npm run build
