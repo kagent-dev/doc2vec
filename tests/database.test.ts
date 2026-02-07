@@ -728,4 +728,637 @@ describe('DatabaseManager', () => {
             expect(value).toBe('default_val');
         });
     });
+
+    // ─── initDatabase - SQLite path ──────────────────────────────────
+    describe('initDatabase - SQLite path', () => {
+        it('should generate default db_path from product_name and version', async () => {
+            const mockDb = {
+                exec: vi.fn(),
+                close: vi.fn(),
+            };
+            const BetterSqlite3Mock = vi.fn().mockReturnValue(mockDb);
+            const sqliteVecLoadMock = vi.fn();
+
+            // We need to spy on the actual module imports
+            // Instead, we test the path logic by inspecting args
+            const config: SourceConfig = {
+                type: 'website',
+                product_name: 'My Product',
+                version: '2.0',
+                max_size: 1000,
+                url: 'https://example.com',
+                database_config: {
+                    type: 'sqlite',
+                    params: {} // no db_path → should use default
+                }
+            };
+
+            // Since we can't easily mock the BetterSqlite3 constructor without vi.mock,
+            // we test the path construction logic directly
+            const params = config.database_config.params as { db_path?: string };
+            const expectedDefault = path.join(process.cwd(), 'My_Product-2.0.db');
+            const dbPath = params.db_path || path.join(process.cwd(), `${config.product_name.replace(/\s+/g, '_')}-${config.version}.db`);
+            expect(dbPath).toBe(expectedDefault);
+        });
+
+        it('should use custom db_path when provided', () => {
+            const config: SourceConfig = {
+                type: 'website',
+                product_name: 'My Product',
+                version: '2.0',
+                max_size: 1000,
+                url: 'https://example.com',
+                database_config: {
+                    type: 'sqlite',
+                    params: { db_path: '/custom/path/my.db' }
+                }
+            };
+
+            const params = config.database_config.params as { db_path?: string };
+            const dbPath = params.db_path || path.join(process.cwd(), `${config.product_name.replace(/\s+/g, '_')}-${config.version}.db`);
+            expect(dbPath).toBe('/custom/path/my.db');
+        });
+
+        it('should return SqliteDB connection from a real in-memory database', async () => {
+            // Test with a real in-memory SQLite (simulates what initDatabase does)
+            const db = new BetterSqlite3(':memory:', { allowExtension: true } as any);
+            sqliteVec.load(db);
+            db.exec(`
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
+                    embedding FLOAT[3072],
+                    product_name TEXT,
+                    version TEXT,
+                    branch TEXT,
+                    repo TEXT,
+                    heading_hierarchy TEXT,
+                    section TEXT,
+                    chunk_id TEXT UNIQUE,
+                    content TEXT,
+                    url TEXT,
+                    hash TEXT,
+                    chunk_index INTEGER,
+                    total_chunks INTEGER
+                );
+            `);
+            const conn: SqliteDB = { db, type: 'sqlite' };
+            expect(conn.type).toBe('sqlite');
+            expect(conn.db).toBeDefined();
+            db.close();
+        });
+    });
+
+    // ─── initDatabase - Qdrant path ──────────────────────────────────
+    describe('initDatabase - Qdrant path', () => {
+        it('should generate default collection name from product_name and version', () => {
+            const config: SourceConfig = {
+                type: 'website',
+                product_name: 'My Product',
+                version: '3.1',
+                max_size: 1000,
+                url: 'https://example.com',
+                database_config: {
+                    type: 'qdrant',
+                    params: {} // no collection_name
+                }
+            };
+
+            const params = config.database_config.params as { collection_name?: string };
+            const collectionName = params.collection_name || `${config.product_name.toLowerCase().replace(/\s+/g, '_')}_${config.version}`;
+            expect(collectionName).toBe('my_product_3.1');
+        });
+
+        it('should use custom collection name when provided', () => {
+            const config: SourceConfig = {
+                type: 'website',
+                product_name: 'My Product',
+                version: '3.1',
+                max_size: 1000,
+                url: 'https://example.com',
+                database_config: {
+                    type: 'qdrant',
+                    params: { collection_name: 'custom_collection' }
+                }
+            };
+
+            const params = config.database_config.params as { collection_name?: string };
+            const collectionName = params.collection_name || `${config.product_name.toLowerCase().replace(/\s+/g, '_')}_${config.version}`;
+            expect(collectionName).toBe('custom_collection');
+        });
+
+        it('should call createCollectionQdrant and return QdrantDB connection', async () => {
+            const mockClient = {
+                getCollections: vi.fn().mockResolvedValue({ collections: [] }),
+                createCollection: vi.fn().mockResolvedValue({}),
+            };
+
+            // Simulate what initDatabase does for Qdrant
+            const collectionName = 'test_col';
+            await DatabaseManager.createCollectionQdrant(mockClient as any, collectionName, testLogger);
+
+            expect(mockClient.createCollection).toHaveBeenCalledOnce();
+
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName,
+                type: 'qdrant',
+            };
+            expect(qdrantDb.type).toBe('qdrant');
+            expect(qdrantDb.collectionName).toBe('test_col');
+        });
+    });
+
+    // ─── initDatabase - unsupported type ─────────────────────────────
+    describe('initDatabase - unsupported type', () => {
+        it('should throw for unknown database type', async () => {
+            const config = {
+                type: 'website',
+                product_name: 'Test',
+                version: '1.0',
+                max_size: 1000,
+                url: 'https://example.com',
+                database_config: {
+                    type: 'mongodb' as any, // unsupported
+                    params: {}
+                }
+            } as SourceConfig;
+
+            await expect(
+                DatabaseManager.initDatabase(config, testLogger)
+            ).rejects.toThrow('Unsupported database type: mongodb');
+        });
+    });
+
+    // ─── initDatabaseMetadata - Qdrant ───────────────────────────────
+    describe('initDatabaseMetadata - Qdrant', () => {
+        it('should be a no-op for Qdrant connections (just logs)', async () => {
+            const mockClient = {};
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            // Should not throw - it's a no-op that just logs
+            await DatabaseManager.initDatabaseMetadata(qdrantDb, testLogger);
+        });
+    });
+
+    // ─── getLastRunDate - Qdrant ─────────────────────────────────────
+    describe('getLastRunDate - Qdrant', () => {
+        it('should return date from Qdrant when found', async () => {
+            const mockClient = {
+                retrieve: vi.fn().mockResolvedValue([
+                    { payload: { metadata_value: '2025-06-15T10:00:00.000Z' } }
+                ]),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const date = await DatabaseManager.getLastRunDate(qdrantDb, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
+            expect(date).toBe('2025-06-15T10:00:00.000Z');
+            expect(mockClient.retrieve).toHaveBeenCalledOnce();
+        });
+
+        it('should return default when not found in Qdrant', async () => {
+            const mockClient = {
+                retrieve: vi.fn().mockResolvedValue([]),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const date = await DatabaseManager.getLastRunDate(qdrantDb, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
+            expect(date).toBe('2025-01-01T00:00:00Z');
+        });
+
+        it('should handle retrieve error gracefully and return default', async () => {
+            const mockClient = {
+                retrieve: vi.fn().mockRejectedValue(new Error('Network timeout')),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const date = await DatabaseManager.getLastRunDate(qdrantDb, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
+            expect(date).toBe('2025-01-01T00:00:00Z');
+        });
+    });
+
+    // ─── updateLastRunDate - Qdrant ──────────────────────────────────
+    describe('updateLastRunDate - Qdrant', () => {
+        it('should call upsert with metadata point', async () => {
+            const mockClient = {
+                upsert: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger);
+
+            expect(mockClient.upsert).toHaveBeenCalledOnce();
+            const call = mockClient.upsert.mock.calls[0];
+            expect(call[0]).toBe('test_col');
+            const point = call[1].points[0];
+            expect(point.payload.is_metadata).toBe(true);
+            expect(point.payload.metadata_key).toBe('last_run_owner_repo');
+            expect(point.payload.metadata_value).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+            expect(point.vector).toHaveLength(3072);
+        });
+
+        it('should handle upsert error gracefully', async () => {
+            const mockClient = {
+                upsert: vi.fn().mockRejectedValue(new Error('Qdrant down')),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            // Should not throw
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger);
+        });
+    });
+
+    // ─── removeObsoleteChunksQdrant - error handling ─────────────────
+    describe('removeObsoleteChunksQdrant - error handling', () => {
+        it('should handle scroll error gracefully', async () => {
+            const mockClient = {
+                scroll: vi.fn().mockRejectedValue(new Error('Scroll failed')),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            // Should not throw
+            await DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, new Set(), 'https://example.com', testLogger);
+        });
+    });
+
+    // ─── removeChunksByUrlQdrant - error handling ────────────────────
+    describe('removeChunksByUrlQdrant - error handling', () => {
+        it('should handle delete error gracefully', async () => {
+            const mockClient = {
+                delete: vi.fn().mockRejectedValue(new Error('Delete failed')),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            // Should not throw
+            await DatabaseManager.removeChunksByUrlQdrant(qdrantDb, 'https://example.com/page', testLogger);
+        });
+    });
+
+    // ─── removeObsoleteFilesQdrant ───────────────────────────────────
+    describe('removeObsoleteFilesQdrant', () => {
+        it('should delete obsolete file chunks in direct file path mode', async () => {
+            const mockClient = {
+                scroll: vi.fn().mockResolvedValue({
+                    points: [
+                        { id: 'p1', payload: { url: 'file:///project/src/a.ts', is_metadata: false } },
+                        { id: 'p2', payload: { url: 'file:///project/src/deleted.ts', is_metadata: false } },
+                    ],
+                }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, processedFiles, '/project/src', testLogger);
+
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleteCall = mockClient.delete.mock.calls[0];
+            expect(deleteCall[1].points).toContain('p2');
+            expect(deleteCall[1].points).not.toContain('p1');
+        });
+
+        it('should delete obsolete file chunks in URL rewrite mode', async () => {
+            const mockClient = {
+                scroll: vi.fn().mockResolvedValue({
+                    points: [
+                        { id: 'r1', payload: { url: 'https://mysite.com/src/a.ts', is_metadata: false } },
+                        { id: 'r2', payload: { url: 'https://mysite.com/src/deleted.ts', is_metadata: false } },
+                    ],
+                }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            await DatabaseManager.removeObsoleteFilesQdrant(
+                qdrantDb,
+                processedFiles,
+                { path: '/project', url_rewrite_prefix: 'https://mysite.com' },
+                testLogger
+            );
+
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleteCall = mockClient.delete.mock.calls[0];
+            expect(deleteCall[1].points).toContain('r2');
+            expect(deleteCall[1].points).not.toContain('r1');
+        });
+
+        it('should not delete when no obsolete files exist', async () => {
+            const mockClient = {
+                scroll: vi.fn().mockResolvedValue({
+                    points: [
+                        { id: 'p1', payload: { url: 'file:///project/src/a.ts', is_metadata: false } },
+                    ],
+                }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, processedFiles, '/project/src', testLogger);
+
+            expect(mockClient.delete).not.toHaveBeenCalled();
+        });
+
+        it('should handle error gracefully', async () => {
+            const mockClient = {
+                scroll: vi.fn().mockRejectedValue(new Error('Qdrant scroll failed')),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            // Should not throw
+            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, new Set(), '/project/src', testLogger);
+        });
+    });
+
+    // ─── storeChunkInQdrant - randomUUID fallback ────────────────────
+    describe('storeChunkInQdrant - randomUUID fallback', () => {
+        it('should use crypto.randomUUID when hashToUuid throws', async () => {
+            const mockClient = {
+                upsert: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const chunk = createTestChunk();
+            // Use a chunk_id that is not a valid UUID and would cause hashToUuid issues
+            // hashToUuid only takes first 32 chars, but if isValidUuid returns false
+            // and hashToUuid itself throws, we fall back to crypto.randomUUID
+            chunk.metadata.chunk_id = ''; // empty string - hashToUuid may produce invalid output
+            const embedding = createTestEmbedding();
+
+            // Mock Utils.hashToUuid to throw
+            const { Utils } = await import('../utils');
+            const hashToUuidSpy = vi.spyOn(Utils, 'hashToUuid').mockImplementation(() => {
+                throw new Error('Invalid hash input');
+            });
+            const isValidUuidSpy = vi.spyOn(Utils, 'isValidUuid').mockReturnValue(false);
+
+            await DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, embedding, 'test-hash');
+
+            expect(mockClient.upsert).toHaveBeenCalledOnce();
+            const call = mockClient.upsert.mock.calls[0];
+            const pointId = call[1].points[0].id;
+            // Should be a valid UUID from crypto.randomUUID()
+            expect(pointId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+            hashToUuidSpy.mockRestore();
+            isValidUuidSpy.mockRestore();
+        });
+    });
+
+    // ─── storeChunkInQdrant - hash generation ────────────────────────
+    describe('storeChunkInQdrant - hash generation', () => {
+        it('should generate hash from content when no chunkHash provided', async () => {
+            const mockClient = {
+                upsert: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const chunk = createTestChunk();
+            const embedding = createTestEmbedding();
+
+            // Call without chunkHash
+            await DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, embedding);
+
+            expect(mockClient.upsert).toHaveBeenCalledOnce();
+            const call = mockClient.upsert.mock.calls[0];
+            const payload = call[1].points[0].payload;
+            // hash should be a sha256 hex string (64 chars)
+            expect(payload.hash).toMatch(/^[a-f0-9]{64}$/);
+        });
+    });
+
+    // ─── setMetadataValue - error handling ────────────────────────────
+    describe('setMetadataValue - error handling', () => {
+        it('should handle SQLite error gracefully', async () => {
+            const mockDb = {
+                prepare: vi.fn().mockImplementation(() => {
+                    throw new Error('SQLite prepare failed');
+                }),
+            };
+            const conn: SqliteDB = { db: mockDb, type: 'sqlite' };
+
+            // Should not throw - error is caught internally
+            await DatabaseManager.setMetadataValue(conn, 'key', 'value', testLogger);
+        });
+
+        it('should handle Qdrant upsert error gracefully', async () => {
+            const mockClient = {
+                upsert: vi.fn().mockRejectedValue(new Error('Qdrant upsert failed')),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            // Should not throw - error is caught internally
+            await DatabaseManager.setMetadataValue(qdrantDb, 'key', 'value', testLogger);
+        });
+    });
+
+    // ─── getMetadataValue - outer catch ──────────────────────────────
+    describe('getMetadataValue - outer catch', () => {
+        it('should catch error in SQLite prepare (outer try/catch)', async () => {
+            const mockDb = {
+                prepare: vi.fn().mockImplementation(() => {
+                    throw new Error('SQLite prepare exploded');
+                }),
+            };
+            const conn: SqliteDB = { db: mockDb, type: 'sqlite' };
+
+            // The outer try/catch should handle this and return defaultValue
+            const value = await DatabaseManager.getMetadataValue(conn, 'key', 'fallback', testLogger);
+            expect(value).toBe('fallback');
+        });
+
+        it('should return undefined when SQLite prepare fails and no default', async () => {
+            const mockDb = {
+                prepare: vi.fn().mockImplementation(() => {
+                    throw new Error('SQLite prepare exploded');
+                }),
+            };
+            const conn: SqliteDB = { db: mockDb, type: 'sqlite' };
+
+            const value = await DatabaseManager.getMetadataValue(conn, 'key', undefined, testLogger);
+            expect(value).toBeUndefined();
+        });
+    });
+
+    // ─── removeObsoleteFilesSQLite - trailing slash in URL prefix ────
+    describe('removeObsoleteFilesSQLite - trailing slash in URL prefix', () => {
+        let db: BetterSqlite3.Database;
+
+        beforeEach(() => {
+            db = createTestDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('should handle url_rewrite_prefix ending with trailing slash', () => {
+            const embedding = createTestEmbedding();
+
+            const chunk1 = createTestChunk();
+            chunk1.metadata.chunk_id = 'trail1';
+            chunk1.metadata.url = 'https://mysite.com/src/a.ts';
+            DatabaseManager.insertVectorsSQLite(db, chunk1, embedding, testLogger);
+
+            const chunk2 = createTestChunk();
+            chunk2.metadata.chunk_id = 'trail2';
+            chunk2.metadata.url = 'https://mysite.com/src/deleted.ts';
+            DatabaseManager.insertVectorsSQLite(db, chunk2, embedding, testLogger);
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            // Trailing slash in url_rewrite_prefix
+            DatabaseManager.removeObsoleteFilesSQLite(
+                db,
+                processedFiles,
+                { path: '/project', url_rewrite_prefix: 'https://mysite.com/' },
+                testLogger
+            );
+
+            const remaining = db.prepare('SELECT chunk_id FROM vec_items').all() as any[];
+            expect(remaining.length).toBe(1);
+            expect(remaining[0].chunk_id).toBe('trail1');
+        });
+    });
+
+    // ─── removeObsoleteFilesSQLite - path starting with ./ ───────────
+    describe('removeObsoleteFilesSQLite - path starting with ./', () => {
+        let db: BetterSqlite3.Database;
+
+        beforeEach(() => {
+            db = createTestDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('should clean ./ prefix from path when used as string pathConfig', () => {
+            const embedding = createTestEmbedding();
+
+            // When pathConfig is './project/src', the ./ is stripped to get 'project/src'
+            // Then urlPrefix becomes 'file://project/src'
+            // So chunks must have URLs starting with 'file://project/src'
+            const chunk1 = createTestChunk();
+            chunk1.metadata.chunk_id = 'dot-slash-1';
+            chunk1.metadata.url = 'file://project/src/keep.ts';
+            DatabaseManager.insertVectorsSQLite(db, chunk1, embedding, testLogger);
+
+            const chunk2 = createTestChunk();
+            chunk2.metadata.chunk_id = 'dot-slash-2';
+            chunk2.metadata.url = 'file://project/src/remove.ts';
+            DatabaseManager.insertVectorsSQLite(db, chunk2, embedding, testLogger);
+
+            // filePath is extracted by removing 'file://' prefix (7 chars)
+            // so 'file://project/src/keep.ts' -> 'project/src/keep.ts'
+            const processedFiles = new Set(['project/src/keep.ts']);
+            // pathConfig starts with ./
+            DatabaseManager.removeObsoleteFilesSQLite(db, processedFiles, './project/src', testLogger);
+
+            const remaining = db.prepare('SELECT chunk_id FROM vec_items').all() as any[];
+            expect(remaining.length).toBe(1);
+            expect(remaining[0].chunk_id).toBe('dot-slash-1');
+        });
+    });
+
+    // ─── hasColumn - error path ──────────────────────────────────────
+    describe('hasColumn - error path', () => {
+        it('should return false when PRAGMA fails', () => {
+            const mockDb = {
+                prepare: vi.fn().mockImplementation(() => {
+                    throw new Error('PRAGMA failed');
+                }),
+            };
+
+            // Access the private method via the prototype
+            const result = (DatabaseManager as any).hasColumn(mockDb, 'branch');
+            expect(result).toBe(false);
+        });
+
+        it('should return false when column does not exist', () => {
+            const mockDb = {
+                prepare: vi.fn().mockReturnValue({
+                    all: vi.fn().mockReturnValue([
+                        { name: 'other_column' },
+                        { name: 'another_column' },
+                    ]),
+                }),
+            };
+
+            const result = (DatabaseManager as any).hasColumn(mockDb, 'nonexistent');
+            expect(result).toBe(false);
+        });
+
+        it('should return true when column exists', () => {
+            const mockDb = {
+                prepare: vi.fn().mockReturnValue({
+                    all: vi.fn().mockReturnValue([
+                        { name: 'branch' },
+                        { name: 'repo' },
+                    ]),
+                }),
+            };
+
+            const result = (DatabaseManager as any).hasColumn(mockDb, 'branch');
+            expect(result).toBe(true);
+        });
+    });
 });

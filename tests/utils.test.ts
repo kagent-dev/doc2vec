@@ -336,4 +336,27 @@ describe('Utils', () => {
             expect(tokens.join('')).toBe('# Hello World!\n\nParagraph here.');
         });
     });
+
+    // ─── shouldProcessUrl - invalid URL ─────────────────────────────
+    describe('shouldProcessUrl - invalid URL', () => {
+        it('should throw on invalid URL', () => {
+            expect(() => Utils.shouldProcessUrl('not-a-url')).toThrow();
+        });
+    });
+
+    // ─── hashToUuid - edge cases ────────────────────────────────────
+    describe('hashToUuid - edge cases', () => {
+        it('should handle hash shorter than 32 chars', () => {
+            const uuid = Utils.hashToUuid('abcd1234');
+            // Should still produce a string with dashes, just potentially shorter segments
+            expect(uuid).toContain('-');
+        });
+
+        it('should handle exactly 32 hex characters', () => {
+            const hash = 'abcdef1234567890abcdef1234567890';
+            const uuid = Utils.hashToUuid(hash);
+            // Should be in UUID format: 8-4-4-4-12 with version=5 and variant=8
+            expect(uuid).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
+        });
+    });
 });

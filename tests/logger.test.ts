@@ -342,4 +342,70 @@ describe('Logger', () => {
             expect(LogLevel.ERROR).toBeLessThan(LogLevel.NONE);
         });
     });
+
+    // ─── Empty module name ──────────────────────────────────────────
+    describe('empty moduleName', () => {
+        it('should omit module prefix when moduleName is empty', () => {
+            const logger = new Logger('', { useColor: false, useTimestamp: false });
+            logger.info('test');
+            const output = logSpy.mock.calls[0][0] as string;
+            expect(output).not.toContain('[]');
+        });
+    });
+
+    // ─── prettyPrint=false with objects ──────────────────────────────
+    describe('formatMessage with prettyPrint=false', () => {
+        it('should format objects as strings when prettyPrint is false', () => {
+            const logger = new Logger('test', { useColor: false, useTimestamp: false, prettyPrint: false });
+            logger.info('data', { key: 'value' });
+            const output = logSpy.mock.calls[0][0] as string;
+            // prettyPrint=false uses String(arg) instead of JSON.stringify
+            expect(output).toContain('[object Object]');
+        });
+    });
+
+    // ─── progress complete() default message ────────────────────────
+    describe('progress complete() default message', () => {
+        it('should use default "Completed" message when no arg passed', () => {
+            const logger = new Logger('test', { useColor: false });
+            const progress = logger.progress('Test', 2);
+            progress.complete();
+            const lastCall = logSpy.mock.calls[logSpy.mock.calls.length - 1][0] as string;
+            expect(lastCall).toContain('Completed');
+        });
+    });
+
+    // ─── progress bar with color ────────────────────────────────────
+    describe('progress bar with useColor=true', () => {
+        it('should use green color in progress bar when useColor is true', () => {
+            const logger = new Logger('test', { useColor: true });
+            const progress = logger.progress('Test', 2);
+            progress.update(1);
+            const output = logSpy.mock.calls[0][0] as string;
+            expect(output).toContain('\x1b[32m'); // green
+        });
+    });
+
+    // ─── section with WARN level ────────────────────────────────────
+    describe('section chaining at WARN level', () => {
+        it('should return logger for chaining even when level is WARN', () => {
+            const logger = new Logger('test', { level: LogLevel.WARN, useColor: false });
+            const result = logger.section('Hidden Section');
+            expect(result).toBe(logger);
+            expect(logSpy).not.toHaveBeenCalled();
+        });
+    });
+});
+
+// ─── defaultLogger export ───────────────────────────────────────────
+import { defaultLogger } from '../logger';
+
+describe('defaultLogger', () => {
+    it('should be an instance of Logger', () => {
+        expect(defaultLogger).toBeDefined();
+        expect(defaultLogger).toHaveProperty('info');
+        expect(defaultLogger).toHaveProperty('error');
+        expect(defaultLogger).toHaveProperty('debug');
+        expect(defaultLogger).toHaveProperty('warn');
+    });
 });

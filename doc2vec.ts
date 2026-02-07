@@ -32,7 +32,7 @@ const execAsync = promisify(exec);
 
 dotenv.config();
 
-class Doc2Vec {
+export class Doc2Vec {
     private config: Config;
     private openai: OpenAI;
     private contentProcessor: ContentProcessor;
