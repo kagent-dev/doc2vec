@@ -338,17 +338,23 @@ h1 { font-size: 2em; color: #333; }
     // ─── Function boundary integrity ──────────────────────────────────
     // These tests verify that complete function/class/method definitions
     // remain intact within a single chunk and are never split mid-body.
-    // The strategy: use a chunkSize large enough to hold each individual
-    // construct, then assert that every chunk containing a function/class
-    // opening also contains its closing brace/keyword.
+    // The strategy:
+    //   1. Total code MUST exceed chunkSize (forcing chunking to actually happen)
+    //   2. Each individual construct fits within chunkSize
+    //   3. Assert that every chunk containing a construct's opening also
+    //      contains its closing — proving the chunker respected the boundary
     describe('function boundary integrity', () => {
 
-        // Helper: asserts that every chunk containing a given opening pattern
-        // also contains the corresponding closing pattern.
+        // Helper: asserts that chunking actually occurred (chunks > 1) and
+        // that every chunk containing a given opening pattern also contains
+        // the corresponding closing pattern.
         function assertBoundaryIntegrity(
             chunks: CodeChunk[],
             constructs: { name: string; opening: string | RegExp; closing: string | RegExp }[]
         ) {
+            // Chunking must have actually happened — otherwise the test is trivially true
+            expect(chunks.length).toBeGreaterThan(1);
+
             for (const construct of constructs) {
                 const matchingChunks = chunks.filter(c => {
                     if (typeof construct.opening === 'string') {
@@ -411,10 +417,15 @@ const triple = (x: number): number => {
     const result = x * 3;
     return result;
 };
+
+const quadruple = (x: number): number => {
+    const result = x * 4;
+    return result;
+};
 `;
                 const chunker = await CodeChunker.create({
                     lang: 'typescript',
-                    chunkSize: 200,
+                    chunkSize: 150,
                     tokenCounter: async (t: string) => t.length,
                 });
                 const chunks = await chunker.chunk(code);
@@ -422,6 +433,7 @@ const triple = (x: number): number => {
                 assertBoundaryIntegrity(chunks, [
                     { name: 'double', opening: 'const double =', closing: 'return result;\n};' },
                     { name: 'triple', opening: 'const triple =', closing: 'return result;\n};' },
+                    { name: 'quadruple', opening: 'const quadruple =', closing: 'return result;\n};' },
                 ]);
             });
 
@@ -440,10 +452,17 @@ interface Product {
     price: number;
     inStock: boolean;
 }
+
+interface Order {
+    orderId: string;
+    userId: number;
+    total: number;
+    status: string;
+}
 `;
                 const chunker = await CodeChunker.create({
                     lang: 'typescript',
-                    chunkSize: 200,
+                    chunkSize: 120,
                     tokenCounter: async (t: string) => t.length,
                 });
                 const chunks = await chunker.chunk(code);
@@ -451,6 +470,7 @@ interface Product {
                 assertBoundaryIntegrity(chunks, [
                     { name: 'User', opening: 'interface User {', closing: 'createdAt: Date;\n}' },
                     { name: 'Product', opening: 'interface Product {', closing: 'inStock: boolean;\n}' },
+                    { name: 'Order', opening: 'interface Order {', closing: 'status: string;\n}' },
                 ]);
             });
 
@@ -533,10 +553,17 @@ enum Color {
     Green = 1,
     Blue = 2,
 }
+
+enum Status {
+    Pending = "PENDING",
+    Active = "ACTIVE",
+    Inactive = "INACTIVE",
+    Archived = "ARCHIVED",
+}
 `;
                 const chunker = await CodeChunker.create({
                     lang: 'typescript',
-                    chunkSize: 200,
+                    chunkSize: 130,
                     tokenCounter: async (t: string) => t.length,
                 });
                 const chunks = await chunker.chunk(code);
@@ -544,6 +571,7 @@ enum Color {
                 assertBoundaryIntegrity(chunks, [
                     { name: 'Direction', opening: 'enum Direction {', closing: 'Right = "RIGHT",\n}' },
                     { name: 'Color', opening: 'enum Color {', closing: 'Blue = 2,\n}' },
+                    { name: 'Status', opening: 'enum Status {', closing: 'Archived = "ARCHIVED",\n}' },
                 ]);
             });
         });
@@ -716,10 +744,16 @@ def say_hello(name):
     message = f"Hello, {name}!"
     print(message)
     return message
+
+@decorator
+def say_goodbye(name):
+    message = f"Goodbye, {name}!"
+    print(message)
+    return message
 `;
                 const chunker = await CodeChunker.create({
                     lang: 'python',
-                    chunkSize: 300,
+                    chunkSize: 200,
                     tokenCounter: async (t: string) => t.length,
                 });
                 const chunks = await chunker.chunk(code);
@@ -727,6 +761,7 @@ def say_hello(name):
                 assertBoundaryIntegrity(chunks, [
                     { name: 'decorator', opening: 'def decorator(func)', closing: 'return wrapper' },
                     { name: 'say_hello', opening: 'def say_hello(name)', closing: 'return message' },
+                    { name: 'say_goodbye', opening: 'def say_goodbye(name)', closing: 'return message' },
                 ]);
             });
         });

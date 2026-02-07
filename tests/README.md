@@ -346,15 +346,19 @@ npm run test:coverage
 - Normalizes hyphenated language names (`c-sharp` -> `c_sharp`)
 
 #### `function boundary integrity` (33 tests)
-Verifies that complete function/class/method definitions remain intact within a single chunk and are never split mid-body. Uses a helper `assertBoundaryIntegrity` that checks every chunk containing a construct's opening also contains its closing.
+Verifies that complete function/class/method definitions remain intact within a single chunk and are never split mid-body. Uses a helper `assertBoundaryIntegrity` that:
+1. **Enforces chunking actually occurred** (`chunks.length > 1`) — prevents false positives where all code fits in one chunk
+2. **Checks every chunk containing a construct's opening also contains its closing** — proves the boundary was respected
+
+Every test is designed so that total code exceeds `chunkSize` (forcing the chunker to split), while each individual construct fits within `chunkSize` (so the chunker *can* keep it intact).
 
 **TypeScript** (6 tests):
 - Standalone functions (`function add`, `function multiply`, `function greet`)
-- Arrow functions (`const double = ...`, `const triple = ...`)
-- Interfaces (`interface User`, `interface Product`)
+- Arrow functions (`const double`, `const triple`, `const quadruple`)
+- Interfaces (`interface User`, `interface Product`, `interface Order`)
 - Class methods when class is split (`add`, `subtract`, `getHistory`)
 - Async functions (`async function fetchUser`, `async function fetchProducts`)
-- Enum declarations (`enum Direction`, `enum Color`)
+- Enum declarations (`enum Direction`, `enum Color`, `enum Status`)
 
 **JavaScript** (2 tests):
 - Standalone functions (`fibonacci`, `factorial`)
@@ -363,7 +367,7 @@ Verifies that complete function/class/method definitions remain intact within a 
 **Python** (3 tests):
 - Function definitions (`binary_search`, `merge_sort`)
 - Class methods when class is split (`Stack.__init__`, `push`, `pop`, `is_empty`)
-- Decorated functions (`@decorator` + `say_hello`)
+- Decorated functions (`@decorator` + `say_hello`, `say_goodbye`)
 
 **Go** (2 tests):
 - Function definitions (`fibonacci`, `isPrime`, `main`)
