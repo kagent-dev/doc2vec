@@ -17,6 +17,8 @@ import {
 } from './types';
 
 export class DatabaseManager {
+    private static columnCache: WeakMap<Database, { hasBranch: boolean; hasRepo: boolean }> = new WeakMap();
+
     static async initDatabase(config: SourceConfig, parentLogger: Logger): Promise<DatabaseConnection> {
         const logger = parentLogger.child('database');
         const dbConfig = config.database_config;
@@ -36,6 +38,8 @@ export class DatabaseManager {
                     embedding FLOAT[3072],
                     product_name TEXT,
                     version TEXT,
+                    branch TEXT,
+                    repo TEXT,
                     heading_hierarchy TEXT,
                     section TEXT,
                     chunk_id TEXT UNIQUE,
@@ -124,6 +128,92 @@ export class DatabaseManager {
             // For Qdrant, we'll use the same collection but verify it exists
             logger.info(`Using existing Qdrant collection for metadata: ${dbConnection.collectionName}`);
             // Nothing special to initialize as we'll use the same collection
+        }
+    }
+
+    static async getMetadataValue(
+        dbConnection: DatabaseConnection,
+        key: string,
+        defaultValue: string | undefined,
+        logger: Logger
+    ): Promise<string | undefined> {
+        try {
+            if (dbConnection.type === 'sqlite') {
+                const stmt = dbConnection.db.prepare('SELECT value FROM vec_metadata WHERE key = ?');
+                const result = stmt.get(key) as { value: string } | undefined;
+                if (result) {
+                    logger.debug(`Retrieved metadata value for ${key}: ${result.value}`);
+                    return result.value;
+                }
+            } else if (dbConnection.type === 'qdrant') {
+                const metadataUUID = Utils.generateMetadataUUID(key);
+                logger.debug(`Looking up metadata with UUID: ${metadataUUID}`);
+                try {
+                    const response = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                        ids: [metadataUUID],
+                        with_payload: true,
+                        with_vector: false
+                    });
+                    if (response.length > 0 && response[0].payload?.metadata_value) {
+                        const value = response[0].payload.metadata_value as string;
+                        logger.debug(`Retrieved metadata value for ${key}: ${value}`);
+                        return value;
+                    }
+                } catch (error) {
+                    logger.warn(`Failed to retrieve metadata for ${key}:`, error);
+                }
+            }
+        } catch (error) {
+            logger.warn(`Error retrieving metadata value for ${key}:`, error);
+        }
+
+        if (defaultValue !== undefined) {
+            logger.debug(`No metadata value found for ${key}, using default: ${defaultValue}`);
+        }
+        return defaultValue;
+    }
+
+    static async setMetadataValue(
+        dbConnection: DatabaseConnection,
+        key: string,
+        value: string,
+        logger: Logger
+    ): Promise<void> {
+        try {
+            if (dbConnection.type === 'sqlite') {
+                const stmt = dbConnection.db.prepare(`
+                    INSERT INTO vec_metadata (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                `);
+                stmt.run(key, value);
+                logger.debug(`Updated metadata value for ${key}`);
+            } else if (dbConnection.type === 'qdrant') {
+                const metadataUUID = Utils.generateMetadataUUID(key);
+                const dummyEmbeddingSize = 3072;
+                const dummyEmbedding = new Array(dummyEmbeddingSize).fill(0);
+                const metadataPoint = {
+                    id: metadataUUID,
+                    vector: dummyEmbedding,
+                    payload: {
+                        metadata_key: key,
+                        metadata_value: value,
+                        is_metadata: true,
+                        content: `Metadata: ${key}`,
+                        product_name: 'system',
+                        version: 'metadata',
+                        url: 'metadata://' + key
+                    }
+                };
+
+                await dbConnection.client.upsert(dbConnection.collectionName, {
+                    wait: true,
+                    points: [metadataPoint]
+                });
+
+                logger.debug(`Updated metadata value for ${key}`);
+            }
+        } catch (error) {
+            logger.error(`Failed to update metadata value for ${key}:`, error);
         }
     }
 
@@ -220,23 +310,66 @@ export class DatabaseManager {
     }
 
     static prepareSQLiteStatements(db: Database) {
+        let cached = this.columnCache.get(db);
+        if (!cached) {
+            cached = {
+                hasBranch: this.hasColumn(db, 'branch'),
+                hasRepo: this.hasColumn(db, 'repo')
+            };
+            this.columnCache.set(db, cached);
+        }
+        const hasBranchColumn = cached.hasBranch;
+        const hasRepoColumn = cached.hasRepo;
+        const insertColumns = [
+            'embedding',
+            'product_name',
+            'version',
+            ...(hasBranchColumn ? ['branch'] : []),
+            ...(hasRepoColumn ? ['repo'] : []),
+            'heading_hierarchy',
+            'section',
+            'chunk_id',
+            'content',
+            'url',
+            'hash',
+            'chunk_index',
+            'total_chunks'
+        ];
+        const insertPlaceholders = insertColumns.map(() => '?').join(', ');
+        const updateSet = [
+            'embedding = ?',
+            'product_name = ?',
+            'version = ?',
+            ...(hasBranchColumn ? ['branch = ?'] : []),
+            ...(hasRepoColumn ? ['repo = ?'] : []),
+            'heading_hierarchy = ?',
+            'section = ?',
+            'content = ?',
+            'url = ?',
+            'hash = ?',
+            'chunk_index = ?',
+            'total_chunks = ?'
+        ].join(', ');
+
         return {
             insertStmt: db.prepare(`
-                INSERT INTO vec_items (embedding, product_name, version, heading_hierarchy, section, chunk_id, content, url, hash, chunk_index, total_chunks)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO vec_items (${insertColumns})
+                VALUES (${insertPlaceholders})
             `),
             checkHashStmt: db.prepare(`SELECT hash FROM vec_items WHERE chunk_id = ?`),
             updateStmt: db.prepare(`
-                UPDATE vec_items SET embedding = ?, product_name = ?, version = ?, heading_hierarchy = ?, section = ?, content = ?, url = ?, hash = ?, chunk_index = ?, total_chunks = ?
+                UPDATE vec_items SET ${updateSet}
                 WHERE chunk_id = ?
             `),
             getAllChunkIdsStmt: db.prepare(`SELECT chunk_id FROM vec_items`),
-            deleteChunkStmt: db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`)
+            deleteChunkStmt: db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`),
+            hasBranchColumn,
+            hasRepoColumn
         };
     }
 
     static insertVectorsSQLite(db: Database, chunk: DocumentChunk, embedding: number[], logger: Logger, chunkHash?: string) {
-        const { insertStmt, updateStmt } = this.prepareSQLiteStatements(db);
+        const { insertStmt, updateStmt, hasBranchColumn, hasRepoColumn } = this.prepareSQLiteStatements(db);
         const hash = chunkHash || Utils.generateHash(chunk.content);
         
         const transaction = db.transaction(() => {
@@ -245,33 +378,59 @@ export class DatabaseManager {
             const totalChunks = BigInt(chunk.metadata.total_chunks | 0);
 
             try {
-                insertStmt.run(
+                const insertValues: any[] = [
                     new Float32Array(embedding),
                     chunk.metadata.product_name,
-                    chunk.metadata.version,
+                    chunk.metadata.version
+                ];
+
+                if (hasBranchColumn) {
+                    insertValues.push(chunk.metadata.branch ?? null);
+                }
+
+                if (hasRepoColumn) {
+                    insertValues.push(chunk.metadata.repo ?? null);
+                }
+
+                insertValues.push(
                     JSON.stringify(chunk.metadata.heading_hierarchy),
                     chunk.metadata.section,
                     chunk.metadata.chunk_id,
                     chunk.content,
                     chunk.metadata.url,
                     hash,
-                    chunkIndex,
-                    totalChunks
+                    chunkIndex as any,
+                    totalChunks as any
                 );
+
+                insertStmt.run(...insertValues);
             } catch (error) {
-                updateStmt.run(
+                const updateValues: any[] = [
                     new Float32Array(embedding),
                     chunk.metadata.product_name,
-                    chunk.metadata.version,
+                    chunk.metadata.version
+                ];
+
+                if (hasBranchColumn) {
+                    updateValues.push(chunk.metadata.branch ?? null);
+                }
+
+                if (hasRepoColumn) {
+                    updateValues.push(chunk.metadata.repo ?? null);
+                }
+
+                updateValues.push(
                     JSON.stringify(chunk.metadata.heading_hierarchy),
                     chunk.metadata.section,
                     chunk.content,
                     chunk.metadata.url,
                     hash,
-                    chunkIndex,
-                    totalChunks,
+                    chunkIndex as any,
+                    totalChunks as any,
                     chunk.metadata.chunk_id
                 );
+
+                updateStmt.run(...updateValues);
             }
         });
 
@@ -300,6 +459,8 @@ export class DatabaseManager {
                     content: chunk.content,
                     product_name: chunk.metadata.product_name,
                     version: chunk.metadata.version,
+                    branch: chunk.metadata.branch,
+                    repo: chunk.metadata.repo,
                     heading_hierarchy: chunk.metadata.heading_hierarchy,
                     section: chunk.metadata.section,
                     url: chunk.metadata.url,
@@ -392,6 +553,50 @@ export class DatabaseManager {
             }
         } catch (error) {
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+        }
+    }
+
+    private static hasColumn(db: Database, columnName: string): boolean {
+        try {
+            const columns = db.prepare('PRAGMA table_info(vec_items)').all() as { name?: string }[];
+            return columns.some((column) => column.name === columnName);
+        } catch (error) {
+            return false;
+        }
+    }
+
+    static removeChunksByUrlSQLite(db: Database, url: string, logger: Logger) {
+        const deleteStmt = db.prepare(`DELETE FROM vec_items WHERE url = ?`);
+        const result = deleteStmt.run(url);
+        logger.info(`Deleted ${result.changes} chunks from SQLite for URL ${url}`);
+    }
+
+    static async removeChunksByUrlQdrant(db: QdrantDB, url: string, logger: Logger) {
+        const { client, collectionName } = db;
+        try {
+            await client.delete(collectionName, {
+                filter: {
+                    must: [
+                        {
+                            key: 'url',
+                            match: {
+                                text: url
+                            }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: 'is_metadata',
+                            match: {
+                                value: true
+                            }
+                        }
+                    ]
+                }
+            });
+            logger.info(`Deleted chunks from Qdrant for URL ${url}`);
+        } catch (error) {
+            logger.error(`Error deleting chunks from Qdrant for URL ${url}:`, error);
         }
     }
 

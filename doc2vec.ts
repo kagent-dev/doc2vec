@@ -5,6 +5,9 @@ import crypto from 'crypto';
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { Buffer } from 'buffer';
 import { OpenAI } from "openai";
 import * as dotenv from "dotenv";
@@ -18,12 +21,14 @@ import {
     GithubSourceConfig, 
     WebsiteSourceConfig, 
     LocalDirectorySourceConfig,
+    CodeSourceConfig,
     ZendeskSourceConfig,
     DatabaseConnection,
     DocumentChunk
 } from './types';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+const execAsync = promisify(exec);
 
 dotenv.config();
 
@@ -68,6 +73,20 @@ class Doc2Vec {
             let config = yaml.load(configFile) as any;
             
             const typedConfig = config as Config;
+            for (const source of typedConfig.sources) {
+                if (source.type === 'code') {
+                    if (!source.version || String(source.version).trim().length === 0) {
+                        if (source.branch && String(source.branch).trim().length > 0) {
+                            source.version = source.branch;
+                        } else {
+                            source.version = 'local';
+                        }
+                    }
+                } else if (!source.version || String(source.version).trim().length === 0) {
+                    logger.error(`Missing required version for ${source.type} source: ${source.product_name}`);
+                    process.exit(1);
+                }
+            }
             logger.info(`Configuration loaded successfully, found ${typedConfig.sources.length} sources`);
             return typedConfig;
         } catch (error) {
@@ -90,6 +109,8 @@ class Doc2Vec {
                 await this.processWebsite(sourceConfig, sourceLogger);
             } else if (sourceConfig.type === 'local_directory') {
                 await this.processLocalDirectory(sourceConfig, sourceLogger);
+            } else if (sourceConfig.type === 'code') {
+                await this.processCodeSource(sourceConfig, sourceLogger);
             } else if (sourceConfig.type === 'zendesk') {
                 await this.processZendesk(sourceConfig, sourceLogger);
             } else {
@@ -595,6 +616,432 @@ class Doc2Vec {
         }
         
         logger.info(`Finished processing local directory: ${config.path}`);
+    }
+
+    private async processCodeSource(config: CodeSourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for code source (${config.source})`);
+
+        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        const validChunkIds: Set<string> = new Set();
+        const processedFiles: Set<string> = new Set();
+
+        let basePath: string | undefined;
+        let cleanupPathConfig: { path: string; url_rewrite_prefix?: string } | string;
+        let tempDir: string | null = null;
+        let repoUrlPrefix: string | undefined;
+        let repoBranch: string | undefined;
+        let incrementalMode = false;
+        let deleteUrls: string[] = [];
+        let allowedFiles: Set<string> | undefined;
+        let mtimeCutoff: number | undefined;
+        let fileListKey: string | undefined;
+        let lastMtimeKey: string | undefined;
+        let trackedFiles: Set<string> | undefined;
+        let maxObservedMtime = 0;
+
+        if (config.source === 'local_directory') {
+            if (!config.path) {
+                logger.error('Code source type local_directory requires a path.');
+                return;
+            }
+            basePath = config.path;
+            cleanupPathConfig = config.url_rewrite_prefix
+                ? { path: basePath, url_rewrite_prefix: config.url_rewrite_prefix }
+                : basePath;
+
+            const resolvedPath = path.resolve(basePath);
+            const pathKey = resolvedPath.replace(/[^a-zA-Z0-9]+/g, '_');
+            lastMtimeKey = `code_last_mtime_${pathKey}`;
+            fileListKey = `code_filelist_${pathKey}`;
+
+            await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+            const lastMtimeValue = await DatabaseManager.getMetadataValue(dbConnection, lastMtimeKey, '0', logger);
+            mtimeCutoff = lastMtimeValue ? parseFloat(lastMtimeValue) : 0;
+            trackedFiles = new Set<string>();
+            incrementalMode = true;
+        } else if (config.source === 'github') {
+            if (!config.repo) {
+                logger.error('Code source type github requires a repo in owner/repo format.');
+                return;
+            }
+            const cloneResult = await this.cloneGithubRepo(config, logger);
+            basePath = cloneResult.path;
+            tempDir = cloneResult.path;
+            repoUrlPrefix = cloneResult.urlPrefix;
+            repoBranch = cloneResult.branch;
+            cleanupPathConfig = { path: basePath, url_rewrite_prefix: repoUrlPrefix };
+
+            await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+            const shaKey = this.buildCodeShaMetadataKey(config.repo, repoBranch);
+            const lastSha = await DatabaseManager.getMetadataValue(dbConnection, shaKey, undefined, logger);
+            const headSha = await this.getRepoHeadSha(basePath, logger);
+
+            if (lastSha && headSha) {
+                if (headSha === lastSha) {
+                    incrementalMode = true;
+                    allowedFiles = new Set();
+                    deleteUrls = [];
+                } else {
+                    const diffResult = await this.getGitChangedFiles(basePath, lastSha, repoBranch, logger);
+                    if (diffResult.mode === 'incremental') {
+                        incrementalMode = true;
+                        allowedFiles = diffResult.changedFiles;
+                        deleteUrls = diffResult.deletedPaths
+                            .map((relativePath) => this.buildCodeFileUrl(path.join(basePath as string, relativePath), basePath as string, config, repoUrlPrefix));
+                    } else {
+                        logger.warn('Falling back to full scan for GitHub code source.');
+                    }
+                }
+            }
+        } else {
+            logger.error(`Unknown code source: ${config.source}`);
+            return;
+        }
+
+        logger.section('CODE SCANNING AND EMBEDDING');
+
+        try {
+            const scanResult = await this.contentProcessor.processCodeDirectory(
+                basePath,
+                config,
+                async (filePath, content) => {
+                    processedFiles.add(filePath);
+
+                    const relativePath = path.relative(basePath as string, filePath).replace(/\\/g, '/');
+                    const fileUrl = this.buildCodeFileUrl(filePath, basePath as string, config, repoUrlPrefix);
+
+                    logger.info(`Processing code from ${relativePath || filePath} (${content.length} chars)`);
+                    try {
+                        const chunks = await this.contentProcessor.chunkCode(
+                            content,
+                            config,
+                            fileUrl,
+                            relativePath || filePath,
+                            repoBranch || config.branch,
+                            config.repo
+                        );
+                        logger.info(`Created ${chunks.length} chunks`);
+
+                        if (chunks.length > 0) {
+                            const chunkProgress = logger.progress(`Embedding chunks for ${relativePath || filePath}`, chunks.length);
+
+                            for (let i = 0; i < chunks.length; i++) {
+                                const chunk = chunks[i];
+                                validChunkIds.add(chunk.metadata.chunk_id);
+
+                                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+                                let needsEmbedding = true;
+                                const chunkHash = Utils.generateHash(chunk.content);
+
+                                if (dbConnection.type === 'sqlite') {
+                                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
+                                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
+
+                                    if (existing && existing.hash === chunkHash) {
+                                        needsEmbedding = false;
+                                        chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
+                                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                                    }
+                                } else if (dbConnection.type === 'qdrant') {
+                                    try {
+                                        let pointId: string;
+                                        try {
+                                            pointId = chunk.metadata.chunk_id;
+                                            if (!Utils.isValidUuid(pointId)) {
+                                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
+                                            }
+                                        } catch (e) {
+                                            pointId = crypto.randomUUID();
+                                        }
+
+                                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
+                                            ids: [pointId],
+                                            with_payload: true,
+                                            with_vector: false,
+                                        });
+
+                                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
+                                            needsEmbedding = false;
+                                            chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
+                                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
+                                        }
+                                    } catch (error) {
+                                        logger.error(`Error checking existing point in Qdrant:`, error);
+                                    }
+                                }
+
+                                if (needsEmbedding) {
+                                    const embeddings = await this.createEmbeddings([chunk.content]);
+                                    if (embeddings.length > 0) {
+                                        const embedding = embeddings[0];
+                                        if (dbConnection.type === 'sqlite') {
+                                            DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
+                                            chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
+                                        } else if (dbConnection.type === 'qdrant') {
+                                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
+                                            chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
+                                        }
+                                    } else {
+                                        logger.error(`Embedding failed for chunk: ${chunkId}`);
+                                        chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
+                                    }
+                                }
+                            }
+
+                            chunkProgress.complete();
+                        }
+                    } catch (error) {
+                        logger.error(`Error during code chunking or embedding for ${filePath}:`, error);
+                    }
+                },
+                logger,
+                undefined,
+                {
+                    allowedFiles,
+                    mtimeCutoff,
+                    trackFiles: trackedFiles
+                }
+            );
+
+            if (trackedFiles) {
+                maxObservedMtime = scanResult.maxMtime;
+            }
+        } finally {
+            logger.section('CLEANUP');
+
+            if (incrementalMode) {
+                if (deleteUrls.length > 0) {
+                    logger.info(`Cleaning up ${deleteUrls.length} deleted/renamed files`);
+                    for (const url of deleteUrls) {
+                        if (dbConnection.type === 'sqlite') {
+                            DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                        } else if (dbConnection.type === 'qdrant') {
+                            await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        }
+                    }
+                } else {
+                    logger.info('No deleted/renamed files to clean up.');
+                }
+
+                if (trackedFiles && fileListKey) {
+                    const previousListValue = await DatabaseManager.getMetadataValue(dbConnection, fileListKey, '[]', logger);
+                    const previousList = previousListValue ? JSON.parse(previousListValue) as string[] : [];
+                    const currentList = Array.from(trackedFiles);
+                    const deletedFiles = previousList.filter((filePath) => !trackedFiles?.has(filePath));
+
+                    for (const deletedFile of deletedFiles) {
+                        const url = this.buildCodeFileUrl(deletedFile, basePath as string, config, repoUrlPrefix);
+                        if (dbConnection.type === 'sqlite') {
+                            DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                        } else if (dbConnection.type === 'qdrant') {
+                            await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        }
+                    }
+
+                    await DatabaseManager.setMetadataValue(dbConnection, fileListKey, JSON.stringify(currentList), logger);
+                    if (lastMtimeKey) {
+                        const nextMtime = maxObservedMtime > 0 ? maxObservedMtime : Date.now();
+                        await DatabaseManager.setMetadataValue(dbConnection, lastMtimeKey, `${nextMtime}`, logger);
+                    }
+                }
+            } else {
+                if (dbConnection.type === 'sqlite') {
+                    logger.info(`Running SQLite cleanup for code source ${basePath}`);
+                    DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, cleanupPathConfig, logger);
+                } else if (dbConnection.type === 'qdrant') {
+                    logger.info(`Running Qdrant cleanup for code source ${basePath} in collection ${dbConnection.collectionName}`);
+                    await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, cleanupPathConfig, logger);
+                }
+            }
+
+            if (config.source === 'github' && basePath && repoBranch) {
+                const headSha = await this.getRepoHeadSha(basePath, logger);
+                if (headSha) {
+                    const shaKey = this.buildCodeShaMetadataKey(config.repo as string, repoBranch);
+                    await DatabaseManager.setMetadataValue(dbConnection, shaKey, headSha, logger);
+                }
+            }
+
+            if (tempDir) {
+                try {
+                    fs.rmSync(tempDir, { recursive: true, force: true });
+                    logger.debug(`Removed temporary repo at ${tempDir}`);
+                } catch (error) {
+                    logger.warn(`Failed to remove temporary repo at ${tempDir}:`, error);
+                }
+            }
+        }
+
+        logger.info(`Finished processing code source (${config.source})`);
+    }
+
+    private buildCodeShaMetadataKey(repo: string, branch: string): string {
+        const normalizedRepo = repo.replace(/[^a-zA-Z0-9]+/g, '_');
+        const normalizedBranch = branch.replace(/[^a-zA-Z0-9]+/g, '_');
+        return `code_last_sha_${normalizedRepo}_${normalizedBranch}`;
+    }
+
+    private async getRepoHeadSha(repoPath: string, logger: Logger): Promise<string | undefined> {
+        try {
+            const { stdout } = await execAsync(`git -C "${repoPath}" rev-parse HEAD`);
+            return stdout.trim() || undefined;
+        } catch (error) {
+            logger.warn(`Failed to resolve HEAD sha for ${repoPath}:`, error);
+            return undefined;
+        }
+    }
+
+    private async getGitChangedFiles(
+        repoPath: string,
+        lastSha: string,
+        branch: string,
+        logger: Logger
+    ): Promise<{ mode: 'incremental' | 'full'; changedFiles: Set<string>; deletedPaths: string[] }> {
+        const diffCommand = `git -C "${repoPath}" diff --name-status ${lastSha}..HEAD`;
+
+        const attemptDiff = async () => {
+            const { stdout } = await execAsync(diffCommand);
+            return stdout;
+        };
+
+        let diffOutput: string | undefined;
+
+        try {
+            diffOutput = await attemptDiff();
+        } catch (error) {
+            logger.warn(`Failed to diff against ${lastSha}. Fetching more history...`);
+            const fetchDepths = [200, 1000, 5000];
+            let fetched = false;
+            for (const depth of fetchDepths) {
+                try {
+                    logger.info(`Fetching with --depth=${depth}...`);
+                    await execAsync(`git -C "${repoPath}" fetch --depth=${depth} origin "${branch}"`);
+                    diffOutput = await attemptDiff();
+                    fetched = true;
+                    break;
+                } catch (fetchError) {
+                    logger.warn(`Diff still failed at --depth=${depth}.`);
+                }
+            }
+            if (!fetched) {
+                try {
+                    logger.info(`Attempting full unshallow fetch...`);
+                    await execAsync(`git -C "${repoPath}" fetch --unshallow origin "${branch}"`);
+                    diffOutput = await attemptDiff();
+                } catch (unshallowError) {
+                    logger.warn(`Failed to diff even after full unshallow. Falling back to full scan.`, unshallowError);
+                    return { mode: 'full', changedFiles: new Set(), deletedPaths: [] };
+                }
+            }
+        }
+
+        if (!diffOutput) {
+            logger.warn('No diff output available. Falling back to full scan.');
+            return { mode: 'full', changedFiles: new Set(), deletedPaths: [] };
+        }
+
+        const changedFiles = new Set<string>();
+        const deletedPaths: string[] = [];
+
+        for (const line of diffOutput.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const parts = trimmed.split('\t');
+            const status = parts[0];
+
+            if (status.startsWith('R')) {
+                const oldPath = parts[1];
+                const newPath = parts[2];
+                if (oldPath) deletedPaths.push(oldPath);
+                if (newPath) changedFiles.add(path.join(repoPath, newPath));
+            } else if (status === 'D') {
+                const deletedPath = parts[1];
+                if (deletedPath) deletedPaths.push(deletedPath);
+            } else if (status === 'A' || status === 'M') {
+                const changedPath = parts[1];
+                if (changedPath) changedFiles.add(path.join(repoPath, changedPath));
+            }
+        }
+
+        logger.info(`Git diff changes: ${changedFiles.size} modified/added, ${deletedPaths.length} deleted/renamed.`);
+        return { mode: 'incremental', changedFiles, deletedPaths };
+    }
+
+    private buildCodeFileUrl(
+        filePath: string,
+        basePath: string,
+        config: CodeSourceConfig,
+        repoUrlPrefix?: string
+    ): string {
+        const relativePath = path.relative(basePath, filePath).replace(/\\/g, '/');
+
+        if (repoUrlPrefix) {
+            return `${repoUrlPrefix}/${relativePath}`;
+        }
+
+        if (config.url_rewrite_prefix) {
+            if (relativePath.startsWith('..')) {
+                return `file://${filePath}`;
+            }
+
+            const prefix = config.url_rewrite_prefix.endsWith('/')
+                ? config.url_rewrite_prefix.slice(0, -1)
+                : config.url_rewrite_prefix;
+
+            return `${prefix}/${relativePath}`;
+        }
+
+        return `file://${filePath}`;
+    }
+
+    private async cloneGithubRepo(
+        config: CodeSourceConfig,
+        logger: Logger
+    ): Promise<{ path: string; branch: string; urlPrefix: string }> {
+        const repo = config.repo as string;
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc2vec-code-'));
+        const requestedBranch = config.branch;
+        const encodedToken = GITHUB_TOKEN ? encodeURIComponent(GITHUB_TOKEN) : '';
+        const repoUrl = encodedToken
+            ? `https://x-access-token:${encodedToken}@github.com/${repo}.git`
+            : `https://github.com/${repo}.git`;
+
+        const branchArg = requestedBranch ? `--branch "${requestedBranch}"` : '';
+        logger.info(`Cloning ${repo} to ${tempDir}`);
+
+        try {
+            await execAsync(`git clone --depth 1 ${branchArg} "${repoUrl}" "${tempDir}"`);
+        } catch (error) {
+            try {
+                fs.rmSync(tempDir, { recursive: true, force: true });
+            } catch (cleanupError) {
+                logger.warn(`Failed to clean up temp dir after clone failure: ${tempDir}`, cleanupError);
+            }
+            logger.error(`Failed to clone repo ${repo}:`, error);
+            throw error;
+        }
+
+        let resolvedBranch = requestedBranch;
+        if (!resolvedBranch) {
+            resolvedBranch = await this.getRepoBranch(tempDir, logger);
+        }
+
+        const branch = resolvedBranch || 'main';
+        const urlPrefix = `https://github.com/${repo}/blob/${branch}`;
+
+        return { path: tempDir, branch, urlPrefix };
+    }
+
+    private async getRepoBranch(repoPath: string, logger: Logger): Promise<string | undefined> {
+        try {
+            const { stdout } = await execAsync(`git -C "${repoPath}" symbolic-ref --short HEAD`);
+            const branch = stdout.trim();
+            return branch || undefined;
+        } catch (error) {
+            logger.warn(`Failed to resolve repo branch for ${repoPath}:`, error);
+            return undefined;
+        }
     }
 
     private async processZendesk(config: ZendeskSourceConfig, parentLogger: Logger): Promise<void> {

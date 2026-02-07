@@ -146,8 +146,75 @@ async function createEmbeddings(text: string): Promise<number[]> {
     }
 }
 
-function queryCollection(queryEmbedding: number[], filter: { product_name: string; version?: string }, topK: number = 10): QueryResult[] {
-    const dbPath = path.join(dbDir, `${filter.product_name}.db`);
+type QueryFilter = {
+    product_name?: string;
+    version?: string;
+    branch?: string;
+    repo?: string;
+    urlPrefix?: string;
+    extensions?: string[];
+};
+
+function resolveDbPath(dbName?: string, productName?: string): { dbPath: string; dbLabel: string } {
+    if (dbName) {
+        const normalizedName = dbName.endsWith('.db') ? dbName : `${dbName}.db`;
+        const dbPath = path.isAbsolute(normalizedName) ? normalizedName : path.join(dbDir, normalizedName);
+        return { dbPath, dbLabel: normalizedName };
+    }
+
+    if (!productName) {
+        throw new Error('Either productName/repo or dbName must be provided.');
+    }
+
+    const dbPath = path.join(dbDir, `${productName}.db`);
+    return { dbPath, dbLabel: `${productName}.db` };
+}
+
+function normalizeExtensions(extensions?: string[]): string[] {
+    if (!extensions || extensions.length === 0) {
+        return [];
+    }
+
+    return extensions.map((ext) => (ext.startsWith('.') ? ext.toLowerCase() : `.${ext.toLowerCase()}`));
+}
+
+function filterResultsByUrl(
+    results: QueryResult[],
+    urlPrefix?: string,
+    extensions?: string[]
+): QueryResult[] {
+    const normalizedExtensions = normalizeExtensions(extensions);
+    return results.filter((row) => {
+        const url = typeof row.url === 'string' ? row.url : '';
+        if (urlPrefix && !url.startsWith(urlPrefix)) {
+            return false;
+        }
+        if (normalizedExtensions.length > 0) {
+            const lowerUrl = url.toLowerCase();
+            const matches = normalizedExtensions.some((ext) => lowerUrl.endsWith(ext));
+            if (!matches) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
+function filterResultsWithContent(results: QueryResult[]): QueryResult[] {
+    return results.filter((row) => {
+        if (typeof row.content !== 'string') {
+            return false;
+        }
+        return row.content.trim().length > 0;
+    });
+}
+
+function queryCollection(
+    queryEmbedding: number[],
+    dbPath: string,
+    filter: QueryFilter,
+    topK: number = 10
+): QueryResult[] {
 
     if (!fs.existsSync(dbPath)) {
         throw new Error(`Database file not found at ${dbPath}`);
@@ -168,7 +235,9 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
       
         if (filter.product_name) query += ` AND product_name = @product_name`;
         if (filter.version) query += ` AND version = @version`;
-      
+        if (filter.branch) query += ` AND branch = @branch`;
+        if (filter.repo) query += ` AND repo = @repo`;
+
         query += `
               ORDER BY distance
               LIMIT @top_k;`;
@@ -180,6 +249,8 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
           query_embedding: new Float32Array(queryEmbedding),
           product_name: filter.product_name,
           version: filter.version,
+          branch: filter.branch,
+          repo: filter.repo,
           top_k: topK,
         });
         const duration = Date.now() - startTime;
@@ -202,8 +273,10 @@ function queryCollection(queryEmbedding: number[], filter: { product_name: strin
 
 async function queryDocumentation(
     queryText: string,
-    productName: string,
-    version?: string,
+    productName: string | undefined,
+    dbName: string | undefined,
+    version: string | undefined,
+    urlPathPrefix: string | undefined,
     limit: number = 4
 ): Promise<{
     distance: number;
@@ -214,8 +287,17 @@ async function queryDocumentation(
     total_chunks?: number;
 }[]> {
     const queryEmbedding = await createEmbeddings(queryText);
-    const results = queryCollection(queryEmbedding, { product_name: productName, version: version }, limit);
-    return results.map((qr: QueryResult) => ({
+    const { dbPath } = resolveDbPath(dbName, productName);
+    const hasPostFilters = !!urlPathPrefix;
+    const fetchLimit = hasPostFilters ? limit * 3 : limit;
+    const results = queryCollection(
+        queryEmbedding,
+        dbPath,
+        { product_name: productName, version: version, urlPrefix: urlPathPrefix },
+        fetchLimit
+    );
+    const filteredResults = filterResultsWithContent(filterResultsByUrl(results, urlPathPrefix));
+    return filteredResults.slice(0, limit).map((qr: QueryResult) => ({
         distance: qr.distance,
         content: qr.content,
         ...(qr.url && { url: qr.url }),
@@ -225,14 +307,59 @@ async function queryDocumentation(
     }));
 }
 
+async function queryCode(
+    queryText: string,
+    productName: string | undefined,
+    repo: string | undefined,
+    dbName: string | undefined,
+    branch: string | undefined,
+    filePathPrefix: string | undefined,
+    extensions: string[] | undefined,
+    limit: number = 4
+): Promise<{
+    results: {
+        distance: number;
+        content: string;
+        url?: string;
+        section?: string;
+        chunk_index?: number;
+        total_chunks?: number;
+    }[];
+    rawCount: number;
+    emptyContentCount: number;
+}> {
+    const queryEmbedding = await createEmbeddings(queryText);
+    const { dbPath } = resolveDbPath(dbName, undefined);
+    const hasPostFilters = !!filePathPrefix || (extensions && extensions.length > 0);
+    const fetchLimit = hasPostFilters ? limit * 3 : limit;
+    const results = queryCollection(
+        queryEmbedding,
+        dbPath,
+        { product_name: productName, repo, branch, urlPrefix: filePathPrefix, extensions },
+        fetchLimit
+    );
+    const filteredResults = filterResultsWithContent(filterResultsByUrl(results, filePathPrefix, extensions));
+    const mappedResults = filteredResults.slice(0, limit).map((qr: QueryResult) => ({
+        distance: qr.distance,
+        content: qr.content,
+        ...(qr.url && { url: qr.url }),
+        ...(qr.section && { section: qr.section }),
+        ...(typeof qr.chunk_index === 'number' && { chunk_index: qr.chunk_index }),
+        ...(typeof qr.total_chunks === 'number' && { total_chunks: qr.total_chunks }),
+    }));
+    const emptyContentCount = results.filter((row) => typeof row.content !== 'string' || row.content.trim().length === 0).length;
+    return { results: mappedResults, rawCount: results.length, emptyContentCount };
+}
+
 function getChunksForDocument(
-    productName: string,
+    productName: string | undefined,
+    dbName: string | undefined,
     filePath: string,
     startIndex?: number,
     endIndex?: number,
     version?: string
 ): QueryResult[] {
-    const dbPath = path.join(dbDir, `${productName}.db`);
+    const { dbPath } = resolveDbPath(dbName, productName);
 
     if (!fs.existsSync(dbPath)) {
         throw new Error(`Database file not found at ${dbPath}`);
@@ -263,6 +390,7 @@ function getChunksForDocument(
               FROM vec_items
               WHERE url = ?`;
 
+        if (productName) query += ` AND product_name = ?`;
         if (version) query += ` AND version = ?`;
         if (hasRange) {
             query += ` AND chunk_index >= ? AND chunk_index <= ?`;
@@ -273,6 +401,7 @@ function getChunksForDocument(
 
         let stmt;
         let params: (string | number)[] = [filePath];
+        if (productName) params.push(productName);
         if (version) params.push(version);
         if (hasRange) {
             params.push(startIndex);
@@ -312,10 +441,12 @@ function getChunksForDocument(
                       FROM vec_items
                       WHERE url = ?`;
 
+                if (productName) query += ` AND product_name = ?`;
                 if (version) query += ` AND version = ?`;
                 query += `;`;
 
                 params = [filePath];
+                if (productName) params.push(productName);
                 if (version) params.push(version);
                 
                 try {
@@ -355,22 +486,32 @@ const server = new McpServer({
 const queryDocumentationToolHandler = async ({
     queryText,
     productName,
+    dbName,
     version,
+    urlPathPrefix,
     limit,
 }: {
     queryText: string;
-    productName: string;
+    productName?: string;
+    dbName?: string;
     version?: string;
+    urlPathPrefix?: string;
     limit: number;
 }) => {
-    console.error(`Received query: text="${queryText}", product="${productName}", version="${version || 'any'}", limit=${limit}`);
+    if (!productName && !dbName) {
+        return {
+            content: [{ type: "text" as const, text: "Provide either productName or dbName for query_documentation." }],
+        };
+    }
+
+    console.error(`Received query: text="${queryText}", product="${productName || 'n/a'}", dbName="${dbName || 'n/a'}", version="${version || 'any'}", limit=${limit}`);
 
     try {
-        const results = await queryDocumentation(queryText, productName, version, limit);
+        const results = await queryDocumentation(queryText, productName, dbName, version, urlPathPrefix, limit);
 
         if (results.length === 0) {
         return {
-            content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
+            content: [{ type: "text" as const, text: `No relevant documentation found for "${queryText}" in ${productName ? `product "${productName}"` : `db "${dbName}"`} ${version ? `(version ${version})` : ''}.` }],
         };
         }
 
@@ -380,14 +521,14 @@ const queryDocumentationToolHandler = async ({
                 `  Content: ${r.content}`,
                 `  Distance: ${r.distance.toFixed(4)}`,
                 r.url ? `  URL: ${r.url}` : null,
-                typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number'
+                typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number' && r.total_chunks > 0
                     ? `  Chunk: ${r.chunk_index + 1} of ${r.total_chunks}`
                     : null,
                 "---"
             ].filter(line => line !== null).join("\n")
         ).join("\n");
 
-        const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in product "${productName}" ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
+        const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in ${productName ? `product "${productName}"` : `db "${dbName}"`} ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
         console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
 
         return {
@@ -401,27 +542,119 @@ const queryDocumentationToolHandler = async ({
     }
 };
 
+const queryCodeToolHandler = async ({
+    queryText,
+    productName,
+    repo,
+    dbName,
+    branch,
+    filePathPrefix,
+    extensions,
+    limit,
+}: {
+    queryText: string;
+    productName?: string;
+    repo?: string;
+    dbName?: string;
+    branch?: string;
+    filePathPrefix?: string;
+    extensions?: string[];
+    limit: number;
+}) => {
+    if (!dbName) {
+        return {
+            content: [{ type: "text" as const, text: "Provide dbName for query_code." }],
+        };
+    }
+
+    console.error(`Received code query: text="${queryText}", product="${productName || 'n/a'}", repo="${repo || 'n/a'}", dbName="${dbName}", branch="${branch || 'any'}", limit=${limit}`);
+
+    try {
+        const { results, rawCount, emptyContentCount } = await queryCode(
+            queryText,
+            productName,
+            repo,
+            dbName,
+            branch,
+            filePathPrefix,
+            extensions,
+            limit
+        );
+
+        const target = repo
+            ? `repo "${repo}"`
+            : productName
+                ? `product "${productName}"`
+                : `db "${dbName}"`;
+
+        if (results.length === 0) {
+            if (rawCount > 0 && emptyContentCount === rawCount) {
+                return {
+                    content: [{ type: "text" as const, text: `Found ${rawCount} vector matches in ${target}, but all matching chunks have empty content. Re-ingest this database to populate content fields.` }],
+                };
+            }
+
+            return {
+                content: [{ type: "text" as const, text: `No relevant code found for "${queryText}" in ${target} ${branch ? `(branch ${branch})` : ''}.` }],
+            };
+        }
+
+        const formattedResults = results.map((r, index) =>
+            [
+                `Result ${index + 1}:`,
+                `  Content: ${r.content}`,
+                `  Distance: ${r.distance.toFixed(4)}`,
+                r.url ? `  URL: ${r.url}` : null,
+                typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number' && r.total_chunks > 0
+                    ? `  Chunk: ${r.chunk_index + 1} of ${r.total_chunks}`
+                    : null,
+                "---"
+            ].filter(line => line !== null).join("\n")
+        ).join("\n");
+
+        const responseText = `Found ${results.length} relevant code snippets for "${queryText}" in ${target} ${branch ? `(branch ${branch})` : ''}:\n\n${formattedResults}`;
+        console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
+
+        return {
+            content: [{ type: "text" as const, text: responseText }],
+        };
+    } catch (error: any) {
+        console.error("Error processing 'query_code' tool:", error);
+        return {
+            content: [{ type: "text" as const, text: `Error querying code: ${error.message}` }],
+        };
+    }
+};
+
 const getChunksToolHandler = async ({
     productName,
+    dbName,
     filePath,
     startIndex,
     endIndex,
     version,
 }: {
-    productName: string;
+    productName?: string;
+    dbName?: string;
     filePath: string;
     startIndex?: number;
     endIndex?: number;
     version?: string;
 }) => {
-    console.error(`Received get_chunks: filePath="${filePath}", product="${productName}", version="${version || 'any'}", startIndex=${startIndex}, endIndex=${endIndex}`);
+    if (!productName && !dbName) {
+        return {
+            content: [{ type: "text" as const, text: "Provide either productName or dbName for get_chunks." }],
+        };
+    }
+
+    console.error(`Received get_chunks: filePath="${filePath}", product="${productName || 'n/a'}", dbName="${dbName || 'n/a'}", version="${version || 'any'}", startIndex=${startIndex}, endIndex=${endIndex}`);
 
     try {
-        const results = getChunksForDocument(productName, filePath, startIndex, endIndex, version);
+        const results = getChunksForDocument(productName, dbName, filePath, startIndex, endIndex, version);
 
         if (results.length === 0) {
             return {
-                content: [{ type: "text" as const, text: `No chunks found for "${filePath}" in product "${productName}" ${version ? `(version ${version})` : ''}.` }],
+                content: [{ type: "text" as const, text: `No chunks found for "${filePath}" in ${productName ? `product "${productName}"` : `db "${dbName}"`} ${version ? `(version ${version})` : ''}.` }],
             };
         }
 
@@ -452,18 +685,37 @@ server.tool(
     "Query documentation stored in a sqlite-vec database using vector search.",
     {
         queryText: z.string().min(1).describe("The natural language query to search for."),
-        productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+        productName: z.string().min(1).optional().describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+        dbName: z.string().min(1).optional().describe("The database filename to query directly (e.g., 'my-product.db' or 'my-product')."),
         version: z.string().optional().describe("The specific version of the product documentation (e.g., '1.2.0'). Optional."),
+        urlPathPrefix: z.string().min(1).optional().describe("Full URL prefix to filter documentation results (e.g., 'https://docs.example.com/guide/')."),
         limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
     },
     queryDocumentationToolHandler
 );
 
 server.tool(
+    "query_code",
+    "Query code stored in a sqlite-vec database using vector search.",
+    {
+        queryText: z.string().min(1).describe("The natural language query to search for."),
+        productName: z.string().min(1).optional().describe("Filter results by product name stored in the DB (e.g., 'istio')."),
+        repo: z.string().min(1).optional().describe("Filter results by repo name stored in the DB (e.g., 'owner/repo')."),
+        dbName: z.string().min(1).describe("The database filename to query directly (e.g., 'repo.db' or 'repo')."),
+        branch: z.string().min(1).optional().describe("Branch name to filter code results (e.g., 'main')."),
+        filePathPrefix: z.string().min(1).optional().describe("Full file path prefix to filter code results (e.g., 'https://github.com/org/repo/blob/main/src/')."),
+        extensions: z.array(z.string().min(1)).optional().describe("File extensions to include (e.g., ['.go', '.rs'])."),
+        limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
+    },
+    queryCodeToolHandler
+);
+
+server.tool(
     "get_chunks",
     "Retrieve specific chunks from a document by file path.",
     {
-        productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+        productName: z.string().min(1).optional().describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+        dbName: z.string().min(1).optional().describe("The database filename to query directly (e.g., 'my-product.db' or 'my-product')."),
         filePath: z.string().min(1).describe("The file path (url) of the document to retrieve chunks from."),
         startIndex: z.number().int().nonnegative().optional().describe("Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning."),
         endIndex: z.number().int().nonnegative().optional().describe("End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end."),
@@ -640,18 +892,37 @@ async function main() {
                         "Query documentation stored in a sqlite-vec database using vector search.",
                         {
                             queryText: z.string().min(1).describe("The natural language query to search for."),
-                            productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+                            productName: z.string().min(1).optional().describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+                            dbName: z.string().min(1).optional().describe("The database filename to query directly (e.g., 'my-product.db' or 'my-product')."),
                             version: z.string().optional().describe("The specific version of the product documentation (e.g., '1.2.0'). Optional."),
+                            urlPathPrefix: z.string().min(1).optional().describe("Full URL prefix to filter documentation results (e.g., 'https://docs.example.com/guide/')."),
                             limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
                         },
                         queryDocumentationToolHandler
+                    );
+
+                    sessionServer.tool(
+                        "query_code",
+                        "Query code stored in a sqlite-vec database using vector search.",
+                        {
+                            queryText: z.string().min(1).describe("The natural language query to search for."),
+                            productName: z.string().min(1).optional().describe("Filter results by product name stored in the DB (e.g., 'istio')."),
+                            repo: z.string().min(1).optional().describe("Filter results by repo name stored in the DB (e.g., 'owner/repo')."),
+                            dbName: z.string().min(1).describe("The database filename to query directly (e.g., 'repo.db' or 'repo')."),
+                            branch: z.string().min(1).optional().describe("Branch name to filter code results (e.g., 'main')."),
+                            filePathPrefix: z.string().min(1).optional().describe("Full file path prefix to filter code results (e.g., 'https://github.com/org/repo/blob/main/src/')."),
+                            extensions: z.array(z.string().min(1)).optional().describe("File extensions to include (e.g., ['.go', '.rs'])."),
+                            limit: z.number().int().positive().optional().default(4).describe("Maximum number of results to return. Defaults to 4."),
+                        },
+                        queryCodeToolHandler
                     );
                     
                     sessionServer.tool(
                         "get_chunks",
                         "Retrieve specific chunks from a document by file path.",
                         {
-                            productName: z.string().min(1).describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+                            productName: z.string().min(1).optional().describe("The name of the product documentation database to search within (e.g., 'my-product'). Corresponds to the DB filename without .db."),
+                            dbName: z.string().min(1).optional().describe("The database filename to query directly (e.g., 'my-product.db' or 'my-product')."),
                             filePath: z.string().min(1).describe("The file path (url) of the document to retrieve chunks from."),
                             startIndex: z.number().int().nonnegative().optional().describe("Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning."),
                             endIndex: z.number().int().nonnegative().optional().describe("End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end."),

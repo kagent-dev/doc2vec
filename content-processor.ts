@@ -9,16 +9,22 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from './logger';
 import { Utils } from './utils';
-import { 
-    SourceConfig, 
-    WebsiteSourceConfig, 
-    LocalDirectorySourceConfig, 
-    DocumentChunk 
+import {
+    SourceConfig,
+    WebsiteSourceConfig,
+    LocalDirectorySourceConfig,
+    CodeSourceConfig,
+    DocumentChunk
 } from './types';
+import type { TokenChunker, Tokenizer } from '@chonkiejs/core';
+import { CodeChunker } from './code-chunker';
 
 export class ContentProcessor {
     private turndownService: TurndownService;
     private logger: Logger;
+    private tokenChunkerCache: Map<string, Promise<TokenChunker>>;
+    private codeChunkerCache: Map<string, Promise<CodeChunker>>;
+    private tokenizerCache: Promise<Tokenizer> | null;
 
     constructor(logger: Logger) {
         this.logger = logger;
@@ -26,6 +32,9 @@ export class ContentProcessor {
             codeBlockStyle: 'fenced',
             headingStyle: 'atx'
         });
+        this.tokenChunkerCache = new Map();
+        this.codeChunkerCache = new Map();
+        this.tokenizerCache = null;
         this.setupTurndownRules();
     }
 
@@ -909,6 +918,291 @@ export class ContentProcessor {
         } catch (error) {
             logger.error(`Error reading directory ${dirPath}:`, error);
         }
+    }
+
+    async processCodeDirectory(
+        dirPath: string,
+        config: CodeSourceConfig,
+        processFileContent: (filePath: string, content: string) => Promise<void>,
+        parentLogger: Logger,
+        visitedPaths: Set<string> = new Set(),
+        options?: {
+            allowedFiles?: Set<string>;
+            mtimeCutoff?: number;
+            trackFiles?: Set<string>;
+        }
+    ): Promise<{ processedFiles: number; skippedFiles: number; maxMtime: number }> {
+        const logger = parentLogger.child('code-directory-processor');
+        logger.info(`Processing code directory: ${dirPath}`);
+
+        const recursive = config.recursive !== undefined ? config.recursive : true;
+        const includeExtensions = config.include_extensions || [
+            '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+            '.py', '.go', '.rs', '.java', '.kt', '.kts', '.swift',
+            '.c', '.cc', '.cpp', '.h', '.hpp', '.cs',
+            '.rb', '.php', '.scala', '.sql', '.sh', '.bash', '.zsh',
+            '.html', '.css', '.scss', '.sass', '.less',
+            '.json', '.yaml', '.yml', '.md'
+        ];
+        const excludeExtensions = config.exclude_extensions || [];
+        const encoding = config.encoding || ('utf8' as BufferEncoding);
+
+        let maxMtime = 0;
+
+        try {
+            const files = fs.readdirSync(dirPath);
+            let processedFiles = 0;
+            let skippedFiles = 0;
+
+            const allowedFiles = options?.allowedFiles;
+            const mtimeCutoff = options?.mtimeCutoff;
+            const trackFiles = options?.trackFiles;
+
+            for (const file of files) {
+                const filePath = path.join(dirPath, file);
+                const stat = fs.statSync(filePath);
+
+                if (visitedPaths.has(filePath)) {
+                    logger.debug(`Skipping already visited path: ${filePath}`);
+                    continue;
+                }
+
+                visitedPaths.add(filePath);
+
+                if (stat.isDirectory()) {
+                    if (recursive) {
+                        const childResult = await this.processCodeDirectory(
+                            filePath,
+                            config,
+                            processFileContent,
+                            logger,
+                            visitedPaths,
+                            options
+                        );
+                        processedFiles += childResult.processedFiles;
+                        skippedFiles += childResult.skippedFiles;
+                        maxMtime = Math.max(maxMtime, childResult.maxMtime);
+                    } else {
+                        logger.debug(`Skipping directory ${filePath} (recursive=false)`);
+                    }
+                } else if (stat.isFile()) {
+                    const extension = path.extname(file).toLowerCase();
+
+                    if (excludeExtensions.includes(extension)) {
+                        logger.debug(`Skipping file with excluded extension: ${filePath}`);
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    if (includeExtensions.length > 0 && !includeExtensions.includes(extension)) {
+                        logger.debug(`Skipping file with non-included extension: ${filePath}`);
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    trackFiles?.add(filePath);
+                    maxMtime = Math.max(maxMtime, stat.mtimeMs);
+
+                    if (allowedFiles && !allowedFiles.has(filePath)) {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    if (mtimeCutoff !== undefined && stat.mtimeMs <= mtimeCutoff) {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    try {
+                        logger.info(`Reading file: ${filePath}`);
+                        const content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
+
+                        if (content.length > config.max_size) {
+                            logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                            skippedFiles++;
+                            continue;
+                        }
+
+                        await processFileContent(filePath, content);
+                        processedFiles++;
+                    } catch (error) {
+                        logger.error(`Error processing file ${filePath}:`, error);
+                    }
+                }
+            }
+
+            logger.info(`Code directory processed. Processed: ${processedFiles}, Skipped: ${skippedFiles}`);
+            return { processedFiles, skippedFiles, maxMtime };
+        } catch (error) {
+            logger.error(`Error reading code directory ${dirPath}:`, error);
+            return { processedFiles: 0, skippedFiles: 0, maxMtime };
+        }
+    }
+
+    private async getTokenChunker(chunkSize: number | undefined): Promise<TokenChunker> {
+        const cacheKey = `${chunkSize || 'default'}`;
+        const cached = this.tokenChunkerCache.get(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const chunkerPromise = (async () => {
+            const { TokenChunker } = await this.importChonkieModule('@chonkiejs/core');
+            return await TokenChunker.create({ chunkSize, tokenizer: 'character' });
+        })();
+
+        this.tokenChunkerCache.set(cacheKey, chunkerPromise);
+        return chunkerPromise;
+    }
+
+    private async getCodeChunker(lang: string, chunkSize: number | undefined): Promise<CodeChunker> {
+        const cacheKey = `${lang}:${chunkSize || 'default'}`;
+        const cached = this.codeChunkerCache.get(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const chunkerPromise = (async () => {
+            const tokenizer = await this.getTokenizer();
+            return await CodeChunker.create({
+                lang,
+                chunkSize,
+                tokenCounter: async (text: string) => tokenizer.countTokens(text)
+            });
+        })();
+
+        this.codeChunkerCache.set(cacheKey, chunkerPromise);
+        return chunkerPromise;
+    }
+
+    private async getTokenizer(): Promise<Tokenizer> {
+        if (!this.tokenizerCache) {
+            this.tokenizerCache = (async () => {
+                const { Tokenizer } = await this.importChonkieModule('@chonkiejs/core');
+                return await Tokenizer.create('character');
+            })();
+        }
+
+        return this.tokenizerCache;
+    }
+
+    private detectCodeLanguage(filePath: string): string | undefined {
+        const extension = path.extname(filePath).toLowerCase();
+        const languageMap: Record<string, string> = {
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
+            '.js': 'javascript',
+            '.jsx': 'javascript',
+            '.mjs': 'javascript',
+            '.cjs': 'javascript',
+            '.py': 'python',
+            '.go': 'go',
+            '.rs': 'rust',
+            '.java': 'java',
+            '.kt': 'kotlin',
+            '.kts': 'kotlin',
+            '.swift': 'swift',
+            '.c': 'c',
+            '.cc': 'cpp',
+            '.cpp': 'cpp',
+            '.h': 'cpp',
+            '.hpp': 'cpp',
+            '.cs': 'csharp',
+            '.rb': 'ruby',
+            '.php': 'php',
+            '.scala': 'scala',
+            '.sql': 'sql',
+            '.sh': 'bash',
+            '.bash': 'bash',
+            '.zsh': 'bash',
+            '.html': 'html',
+            '.css': 'css',
+            '.scss': 'scss',
+            '.sass': 'scss',
+            '.less': 'css',
+            '.json': 'json',
+            '.yaml': 'yaml',
+            '.yml': 'yaml',
+            '.md': 'markdown'
+        };
+
+        return languageMap[extension];
+    }
+
+    private async importChonkieModule(specifier: string): Promise<any> {
+        // Use dynamic import() directly - preserved by TypeScript with target ES2020+
+        // even in CommonJS mode, as Node.js supports import() in CJS contexts
+        return import(specifier);
+    }
+
+    async chunkCode(
+        code: string,
+        sourceConfig: CodeSourceConfig,
+        url: string,
+        filePath: string,
+        branch?: string,
+        repo?: string
+    ): Promise<DocumentChunk[]> {
+        const logger = this.logger.child('code-chunker');
+        const normalizedPath = filePath.replace(/\\/g, '/');
+        const lang = this.detectCodeLanguage(filePath);
+        let chunks: Array<{ text: string }>;
+
+        if (lang) {
+            try {
+                const codeChunker = await this.getCodeChunker(lang, sourceConfig.chunk_size);
+                chunks = await codeChunker.chunk(code);
+            } catch (error) {
+                logger.warn(`CodeChunker failed for ${normalizedPath || url}, falling back to token chunking:`, error);
+                const chunker = await this.getTokenChunker(sourceConfig.chunk_size);
+                chunks = await chunker.chunk(code);
+            }
+        } else {
+            const chunker = await this.getTokenChunker(sourceConfig.chunk_size);
+            chunks = await chunker.chunk(code);
+        }
+
+        const documentChunks: DocumentChunk[] = [];
+        let chunkCounter = 0;
+        const headingHierarchy = normalizedPath ? [normalizedPath] : [];
+        const contextPrefix = normalizedPath ? `[File: ${normalizedPath}]\n` : '';
+
+        for (const chunk of chunks) {
+            const content = chunk.text?.trim();
+            if (!content) {
+                continue;
+            }
+
+            const searchableText = contextPrefix + content;
+            const chunkId = Utils.generateHash(`${url}::${searchableText}`);
+
+            documentChunks.push({
+                content: searchableText,
+                metadata: {
+                    product_name: sourceConfig.product_name,
+                    version: sourceConfig.version,
+                    ...(branch ? { branch } : {}),
+                    ...(repo ? { repo } : {}),
+                    heading_hierarchy: headingHierarchy,
+                    section: normalizedPath || 'Code',
+                    chunk_id: chunkId,
+                    url: url,
+                    hash: chunkId,
+                    chunk_index: chunkCounter,
+                    total_chunks: 0
+                }
+            });
+
+            chunkCounter++;
+        }
+
+        const totalChunks = documentChunks.length;
+        for (const chunk of documentChunks) {
+            chunk.metadata.total_chunks = totalChunks;
+        }
+
+        logger.debug(`Chunked ${normalizedPath || url}: ${documentChunks.length} chunks created.`);
+        return documentChunks;
     }
 
     async chunkMarkdown(markdown: string, sourceConfig: SourceConfig, url: string): Promise<DocumentChunk[]> {

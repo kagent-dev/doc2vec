@@ -258,31 +258,55 @@ kubectl apply -f service.yaml
 
 ## Using the MCP Server
 
-The server implements two tools:
+The server implements three tools:
 - `query_documentation` to search documentation
+- `query_code` to search code repositories
 - `get_chunks` to retrieve specific chunks by file path and chunk index
 
 ### query_documentation
 
 **Parameters**
 - `queryText` (string, required): The natural language query to search for
-- `productName` (string, required): The name of the product documentation database to search within
+- `productName` (string, optional): The name of the product documentation database to search within
+- `dbName` (string, optional): Database filename to query directly (e.g., `my-product.db` or `my-product`)
 - `version` (string, optional): The specific version of the product documentation
+- `urlPathPrefix` (string, optional): Full URL prefix to filter results (e.g., `https://docs.example.com/guide/`)
 - `limit` (number, optional, default: 4): Maximum number of results to return
 
 **Notes**
+- Provide either `productName` or `dbName`.
+- If `dbName` is provided, `productName` will be used to filter results within that database.
 - Results include `chunk_index` and `total_chunks` when available, so clients can request neighboring chunks.
+
+### query_code
+
+**Parameters**
+- `queryText` (string, required): The natural language query to search for
+- `productName` (string, optional): Product name to search within (e.g., `istio`)
+- `repo` (string, optional): The repo name to search within (e.g., `owner/repo`)
+- `dbName` (string, required): Database filename to query directly (e.g., `repo.db` or `repo`)
+- `branch` (string, optional): Branch name to filter code results
+- `filePathPrefix` (string, optional): Full file path prefix to filter results (e.g., `https://github.com/org/repo/blob/main/src/`)
+- `extensions` (string[], optional): File extensions to include (e.g., `['.go', '.rs']`)
+- `limit` (number, optional, default: 4): Maximum number of results to return
+
+**Notes**
+- `dbName` is required. `productName` and `repo` are optional filters within the database.
+- `filePathPrefix` and `extensions` are applied as post-filters after the vector query.
 
 ### get_chunks
 
 **Parameters**
-- `productName` (string, required): The name of the product documentation database to search within
+- `productName` (string, optional): The name of the product documentation database to search within
+- `dbName` (string, optional): Database filename to query directly (e.g., `my-product.db` or `my-product`)
 - `filePath` (string, required): The document path (stored as `url` in the DB)
 - `startIndex` (number, optional): Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning
 - `endIndex` (number, optional): End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end
 - `version` (string, optional): The specific version of the product documentation
 
 **Notes**
+- Provide either `productName` or `dbName`.
+- If `dbName` is provided, `productName` will be used to filter results within that database.
 - Range filtering (`startIndex`/`endIndex`) requires the `chunk_index` column in the database. For older databases without this column, the tool will return all chunks and log a warning if range parameters are provided.
 - Results include `chunk_index` and `total_chunks` metadata when available (new format databases only).
 
