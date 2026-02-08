@@ -892,8 +892,8 @@ describe('ContentProcessor', () => {
             await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited);
 
             // processPage should be called for baseUrl AND the sitemap URL
-            expect(processPageSpy).toHaveBeenCalledWith('https://example.com', expect.anything());
-            expect(processPageSpy).toHaveBeenCalledWith('https://example.com/from-sitemap', expect.anything());
+            expect(processPageSpy).toHaveBeenCalledWith('https://example.com', expect.anything(), expect.any(Function));
+            expect(processPageSpy).toHaveBeenCalledWith('https://example.com/from-sitemap', expect.anything(), expect.any(Function));
         });
 
         it('should discover links from crawled pages and add them to queue', async () => {

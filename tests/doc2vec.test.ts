@@ -80,7 +80,7 @@ vi.mock('../content-processor', () => {
     function MockContentProcessor() {
         this.chunkMarkdown = vi.fn().mockResolvedValue([]);
         this.chunkCode = vi.fn().mockResolvedValue([]);
-        this.crawlWebsite = vi.fn().mockResolvedValue({ hasNetworkErrors: false });
+        this.crawlWebsite = vi.fn().mockResolvedValue({ hasNetworkErrors: false, brokenLinks: [] });
         this.processDirectory = vi.fn().mockResolvedValue(undefined);
         this.processCodeDirectory = vi.fn().mockResolvedValue({ maxMtime: 0 });
         this.convertHtmlToMarkdown = vi.fn().mockReturnValue('converted markdown');

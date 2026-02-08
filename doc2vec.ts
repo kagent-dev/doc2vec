@@ -24,7 +24,8 @@ import {
     CodeSourceConfig,
     ZendeskSourceConfig,
     DatabaseConnection,
-    DocumentChunk
+    DocumentChunk,
+    BrokenLink
 } from './types';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
@@ -37,6 +38,8 @@ export class Doc2Vec {
     private openai: OpenAI;
     private contentProcessor: ContentProcessor;
     private logger: Logger;
+    private configDir: string;
+    private brokenLinksByWebsite: Record<string, BrokenLink[]> = {};
 
     constructor(configPath: string) {
         this.logger = new Logger('Doc2Vec', {
@@ -48,6 +51,7 @@ export class Doc2Vec {
         
         this.logger.info('Initializing Doc2Vec');
         this.config = this.loadConfig(configPath);
+        this.configDir = path.dirname(path.resolve(configPath));
         this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
         this.contentProcessor = new ContentProcessor(this.logger);
     }
@@ -117,7 +121,7 @@ export class Doc2Vec {
                 sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
             }
         }
-        
+
         this.logger.section('PROCESSING COMPLETE');
     }
 
@@ -463,6 +467,9 @@ export class Doc2Vec {
 
         }, logger, visitedUrls);
 
+        this.recordBrokenLinks(config.url, crawlResult.brokenLinks);
+        this.writeBrokenLinksReport();
+
         logger.info(`Found ${validChunkIds.size} valid chunks across processed pages for ${config.url}`);
 
         logger.section('CLEANUP');
@@ -480,6 +487,39 @@ export class Doc2Vec {
         }
 
         logger.info(`Finished processing website: ${config.url}`);
+    }
+
+    private recordBrokenLinks(baseUrl: string, brokenLinks: BrokenLink[]): void {
+        const uniqueByKey = new Map<string, BrokenLink>();
+        for (const link of brokenLinks) {
+            const key = `${link.source} -> ${link.target}`;
+            if (!uniqueByKey.has(key)) {
+                uniqueByKey.set(key, link);
+            }
+        }
+        const unique = Array.from(uniqueByKey.values()).sort((a, b) => {
+            const sourceCompare = a.source.localeCompare(b.source);
+            if (sourceCompare !== 0) return sourceCompare;
+            return a.target.localeCompare(b.target);
+        });
+        this.brokenLinksByWebsite[baseUrl] = unique;
+    }
+
+    private writeBrokenLinksReport(): void {
+        const reportPath = path.join(this.configDir, '404.yaml');
+        const orderedEntries = Object.entries(this.brokenLinksByWebsite)
+            .sort(([a], [b]) => a.localeCompare(b));
+        const reportPayload = orderedEntries.map(([website, links]) => ({
+            website,
+            'broken-links': links
+        }));
+
+        try {
+            fs.writeFileSync(reportPath, yaml.dump(reportPayload, { noRefs: true }), 'utf8');
+            this.logger.info(`Wrote broken link report to ${reportPath}`);
+        } catch (error) {
+            this.logger.error(`Failed to write broken link report to ${reportPath}:`, error);
+        }
     }
 
     private async processLocalDirectory(config: LocalDirectorySourceConfig, parentLogger: Logger): Promise<void> {

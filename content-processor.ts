@@ -14,7 +14,8 @@ import {
     WebsiteSourceConfig,
     LocalDirectorySourceConfig,
     CodeSourceConfig,
-    DocumentChunk
+    DocumentChunk,
+    BrokenLink
 } from './types';
 import type { TokenChunker, Tokenizer } from '@chonkiejs/core';
 import { CodeChunker } from './code-chunker';
@@ -210,9 +211,30 @@ export class ContentProcessor {
         processPageContent: (url: string, content: string) => Promise<void>,
         parentLogger: Logger,
         visitedUrls: Set<string>
-    ): Promise<{ hasNetworkErrors: boolean }> {
+    ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[] }> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
+        const brokenLinks: BrokenLink[] = [];
+        const brokenLinkKeys: Set<string> = new Set();
+        const referrers: Map<string, Set<string>> = new Map();
+
+        const addReferrer = (targetUrl: string, sourceUrl: string) => {
+            const existing = referrers.get(targetUrl);
+            if (existing) {
+                existing.add(sourceUrl);
+            } else {
+                referrers.set(targetUrl, new Set([sourceUrl]));
+            }
+        };
+
+        const addBrokenLink = (sourceUrl: string, targetUrl: string) => {
+            const key = `${sourceUrl} -> ${targetUrl}`;
+            if (brokenLinkKeys.has(key)) return;
+            brokenLinkKeys.add(key);
+            brokenLinks.push({ source: sourceUrl, target: targetUrl });
+        };
+
+        addReferrer(baseUrl, baseUrl);
         
         // Process sitemap if provided
         if (sourceConfig.sitemap_url) {
@@ -221,9 +243,12 @@ export class ContentProcessor {
             
             // Add sitemap URLs to the queue if they're within the website scope
             for (const url of sitemapUrls) {
-                if (url.startsWith(sourceConfig.url) && !queue.includes(url)) {
-                    logger.debug(`Adding URL from sitemap to queue: ${url}`);
-                    queue.push(url);
+                if (url.startsWith(sourceConfig.url)) {
+                    addReferrer(url, sourceConfig.sitemap_url);
+                    if (!queue.includes(url)) {
+                        logger.debug(`Adding URL from sitemap to queue: ${url}`);
+                        queue.push(url);
+                    }
                 }
             }
             
@@ -254,7 +279,14 @@ export class ContentProcessor {
 
             try {
                 logger.info(`Crawling: ${url}`);
-                const content = await this.processPage(url, sourceConfig);
+                const sources = referrers.get(url) ?? new Set([baseUrl]);
+                const content = await this.processPage(url, sourceConfig, (reportedUrl, status) => {
+                    if (status === 404) {
+                        for (const source of sources) {
+                            addBrokenLink(source, reportedUrl);
+                        }
+                    }
+                });
 
                 if (content !== null) {
                     await processPageContent(url, content);
@@ -271,6 +303,7 @@ export class ContentProcessor {
                 if (!Utils.isPdfUrl(url)) {
                     const response = await axios.get(url);
                     const $ = load(response.data);
+                    const pageUrlForLinks = response?.request?.res?.responseUrl || url;
 
                     logger.debug(`Finding links on page ${url}`);
                     let newLinksFound = 0;
@@ -279,12 +312,15 @@ export class ContentProcessor {
                         const href = $(element).attr('href');
                         if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
 
-                        const fullUrl = Utils.buildUrl(href, url);
-                        if (fullUrl.startsWith(sourceConfig.url) && !visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
-                             if (!queue.includes(fullUrl)) {
-                                 queue.push(fullUrl);
-                                 newLinksFound++;
-                             }
+                        const fullUrl = Utils.buildUrl(href, pageUrlForLinks);
+                        if (fullUrl.startsWith(sourceConfig.url)) {
+                            addReferrer(fullUrl, pageUrlForLinks);
+                            if (!visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
+                                if (!queue.includes(fullUrl)) {
+                                    queue.push(fullUrl);
+                                    newLinksFound++;
+                                }
+                            }
                         }
                     });
 
@@ -293,6 +329,14 @@ export class ContentProcessor {
             } catch (error: any) {
                 logger.error(`Failed during processing or link discovery for ${url}:`, error);
                 errorCount++;
+
+                const status = this.getHttpStatus(error);
+                if (status === 404) {
+                    const sources = referrers.get(url) ?? new Set([baseUrl]);
+                    for (const source of sources) {
+                        addBrokenLink(source, url);
+                    }
+                }
                 
                 // Check if this is a network error (DNS resolution, connection issues, etc.)
                 if (this.isNetworkError(error)) {
@@ -308,7 +352,7 @@ export class ContentProcessor {
             logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');
         }
         
-        return { hasNetworkErrors };
+        return { hasNetworkErrors, brokenLinks };
     }
 
     private isNetworkError(error: any): boolean {
@@ -347,7 +391,11 @@ export class ContentProcessor {
         return false;
     }
 
-    async processPage(url: string, sourceConfig: SourceConfig): Promise<string | null> {
+    async processPage(
+        url: string,
+        sourceConfig: SourceConfig,
+        onHttpStatus?: (url: string, status: number) => void
+    ): Promise<string | null> {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing content from ${url}`);
 
@@ -365,6 +413,13 @@ export class ContentProcessor {
                 
                 return markdown;
             } catch (error) {
+                const status = this.getHttpStatus(error);
+                if (status !== undefined && status >= 400) {
+                    if (onHttpStatus) {
+                        onHttpStatus(url, status);
+                    }
+                    throw error;
+                }
                 logger.error(`Failed to process PDF ${url}:`, error);
                 return null;
             }
@@ -389,7 +444,13 @@ export class ContentProcessor {
             });
             const page: Page = await browser.newPage();
             logger.debug(`Navigating to ${url}`);
-            await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            const status = response?.status();
+            if (status !== undefined && status >= 400) {
+                const error = new Error(`Failed to load page: HTTP ${status}`);
+                (error as any).status = status;
+                throw error;
+            }
 
             const htmlContent: string = await page.evaluate(() => {
                 // 💡 Try specific content selectors first, then fall back to broader ones
@@ -519,6 +580,13 @@ export class ContentProcessor {
             logger.debug(`Markdown conversion complete (${markdown.length} chars)`);
             return markdown;
         } catch (error) {
+            const status = this.getHttpStatus(error);
+            if (status !== undefined && status >= 400) {
+                if (onHttpStatus) {
+                    onHttpStatus(url, status);
+                }
+                throw error;
+            }
             logger.error(`Error processing page ${url}:`, error);
             return null;
         } finally {
@@ -527,6 +595,18 @@ export class ContentProcessor {
                  logger.debug(`Browser closed for ${url}`);
             }
         }
+    }
+
+    private getHttpStatus(error: any): number | undefined {
+        if (typeof error?.status === 'number') {
+            return error.status;
+        }
+
+        if (typeof error?.response?.status === 'number') {
+            return error.response.status;
+        }
+
+        return undefined;
     }
 
     private markCodeParents(node: Element | null) {

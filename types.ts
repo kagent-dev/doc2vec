@@ -100,6 +100,11 @@ export interface DocumentChunk {
     };
 }
 
+export interface BrokenLink {
+    source: string;
+    target: string;
+}
+
 export interface SqliteDB {
     db: any; // Database from better-sqlite3
     type: 'sqlite';
