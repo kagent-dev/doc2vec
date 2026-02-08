@@ -316,6 +316,22 @@ describe('ContentProcessor', () => {
             const chunks = await processor.chunkCode(code, codeConfig, 'file:///test/a.ts', 'src\\utils\\a.ts');
             expect(chunks[0].content).toContain('src/utils/a.ts');
         });
+
+        it('should use markdown chunker for .md files', async () => {
+            const markdown = '# Title\n\nThis is content. '.repeat(50);
+            const chunkMarkdownSpy = vi.spyOn(processor as any, 'chunkMarkdown');
+            const getCodeChunkerSpy = vi.spyOn(processor as any, 'getCodeChunker');
+
+            const chunks = await processor.chunkCode(markdown, codeConfig, 'file:///test/readme.md', 'docs/README.md');
+
+            expect(chunkMarkdownSpy).toHaveBeenCalled();
+            expect(getCodeChunkerSpy).not.toHaveBeenCalled();
+            expect(chunks.length).toBeGreaterThan(0);
+            expect(chunks[0].content).toContain('[File: docs/README.md]');
+            expect(chunks[0].content).toContain('[Topic:');
+            expect(chunks[0].metadata.heading_hierarchy[0]).toBe('docs/README.md');
+            expect(chunks[0].metadata.section).toBe('docs/README.md');
+        });
     });
 
     // ─── processDirectory ───────────────────────────────────────────

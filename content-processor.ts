@@ -1148,6 +1148,35 @@ export class ContentProcessor {
         const lang = this.detectCodeLanguage(filePath);
         let chunks: Array<{ text: string }>;
 
+        if (lang === 'markdown') {
+            const markdownChunks = await this.chunkMarkdown(code, sourceConfig, url);
+
+            for (const chunk of markdownChunks) {
+                if (normalizedPath) {
+                    const filePrefix = `[File: ${normalizedPath}]\n`;
+                    const searchableText = filePrefix + chunk.content;
+                    const chunkId = Utils.generateHash(`${url}::${searchableText}`);
+
+                    chunk.content = searchableText;
+                    chunk.metadata.heading_hierarchy = [normalizedPath, ...chunk.metadata.heading_hierarchy.filter(Boolean)];
+                    chunk.metadata.section = normalizedPath;
+                    chunk.metadata.chunk_id = chunkId;
+                    chunk.metadata.hash = chunkId;
+                }
+
+                if (branch) {
+                    chunk.metadata.branch = branch;
+                }
+
+                if (repo) {
+                    chunk.metadata.repo = repo;
+                }
+            }
+
+            logger.debug(`Chunked ${normalizedPath || url}: ${markdownChunks.length} chunks created.`);
+            return markdownChunks;
+        }
+
         if (lang) {
             try {
                 const codeChunker = await this.getCodeChunker(lang, sourceConfig.chunk_size);
