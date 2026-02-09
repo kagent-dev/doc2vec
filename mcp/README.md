@@ -1,6 +1,6 @@
 # SQLite Vector Documentation Query MCP Server
 
-This is a Model Context Protocol (MCP) server that enables querying documentation stored in SQLite databases with vector embeddings. The server uses OpenAI's embedding API to convert natural language queries into vector embeddings and performs semantic search against documentation stored in SQLite databases.
+This is a Model Context Protocol (MCP) server that enables querying documentation stored in vector databases with embeddings. The server uses OpenAI's embedding API to convert natural language queries into vector embeddings and performs semantic search against documentation stored in SQLite (sqlite-vec) or Qdrant.
 
 ## Features
 
@@ -11,12 +11,13 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
 - Support for multiple transport types: SSE (default), stdio, and streamable HTTP
 - Session management for HTTP and SSE transports
 - Backward compatibility with previous SSE implementations
+- Supports SQLite (sqlite-vec) and Qdrant backends
 
 ## Prerequisites
 
 - Node.js 20 or higher
 - OpenAI API key
-- Documentation stored in SQLite vector databases (using `sqlite-vec`)
+- Documentation stored in a vector database: SQLite (sqlite-vec) or Qdrant
 
 ## Backward Compatibility
 
@@ -42,7 +43,10 @@ The server automatically detects the database schema and adapts its queries acco
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | Your OpenAI API key (required) | - |
+| `VECTOR_DB_TYPE` | Vector backend: `sqlite` or `qdrant` | `sqlite` |
 | `SQLITE_DB_DIR` | Directory containing SQLite databases | Current directory |
+| `QDRANT_URL` | Qdrant URL (when `VECTOR_DB_TYPE=qdrant`) | `http://localhost:6333` |
+| `QDRANT_API_KEY` | Qdrant API key (optional) | - |
 | `TRANSPORT_TYPE` | Transport type: 'sse', 'stdio', or 'http' | sse |
 | `PORT` | Port to run the server on (HTTP/SSE transports only) | 3001 |
 
@@ -277,6 +281,7 @@ The server implements three tools:
 - Provide either `productName` or `dbName`.
 - If `dbName` is provided, `productName` will be used to filter results within that database.
 - Results include `chunk_index` and `total_chunks` when available, so clients can request neighboring chunks.
+- When `VECTOR_DB_TYPE=qdrant`, `dbName` maps to the Qdrant collection name. If `dbName` is omitted, the server derives a collection name from `productName` and `version` (e.g. `my_product_1.2.0`).
 
 ### query_code
 
@@ -293,6 +298,7 @@ The server implements three tools:
 **Notes**
 - `dbName` is required. `productName` and `repo` are optional filters within the database.
 - `filePathPrefix` and `extensions` are applied as post-filters after the vector query.
+- When `VECTOR_DB_TYPE=qdrant`, `dbName` maps to the Qdrant collection name.
 
 ### get_chunks
 
@@ -309,6 +315,7 @@ The server implements three tools:
 - If `dbName` is provided, `productName` will be used to filter results within that database.
 - Range filtering (`startIndex`/`endIndex`) requires the `chunk_index` column in the database. For older databases without this column, the tool will return all chunks and log a warning if range parameters are provided.
 - Results include `chunk_index` and `total_chunks` metadata when available (new format databases only).
+- When `VECTOR_DB_TYPE=qdrant`, `dbName` maps to the Qdrant collection name. If `dbName` is omitted, the server derives a collection name from `productName` and `version`.
 
 ## Integration Examples
 
