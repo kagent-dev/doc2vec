@@ -1,6 +1,6 @@
 {
     "name": "doc2vec",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "type": "commonjs",
     "description": "",
     "main": "dist/doc2vec.js",
@@ -19,6 +19,9 @@
     "scripts": {
         "build": "tsc && chmod 755 dist/doc2vec.js",
         "start": "node dist/doc2vec.js",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "test:coverage": "vitest run --coverage",
         "prepublishOnly": "npm run build",
         "prepare": "npm run build"
     },
@@ -26,6 +29,7 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@chonkiejs/core": "^0.0.7",
         "@mozilla/readability": "^0.4.4",
         "@qdrant/js-client-rest": "^1.13.0",
         "@qdrant/qdrant-js": "^1.13.0",
@@ -42,7 +46,9 @@
         "puppeteer": "^24.1.1",
         "sanitize-html": "^2.11.0",
         "sqlite-vec": "0.1.7-alpha.2",
+        "tree-sitter-wasms": "^0.1.0",
         "turndown": "^7.1.2",
+        "web-tree-sitter": "^0.25.4",
         "word-extractor": "^1.0.4"
     },
     "devDependencies": {
@@ -52,7 +58,9 @@
         "@types/node": "^20.10.0",
         "@types/sanitize-html": "^2.9.5",
         "@types/turndown": "^5.0.4",
+        "@vitest/coverage-v8": "^4.0.18",
         "ts-node": "^10.9.1",
-        "typescript": "^5.3.2"
+        "typescript": "^5.3.2",
+        "vitest": "^4.0.18"
     }
 }

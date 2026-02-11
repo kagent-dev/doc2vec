@@ -1,6 +1,6 @@
 // Base configuration that applies to all source types
 export interface BaseSourceConfig {
-    type: 'website' | 'github' | 'local_directory' | 'zendesk';
+    type: 'website' | 'github' | 'local_directory' | 'zendesk' | 'code';
     product_name: string;
     version: string;
     max_size: number;
@@ -45,8 +45,23 @@ export interface ZendeskSourceConfig extends BaseSourceConfig {
     ticket_priority?: string[];    // Filter tickets by priority (default: all)
 }
 
+// Configuration specific to code sources (local directory or GitHub repo)
+export interface CodeSourceConfig extends BaseSourceConfig {
+    type: 'code';
+    source: 'local_directory' | 'github';
+    path?: string;                 // Path to the local directory (when source=local_directory)
+    repo?: string;                 // Repo in 'owner/repo' format (when source=github)
+    branch?: string;               // Optional branch to clone (github only)
+    include_extensions?: string[]; // File extensions to include (e.g., ['.ts', '.py'])
+    exclude_extensions?: string[]; // File extensions to exclude
+    recursive?: boolean;           // Whether to traverse subdirectories
+    encoding?: BufferEncoding;     // File encoding (default: 'utf8')
+    url_rewrite_prefix?: string;   // Optional URL prefix to rewrite file:// URLs
+    chunk_size?: number;           // Optional chunk size for Chonkie
+}
+
 // Union type for all possible source configurations
-export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig;
+export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig | CodeSourceConfig;
 
 // Database configuration
 export interface DatabaseConfig {
@@ -73,6 +88,8 @@ export interface DocumentChunk {
     metadata: {
         product_name: string;
         version: string;
+        branch?: string;
+        repo?: string;
         heading_hierarchy: string[];
         section: string;
         chunk_id: string;
@@ -81,6 +98,11 @@ export interface DocumentChunk {
         chunk_index: number;   // Position of this chunk within the page (0-based)
         total_chunks: number;  // Total number of chunks for this page, allows knowing if more chunks exist
     };
+}
+
+export interface BrokenLink {
+    source: string;
+    target: string;
 }
 
 export interface SqliteDB {

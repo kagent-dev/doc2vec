@@ -1,6 +1,6 @@
 # SQLite Vector Documentation Query MCP Server
 
-This is a Model Context Protocol (MCP) server that enables querying documentation stored in SQLite databases with vector embeddings. The server uses OpenAI's embedding API to convert natural language queries into vector embeddings and performs semantic search against documentation stored in SQLite databases.
+This is a Model Context Protocol (MCP) server that enables querying documentation stored in vector databases with embeddings. The server uses OpenAI's embedding API to convert natural language queries into vector embeddings and performs semantic search against documentation stored in SQLite (sqlite-vec) or Qdrant.
 
 ## Features
 
@@ -11,12 +11,13 @@ This is a Model Context Protocol (MCP) server that enables querying documentatio
 - Support for multiple transport types: SSE (default), stdio, and streamable HTTP
 - Session management for HTTP and SSE transports
 - Backward compatibility with previous SSE implementations
+- Supports SQLite (sqlite-vec) and Qdrant backends
 
 ## Prerequisites
 
 - Node.js 20 or higher
 - OpenAI API key
-- Documentation stored in SQLite vector databases (using `sqlite-vec`)
+- Documentation stored in a vector database: SQLite (sqlite-vec) or Qdrant
 
 ## Backward Compatibility
 
@@ -42,7 +43,10 @@ The server automatically detects the database schema and adapts its queries acco
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | Your OpenAI API key (required) | - |
+| `VECTOR_DB_TYPE` | Vector backend: `sqlite` or `qdrant` | `sqlite` |
 | `SQLITE_DB_DIR` | Directory containing SQLite databases | Current directory |
+| `QDRANT_URL` | Qdrant URL (when `VECTOR_DB_TYPE=qdrant`) | `http://localhost:6333` |
+| `QDRANT_API_KEY` | Qdrant API key (optional) | - |
 | `TRANSPORT_TYPE` | Transport type: 'sse', 'stdio', or 'http' | sse |
 | `PORT` | Port to run the server on (HTTP/SSE transports only) | 3001 |
 
@@ -258,33 +262,60 @@ kubectl apply -f service.yaml
 
 ## Using the MCP Server
 
-The server implements two tools:
+The server implements three tools:
 - `query_documentation` to search documentation
+- `query_code` to search code repositories
 - `get_chunks` to retrieve specific chunks by file path and chunk index
 
 ### query_documentation
 
 **Parameters**
 - `queryText` (string, required): The natural language query to search for
-- `productName` (string, required): The name of the product documentation database to search within
+- `productName` (string, optional): The name of the product documentation database to search within
+- `dbName` (string, optional): Database filename to query directly (e.g., `my-product.db` or `my-product`)
 - `version` (string, optional): The specific version of the product documentation
+- `urlPathPrefix` (string, optional): Full URL prefix to filter results (e.g., `https://docs.example.com/guide/`)
 - `limit` (number, optional, default: 4): Maximum number of results to return
 
 **Notes**
+- Provide either `productName` or `dbName`.
+- If `dbName` is provided, `productName` will be used to filter results within that database.
 - Results include `chunk_index` and `total_chunks` when available, so clients can request neighboring chunks.
+- When `VECTOR_DB_TYPE=qdrant`, `dbName` maps to the Qdrant collection name. If `dbName` is omitted, the server derives a collection name from `productName` and `version` (e.g. `my_product_1.2.0`).
+
+### query_code
+
+**Parameters**
+- `queryText` (string, required): The natural language query to search for
+- `productName` (string, optional): Product name to search within (e.g., `istio`)
+- `repo` (string, optional): The repo name to search within (e.g., `owner/repo`)
+- `dbName` (string, required): Database filename to query directly (e.g., `repo.db` or `repo`)
+- `branch` (string, optional): Branch name to filter code results
+- `filePathPrefix` (string, optional): Full file path prefix to filter results (e.g., `https://github.com/org/repo/blob/main/src/`)
+- `extensions` (string[], optional): File extensions to include (e.g., `['.go', '.rs']`)
+- `limit` (number, optional, default: 4): Maximum number of results to return
+
+**Notes**
+- `dbName` is required. `productName` and `repo` are optional filters within the database.
+- `filePathPrefix` and `extensions` are applied as post-filters after the vector query.
+- When `VECTOR_DB_TYPE=qdrant`, `dbName` maps to the Qdrant collection name.
 
 ### get_chunks
 
 **Parameters**
-- `productName` (string, required): The name of the product documentation database to search within
+- `productName` (string, optional): The name of the product documentation database to search within
+- `dbName` (string, optional): Database filename to query directly (e.g., `my-product.db` or `my-product`)
 - `filePath` (string, required): The document path (stored as `url` in the DB)
 - `startIndex` (number, optional): Start index of the chunk range to retrieve (0-based). If not provided, returns all chunks from the beginning
 - `endIndex` (number, optional): End index of the chunk range to retrieve (0-based, inclusive). If not provided, returns all chunks to the end
 - `version` (string, optional): The specific version of the product documentation
 
 **Notes**
+- Provide either `productName` or `dbName`.
+- If `dbName` is provided, `productName` will be used to filter results within that database.
 - Range filtering (`startIndex`/`endIndex`) requires the `chunk_index` column in the database. For older databases without this column, the tool will return all chunks and log a warning if range parameters are provided.
 - Results include `chunk_index` and `total_chunks` metadata when available (new format databases only).
+- When `VECTOR_DB_TYPE=qdrant`, `dbName` maps to the Qdrant collection name. If `dbName` is omitted, the server derives a collection name from `productName` and `version`.
 
 ## Integration Examples
 

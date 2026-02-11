@@ -22,6 +22,9 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Local Directory Processing:** Scans local directories for files, converts content to searchable chunks.
     * **PDF Support:** Automatically extracts text from PDF files and converts them to Markdown format using Mozilla's PDF.js.
     * **Word Document Support:** Processes both legacy `.doc` and modern `.docx` files, extracting text and formatting.
+*   **Code Source Processing:** Ingests code from local directories or GitHub repositories using Chonkie code chunking.
+    * **AST-aware Chunking:** Uses Chonkie-based code chunking with Tree-sitter to preserve code structure.
+    * **Repository Support:** Clones GitHub repos for code ingestion and maps files to GitHub URLs.
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
     *   **Smart H1 Preservation:** Automatically extracts and preserves page titles (H1 headings) that Readability might strip as "page chrome", ensuring proper heading hierarchy.
     *   **Flexible Content Selectors:** Supports multiple content container patterns (`.docs-content`, `.doc-content`, `.markdown-body`, `article`, etc.) for better compatibility with various documentation sites.
@@ -145,7 +148,7 @@ Configuration is managed through two files:
     **Structure:**
 
     *   `sources`: An array of source configurations.
-        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, or `'zendesk'`
+        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, `'code'`, or `'zendesk'`
         
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
@@ -162,6 +165,20 @@ Configuration is managed through two files:
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix` (Optional) URL prefix to rewrite `file://` URLs (e.g., `https://mydomain.com`)
         *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`). Note: PDF files are processed as binary and this setting doesn't apply to them.
+
+        For code sources (`type: 'code'`):
+        *   `source`: Either `'local_directory'` or `'github'`.
+        *   `path`: Path to the local directory (required when `source: 'local_directory'`).
+        *   `repo`: Repository name in the format `'owner/repo'` (required when `source: 'github'`).
+        *   `branch`: (Optional) Branch to clone for GitHub sources.
+        *   `include_extensions`: (Optional) Array of file extensions to include (defaults to common code extensions).
+        *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
+        *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
+        *   `url_rewrite_prefix`: (Optional) URL prefix to rewrite `file://` URLs for local sources.
+        *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`).
+        *   `chunk_size`: (Optional) Chonkie chunk size for code files.
+        *   `version` is optional for code sources; if omitted it defaults to `branch` (or `local` for local directories).
+        *   `branch` is stored in the database and used by `query_code` filtering.
         
         For Zendesk (`type: 'zendesk'`):
         *   `zendesk_subdomain`: Your Zendesk subdomain (e.g., `'mycompany'` for mycompany.zendesk.com).
@@ -226,6 +243,21 @@ Configuration is managed through two files:
           type: 'sqlite'
           params:
             db_path: './project-docs.db'
+
+      # Code source example (GitHub)
+      - type: 'code'
+        source: 'github'
+        product_name: 'doc2vec'
+        version: 'main'
+        repo: 'kagent-dev/doc2vec'
+        branch: 'main'
+        include_extensions: ['.ts', '.tsx', '.md']
+        max_size: 1048576
+        chunk_size: 2048
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './doc2vec-code.db'
       
       # Zendesk example
       - type: 'zendesk'

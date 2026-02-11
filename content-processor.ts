@@ -9,16 +9,23 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from './logger';
 import { Utils } from './utils';
-import { 
-    SourceConfig, 
-    WebsiteSourceConfig, 
-    LocalDirectorySourceConfig, 
-    DocumentChunk 
+import {
+    SourceConfig,
+    WebsiteSourceConfig,
+    LocalDirectorySourceConfig,
+    CodeSourceConfig,
+    DocumentChunk,
+    BrokenLink
 } from './types';
+import type { TokenChunker, Tokenizer } from '@chonkiejs/core';
+import { CodeChunker } from './code-chunker';
 
 export class ContentProcessor {
     private turndownService: TurndownService;
     private logger: Logger;
+    private tokenChunkerCache: Map<string, Promise<TokenChunker>>;
+    private codeChunkerCache: Map<string, Promise<CodeChunker>>;
+    private tokenizerCache: Promise<Tokenizer> | null;
 
     constructor(logger: Logger) {
         this.logger = logger;
@@ -26,6 +33,9 @@ export class ContentProcessor {
             codeBlockStyle: 'fenced',
             headingStyle: 'atx'
         });
+        this.tokenChunkerCache = new Map();
+        this.codeChunkerCache = new Map();
+        this.tokenizerCache = null;
         this.setupTurndownRules();
     }
 
@@ -201,9 +211,30 @@ export class ContentProcessor {
         processPageContent: (url: string, content: string) => Promise<void>,
         parentLogger: Logger,
         visitedUrls: Set<string>
-    ): Promise<{ hasNetworkErrors: boolean }> {
+    ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[] }> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
+        const brokenLinks: BrokenLink[] = [];
+        const brokenLinkKeys: Set<string> = new Set();
+        const referrers: Map<string, Set<string>> = new Map();
+
+        const addReferrer = (targetUrl: string, sourceUrl: string) => {
+            const existing = referrers.get(targetUrl);
+            if (existing) {
+                existing.add(sourceUrl);
+            } else {
+                referrers.set(targetUrl, new Set([sourceUrl]));
+            }
+        };
+
+        const addBrokenLink = (sourceUrl: string, targetUrl: string) => {
+            const key = `${sourceUrl} -> ${targetUrl}`;
+            if (brokenLinkKeys.has(key)) return;
+            brokenLinkKeys.add(key);
+            brokenLinks.push({ source: sourceUrl, target: targetUrl });
+        };
+
+        addReferrer(baseUrl, baseUrl);
         
         // Process sitemap if provided
         if (sourceConfig.sitemap_url) {
@@ -212,9 +243,12 @@ export class ContentProcessor {
             
             // Add sitemap URLs to the queue if they're within the website scope
             for (const url of sitemapUrls) {
-                if (url.startsWith(sourceConfig.url) && !queue.includes(url)) {
-                    logger.debug(`Adding URL from sitemap to queue: ${url}`);
-                    queue.push(url);
+                if (url.startsWith(sourceConfig.url)) {
+                    addReferrer(url, sourceConfig.sitemap_url);
+                    if (!queue.includes(url)) {
+                        logger.debug(`Adding URL from sitemap to queue: ${url}`);
+                        queue.push(url);
+                    }
                 }
             }
             
@@ -245,7 +279,14 @@ export class ContentProcessor {
 
             try {
                 logger.info(`Crawling: ${url}`);
-                const content = await this.processPage(url, sourceConfig);
+                const sources = referrers.get(url) ?? new Set([baseUrl]);
+                const content = await this.processPage(url, sourceConfig, (reportedUrl, status) => {
+                    if (status === 404) {
+                        for (const source of sources) {
+                            addBrokenLink(source, reportedUrl);
+                        }
+                    }
+                });
 
                 if (content !== null) {
                     await processPageContent(url, content);
@@ -262,6 +303,7 @@ export class ContentProcessor {
                 if (!Utils.isPdfUrl(url)) {
                     const response = await axios.get(url);
                     const $ = load(response.data);
+                    const pageUrlForLinks = response?.request?.res?.responseUrl || url;
 
                     logger.debug(`Finding links on page ${url}`);
                     let newLinksFound = 0;
@@ -270,12 +312,15 @@ export class ContentProcessor {
                         const href = $(element).attr('href');
                         if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
 
-                        const fullUrl = Utils.buildUrl(href, url);
-                        if (fullUrl.startsWith(sourceConfig.url) && !visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
-                             if (!queue.includes(fullUrl)) {
-                                 queue.push(fullUrl);
-                                 newLinksFound++;
-                             }
+                        const fullUrl = Utils.buildUrl(href, pageUrlForLinks);
+                        if (fullUrl.startsWith(sourceConfig.url)) {
+                            addReferrer(fullUrl, pageUrlForLinks);
+                            if (!visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
+                                if (!queue.includes(fullUrl)) {
+                                    queue.push(fullUrl);
+                                    newLinksFound++;
+                                }
+                            }
                         }
                     });
 
@@ -284,6 +329,14 @@ export class ContentProcessor {
             } catch (error: any) {
                 logger.error(`Failed during processing or link discovery for ${url}:`, error);
                 errorCount++;
+
+                const status = this.getHttpStatus(error);
+                if (status === 404) {
+                    const sources = referrers.get(url) ?? new Set([baseUrl]);
+                    for (const source of sources) {
+                        addBrokenLink(source, url);
+                    }
+                }
                 
                 // Check if this is a network error (DNS resolution, connection issues, etc.)
                 if (this.isNetworkError(error)) {
@@ -299,7 +352,7 @@ export class ContentProcessor {
             logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');
         }
         
-        return { hasNetworkErrors };
+        return { hasNetworkErrors, brokenLinks };
     }
 
     private isNetworkError(error: any): boolean {
@@ -338,7 +391,11 @@ export class ContentProcessor {
         return false;
     }
 
-    async processPage(url: string, sourceConfig: SourceConfig): Promise<string | null> {
+    async processPage(
+        url: string,
+        sourceConfig: SourceConfig,
+        onHttpStatus?: (url: string, status: number) => void
+    ): Promise<string | null> {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing content from ${url}`);
 
@@ -356,6 +413,13 @@ export class ContentProcessor {
                 
                 return markdown;
             } catch (error) {
+                const status = this.getHttpStatus(error);
+                if (status !== undefined && status >= 400) {
+                    if (onHttpStatus) {
+                        onHttpStatus(url, status);
+                    }
+                    throw error;
+                }
                 logger.error(`Failed to process PDF ${url}:`, error);
                 return null;
             }
@@ -380,7 +444,13 @@ export class ContentProcessor {
             });
             const page: Page = await browser.newPage();
             logger.debug(`Navigating to ${url}`);
-            await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            const status = response?.status();
+            if (status !== undefined && status >= 400) {
+                const error = new Error(`Failed to load page: HTTP ${status}`);
+                (error as any).status = status;
+                throw error;
+            }
 
             const htmlContent: string = await page.evaluate(() => {
                 // 💡 Try specific content selectors first, then fall back to broader ones
@@ -510,6 +580,13 @@ export class ContentProcessor {
             logger.debug(`Markdown conversion complete (${markdown.length} chars)`);
             return markdown;
         } catch (error) {
+            const status = this.getHttpStatus(error);
+            if (status !== undefined && status >= 400) {
+                if (onHttpStatus) {
+                    onHttpStatus(url, status);
+                }
+                throw error;
+            }
             logger.error(`Error processing page ${url}:`, error);
             return null;
         } finally {
@@ -518,6 +595,18 @@ export class ContentProcessor {
                  logger.debug(`Browser closed for ${url}`);
             }
         }
+    }
+
+    private getHttpStatus(error: any): number | undefined {
+        if (typeof error?.status === 'number') {
+            return error.status;
+        }
+
+        if (typeof error?.response?.status === 'number') {
+            return error.response.status;
+        }
+
+        return undefined;
     }
 
     private markCodeParents(node: Element | null) {
@@ -909,6 +998,320 @@ export class ContentProcessor {
         } catch (error) {
             logger.error(`Error reading directory ${dirPath}:`, error);
         }
+    }
+
+    async processCodeDirectory(
+        dirPath: string,
+        config: CodeSourceConfig,
+        processFileContent: (filePath: string, content: string) => Promise<void>,
+        parentLogger: Logger,
+        visitedPaths: Set<string> = new Set(),
+        options?: {
+            allowedFiles?: Set<string>;
+            mtimeCutoff?: number;
+            trackFiles?: Set<string>;
+        }
+    ): Promise<{ processedFiles: number; skippedFiles: number; maxMtime: number }> {
+        const logger = parentLogger.child('code-directory-processor');
+        logger.info(`Processing code directory: ${dirPath}`);
+
+        const recursive = config.recursive !== undefined ? config.recursive : true;
+        const includeExtensions = config.include_extensions || [
+            '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+            '.py', '.go', '.rs', '.java', '.kt', '.kts', '.swift',
+            '.c', '.cc', '.cpp', '.h', '.hpp', '.cs',
+            '.rb', '.php', '.scala', '.sql', '.sh', '.bash', '.zsh',
+            '.html', '.css', '.scss', '.sass', '.less',
+            '.json', '.yaml', '.yml', '.md'
+        ];
+        const excludeExtensions = config.exclude_extensions || [];
+        const encoding = config.encoding || ('utf8' as BufferEncoding);
+
+        let maxMtime = 0;
+
+        try {
+            const files = fs.readdirSync(dirPath);
+            let processedFiles = 0;
+            let skippedFiles = 0;
+
+            const allowedFiles = options?.allowedFiles;
+            const mtimeCutoff = options?.mtimeCutoff;
+            const trackFiles = options?.trackFiles;
+
+            for (const file of files) {
+                const filePath = path.join(dirPath, file);
+                const stat = fs.statSync(filePath);
+
+                if (visitedPaths.has(filePath)) {
+                    logger.debug(`Skipping already visited path: ${filePath}`);
+                    continue;
+                }
+
+                visitedPaths.add(filePath);
+
+                if (stat.isDirectory()) {
+                    if (recursive) {
+                        const childResult = await this.processCodeDirectory(
+                            filePath,
+                            config,
+                            processFileContent,
+                            logger,
+                            visitedPaths,
+                            options
+                        );
+                        processedFiles += childResult.processedFiles;
+                        skippedFiles += childResult.skippedFiles;
+                        maxMtime = Math.max(maxMtime, childResult.maxMtime);
+                    } else {
+                        logger.debug(`Skipping directory ${filePath} (recursive=false)`);
+                    }
+                } else if (stat.isFile()) {
+                    const extension = path.extname(file).toLowerCase();
+
+                    if (excludeExtensions.includes(extension)) {
+                        logger.debug(`Skipping file with excluded extension: ${filePath}`);
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    if (includeExtensions.length > 0 && !includeExtensions.includes(extension)) {
+                        logger.debug(`Skipping file with non-included extension: ${filePath}`);
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    trackFiles?.add(filePath);
+                    maxMtime = Math.max(maxMtime, stat.mtimeMs);
+
+                    if (allowedFiles && !allowedFiles.has(filePath)) {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    if (mtimeCutoff !== undefined && stat.mtimeMs <= mtimeCutoff) {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    try {
+                        logger.info(`Reading file: ${filePath}`);
+                        const content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
+
+                        if (content.length > config.max_size) {
+                            logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                            skippedFiles++;
+                            continue;
+                        }
+
+                        await processFileContent(filePath, content);
+                        processedFiles++;
+                    } catch (error) {
+                        logger.error(`Error processing file ${filePath}:`, error);
+                    }
+                }
+            }
+
+            logger.info(`Code directory processed. Processed: ${processedFiles}, Skipped: ${skippedFiles}`);
+            return { processedFiles, skippedFiles, maxMtime };
+        } catch (error) {
+            logger.error(`Error reading code directory ${dirPath}:`, error);
+            return { processedFiles: 0, skippedFiles: 0, maxMtime };
+        }
+    }
+
+    private async getTokenChunker(chunkSize: number | undefined): Promise<TokenChunker> {
+        const cacheKey = `${chunkSize || 'default'}`;
+        const cached = this.tokenChunkerCache.get(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const chunkerPromise = (async () => {
+            const { TokenChunker } = await this.importChonkieModule('@chonkiejs/core');
+            return await TokenChunker.create({ chunkSize, tokenizer: 'character' });
+        })();
+
+        this.tokenChunkerCache.set(cacheKey, chunkerPromise);
+        return chunkerPromise;
+    }
+
+    private async getCodeChunker(lang: string, chunkSize: number | undefined): Promise<CodeChunker> {
+        const cacheKey = `${lang}:${chunkSize || 'default'}`;
+        const cached = this.codeChunkerCache.get(cacheKey);
+        if (cached) {
+            return cached;
+        }
+
+        const chunkerPromise = (async () => {
+            const tokenizer = await this.getTokenizer();
+            return await CodeChunker.create({
+                lang,
+                chunkSize,
+                tokenCounter: async (text: string) => tokenizer.countTokens(text)
+            });
+        })();
+
+        this.codeChunkerCache.set(cacheKey, chunkerPromise);
+        return chunkerPromise;
+    }
+
+    private async getTokenizer(): Promise<Tokenizer> {
+        if (!this.tokenizerCache) {
+            this.tokenizerCache = (async () => {
+                const { Tokenizer } = await this.importChonkieModule('@chonkiejs/core');
+                return await Tokenizer.create('character');
+            })();
+        }
+
+        return this.tokenizerCache;
+    }
+
+    private detectCodeLanguage(filePath: string): string | undefined {
+        const extension = path.extname(filePath).toLowerCase();
+        const languageMap: Record<string, string> = {
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
+            '.js': 'javascript',
+            '.jsx': 'javascript',
+            '.mjs': 'javascript',
+            '.cjs': 'javascript',
+            '.py': 'python',
+            '.go': 'go',
+            '.rs': 'rust',
+            '.java': 'java',
+            '.kt': 'kotlin',
+            '.kts': 'kotlin',
+            '.swift': 'swift',
+            '.c': 'c',
+            '.cc': 'cpp',
+            '.cpp': 'cpp',
+            '.h': 'cpp',
+            '.hpp': 'cpp',
+            '.cs': 'csharp',
+            '.rb': 'ruby',
+            '.php': 'php',
+            '.scala': 'scala',
+            '.sql': 'sql',
+            '.sh': 'bash',
+            '.bash': 'bash',
+            '.zsh': 'bash',
+            '.html': 'html',
+            '.css': 'css',
+            '.scss': 'scss',
+            '.sass': 'scss',
+            '.less': 'css',
+            '.json': 'json',
+            '.yaml': 'yaml',
+            '.yml': 'yaml',
+            '.md': 'markdown'
+        };
+
+        return languageMap[extension];
+    }
+
+    private async importChonkieModule(specifier: string): Promise<any> {
+        // Use dynamic import() directly - preserved by TypeScript with target ES2020+
+        // even in CommonJS mode, as Node.js supports import() in CJS contexts
+        return import(specifier);
+    }
+
+    async chunkCode(
+        code: string,
+        sourceConfig: CodeSourceConfig,
+        url: string,
+        filePath: string,
+        branch?: string,
+        repo?: string
+    ): Promise<DocumentChunk[]> {
+        const logger = this.logger.child('code-chunker');
+        const normalizedPath = filePath.replace(/\\/g, '/');
+        const lang = this.detectCodeLanguage(filePath);
+        let chunks: Array<{ text: string }>;
+
+        if (lang === 'markdown') {
+            const markdownChunks = await this.chunkMarkdown(code, sourceConfig, url);
+
+            for (const chunk of markdownChunks) {
+                if (normalizedPath) {
+                    const filePrefix = `[File: ${normalizedPath}]\n`;
+                    const searchableText = filePrefix + chunk.content;
+                    const chunkId = Utils.generateHash(`${url}::${searchableText}`);
+
+                    chunk.content = searchableText;
+                    chunk.metadata.heading_hierarchy = [normalizedPath, ...chunk.metadata.heading_hierarchy.filter(Boolean)];
+                    chunk.metadata.section = normalizedPath;
+                    chunk.metadata.chunk_id = chunkId;
+                    chunk.metadata.hash = chunkId;
+                }
+
+                if (branch) {
+                    chunk.metadata.branch = branch;
+                }
+
+                if (repo) {
+                    chunk.metadata.repo = repo;
+                }
+            }
+
+            logger.debug(`Chunked ${normalizedPath || url}: ${markdownChunks.length} chunks created.`);
+            return markdownChunks;
+        }
+
+        if (lang) {
+            try {
+                const codeChunker = await this.getCodeChunker(lang, sourceConfig.chunk_size);
+                chunks = await codeChunker.chunk(code);
+            } catch (error) {
+                logger.warn(`CodeChunker failed for ${normalizedPath || url}, falling back to token chunking:`, error);
+                const chunker = await this.getTokenChunker(sourceConfig.chunk_size);
+                chunks = await chunker.chunk(code);
+            }
+        } else {
+            const chunker = await this.getTokenChunker(sourceConfig.chunk_size);
+            chunks = await chunker.chunk(code);
+        }
+
+        const documentChunks: DocumentChunk[] = [];
+        let chunkCounter = 0;
+        const headingHierarchy = normalizedPath ? [normalizedPath] : [];
+        const contextPrefix = normalizedPath ? `[File: ${normalizedPath}]\n` : '';
+
+        for (const chunk of chunks) {
+            const content = chunk.text?.trim();
+            if (!content) {
+                continue;
+            }
+
+            const searchableText = contextPrefix + content;
+            const chunkId = Utils.generateHash(`${url}::${searchableText}`);
+
+            documentChunks.push({
+                content: searchableText,
+                metadata: {
+                    product_name: sourceConfig.product_name,
+                    version: sourceConfig.version,
+                    ...(branch ? { branch } : {}),
+                    ...(repo ? { repo } : {}),
+                    heading_hierarchy: headingHierarchy,
+                    section: normalizedPath || 'Code',
+                    chunk_id: chunkId,
+                    url: url,
+                    hash: chunkId,
+                    chunk_index: chunkCounter,
+                    total_chunks: 0
+                }
+            });
+
+            chunkCounter++;
+        }
+
+        const totalChunks = documentChunks.length;
+        for (const chunk of documentChunks) {
+            chunk.metadata.total_chunks = totalChunks;
+        }
+
+        logger.debug(`Chunked ${normalizedPath || url}: ${documentChunks.length} chunks created.`);
+        return documentChunks;
     }
 
     async chunkMarkdown(markdown: string, sourceConfig: SourceConfig, url: string): Promise<DocumentChunk[]> {
