@@ -9,7 +9,7 @@ import * as os from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { Buffer } from 'buffer';
-import { OpenAI } from "openai";
+import { OpenAI, AzureOpenAI } from "openai";
 import * as dotenv from "dotenv";
 import { Logger, LogLevel } from './logger';
 import { Utils } from './utils';
@@ -35,7 +35,8 @@ dotenv.config();
 
 export class Doc2Vec {
     private config: Config;
-    private openai: OpenAI;
+    private openai: OpenAI | AzureOpenAI;
+    private embeddingModel: string;
     private contentProcessor: ContentProcessor;
     private logger: Logger;
     private configDir: string;
@@ -52,7 +53,45 @@ export class Doc2Vec {
         this.logger.info('Initializing Doc2Vec');
         this.config = this.loadConfig(configPath);
         this.configDir = path.dirname(path.resolve(configPath));
-        this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        
+        // Initialize OpenAI or Azure OpenAI based on configuration
+        // Check environment variable if not specified in config
+        const embeddingProvider = this.config.embedding?.provider || (process.env.EMBEDDING_PROVIDER as 'openai' | 'azure') || 'openai';
+        const embeddingConfig = this.config.embedding || { provider: embeddingProvider };
+        
+        if (embeddingProvider === 'azure') {
+            const azureApiKey = embeddingConfig.azure?.api_key || process.env.AZURE_OPENAI_KEY;
+            const azureEndpoint = embeddingConfig.azure?.endpoint || process.env.AZURE_OPENAI_ENDPOINT;
+            const azureDeploymentName = embeddingConfig.azure?.deployment_name || process.env.AZURE_OPENAI_DEPLOYMENT_NAME || 'text-embedding-3-large';
+            const azureApiVersion = embeddingConfig.azure?.api_version || process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
+            
+            if (!azureApiKey || !azureEndpoint) {
+                this.logger.error('Azure OpenAI requires api_key and endpoint to be configured');
+                process.exit(1);
+            }
+            
+            this.openai = new AzureOpenAI({
+                apiKey: azureApiKey,
+                endpoint: azureEndpoint,
+                deployment: azureDeploymentName,
+                apiVersion: azureApiVersion,
+            });
+            this.embeddingModel = azureDeploymentName;
+            this.logger.info(`Using Azure OpenAI with deployment: ${azureDeploymentName}`);
+        } else {
+            const openaiApiKey = embeddingConfig.openai?.api_key || process.env.OPENAI_API_KEY;
+            const openaiModel = embeddingConfig.openai?.model || process.env.OPENAI_MODEL || 'text-embedding-3-large';
+            
+            if (!openaiApiKey) {
+                this.logger.error('OpenAI requires api_key to be configured');
+                process.exit(1);
+            }
+            
+            this.openai = new OpenAI({ apiKey: openaiApiKey });
+            this.embeddingModel = openaiModel;
+            this.logger.info(`Using OpenAI with model: ${openaiModel}`);
+        }
+        
         this.contentProcessor = new ContentProcessor(this.logger);
     }
 
@@ -1483,7 +1522,7 @@ export class Doc2Vec {
         try {
             logger.debug(`Creating embeddings for ${texts.length} texts`);
             const response = await this.openai.embeddings.create({
-                model: "text-embedding-3-large",
+                model: this.embeddingModel,
                 input: texts,
             });
             logger.debug(`Successfully created ${response.data.length} embeddings`);

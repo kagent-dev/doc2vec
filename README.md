@@ -31,7 +31,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
     *   **Clean Heading Text:** Automatically removes anchor links (like `[](#section-id)`) from heading text for cleaner hierarchy display.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
-*   **Vector Embeddings:** Generates embeddings for each chunk using OpenAI's `text-embedding-3-large` model.
+*   **Vector Embeddings:** Generates embeddings for each chunk using OpenAI or Azure OpenAI (configurable).
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
     *   **SQLite:** Using `better-sqlite3` and the `sqlite-vec` extension for efficient vector search.
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
@@ -98,7 +98,7 @@ This ensures that searches for parent topics (like "Installation") will also mat
 *   **Node.js:** Version 18 or higher recommended (check `.nvmrc` if available).
 *   **npm:** Node Package Manager (usually comes with Node.js).
 *   **TypeScript:** As the project is written in TypeScript (`ts-node` is used for execution via `npm start`).
-*   **OpenAI API Key:** You need an API key from OpenAI to generate embeddings.
+*   **OpenAI API Key or Azure OpenAI Credentials:** You need either an OpenAI API key or Azure OpenAI credentials to generate embeddings.
 *   **GitHub Personal Access Token:** Required for accessing GitHub issues (set as `GITHUB_PERSONAL_ACCESS_TOKEN` in your environment).
 *   **Zendesk API Token:** Required for accessing Zendesk tickets and articles (set as `ZENDESK_API_TOKEN` in your environment).
 *   **(Optional) Qdrant Instance:** If using the `qdrant` database type, you need a running Qdrant instance accessible from where you run the script.
@@ -129,8 +129,20 @@ Configuration is managed through two files:
     ```dotenv
     # .env
 
-    # Required: Your OpenAI API Key
+    # Embedding Provider Configuration
+    # Optional: Specify which provider to use (defaults to 'openai' if not set)
+    # Can also be configured in config.yaml
+    EMBEDDING_PROVIDER="azure"  # or "openai"
+
+    # Required: Your OpenAI API Key (if using OpenAI provider)
     OPENAI_API_KEY="sk-..."
+    OPENAI_MODEL="text-embedding-3-large"  # Optional, defaults to text-embedding-3-large
+
+    # Required: Your Azure OpenAI credentials (if using Azure provider)
+    AZURE_OPENAI_KEY="your-azure-key"
+    AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
+    AZURE_OPENAI_DEPLOYMENT_NAME="text-embedding-3-large"
+    AZURE_OPENAI_API_VERSION="2024-10-21"
 
     # Required for GitHub sources
     GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."
@@ -206,6 +218,21 @@ Configuration is managed through two files:
 
     **Example (`config.yaml`):**
     ```yaml
+    # Optional: Configure embedding provider
+    # Can also be set via EMBEDDING_PROVIDER environment variable
+    # Defaults to OpenAI if not specified
+    embedding:
+      provider: 'openai'  # or 'azure'
+      openai:
+        api_key: '${OPENAI_API_KEY}'  # Optional, uses env var by default
+        model: 'text-embedding-3-large'  # Optional, defaults to text-embedding-3-large
+      # For Azure OpenAI, use this instead:
+      # azure:
+      #   api_key: '${AZURE_OPENAI_KEY}'
+      #   endpoint: '${AZURE_OPENAI_ENDPOINT}'
+      #   deployment_name: 'text-embedding-3-large'
+      #   api_version: '2024-10-21'  # Optional
+
     sources:
       # Website source example
       - type: 'website'
