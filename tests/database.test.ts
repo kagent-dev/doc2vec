@@ -292,6 +292,27 @@ describe('DatabaseManager', () => {
             expect(result.repo).toBe('');
         });
 
+        it('should insert successfully when branch/repo are undefined (website source scenario)', () => {
+            // Website sources don't set branch/repo on chunks, so they are undefined.
+            // vec0 TEXT columns reject NULL values, so insertVectorsSQLite must
+            // coerce undefined to empty string. This test verifies the chunk is
+            // actually stored and can be looked up for hash-based deduplication.
+            const chunk = createTestChunk();
+            (chunk.metadata as any).branch = undefined;
+            (chunk.metadata as any).repo = undefined;
+            const embedding = createTestEmbedding();
+
+            DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, 'website-hash');
+
+            const result = db.prepare('SELECT hash, branch, repo FROM vec_items WHERE chunk_id = ?')
+                .get(chunk.metadata.chunk_id) as any;
+
+            expect(result).toBeDefined();
+            expect(result.hash).toBe('website-hash');
+            expect(result.branch).toBe('');
+            expect(result.repo).toBe('');
+        });
+
         it('should use provided chunkHash when given', () => {
             const chunk = createTestChunk();
             const embedding = createTestEmbedding();

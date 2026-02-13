@@ -430,7 +430,7 @@ export class Doc2Vec {
                 logger.info(`Created ${chunks.length} chunks`);
 
                 if (chunks.length > 0) {
-                    const chunkProgress = logger.progress(`Embedding chunks for ${url}`, chunks.length);
+                    const chunkProgress = logger.progress(`Processing chunks for ${url}`, chunks.length);
 
                     for (let i = 0; i < chunks.length; i++) {
                         const chunk = chunks[i];
@@ -610,7 +610,7 @@ export class Doc2Vec {
                     logger.info(`Created ${chunks.length} chunks`);
                     
                     if (chunks.length > 0) {
-                        const chunkProgress = logger.progress(`Embedding chunks for ${filePath}`, chunks.length);
+                        const chunkProgress = logger.progress(`Processing chunks for ${filePath}`, chunks.length);
                         
                         for (let i = 0; i < chunks.length; i++) {
                             const chunk = chunks[i];
@@ -803,7 +803,7 @@ export class Doc2Vec {
                         logger.info(`Created ${chunks.length} chunks`);
 
                         if (chunks.length > 0) {
-                            const chunkProgress = logger.progress(`Embedding chunks for ${relativePath || filePath}`, chunks.length);
+                            const chunkProgress = logger.progress(`Processing chunks for ${relativePath || filePath}`, chunks.length);
 
                             for (let i = 0; i < chunks.length; i++) {
                                 const chunk = chunks[i];

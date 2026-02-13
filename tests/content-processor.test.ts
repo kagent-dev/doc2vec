@@ -828,10 +828,7 @@ describe('ContentProcessor', () => {
         };
 
         it('should skip already visited URLs', async () => {
-            vi.spyOn(processor as any, 'processPage').mockResolvedValue('# Content');
-            vi.spyOn(axios, 'get').mockResolvedValue({
-                data: '<html><body><p>No links</p></body></html>'
-            } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
 
             const visited = new Set<string>();
             visited.add('https://example.com/');
@@ -843,10 +840,7 @@ describe('ContentProcessor', () => {
         });
 
         it('should skip URLs with unsupported extensions (shouldProcessUrl)', async () => {
-            const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue('# Content');
-            vi.spyOn(axios, 'get').mockResolvedValue({
-                data: '<html><body><p>No links</p></body></html>'
-            } as any);
+            const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com/image.jpg' });
 
             const visited = new Set<string>();
             const processContent = vi.fn();
@@ -877,10 +871,9 @@ describe('ContentProcessor', () => {
                     <url><loc>https://example.com/from-sitemap</loc></url>
                 </urlset>`;
 
-            const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue('# Content');
+            const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
             vi.spyOn(axios, 'get')
-                .mockResolvedValueOnce({ data: sitemapXml } as any) // parseSitemap call
-                .mockResolvedValue({ data: '<html><body><p>No links</p></body></html>' } as any); // link discovery
+                .mockResolvedValueOnce({ data: sitemapXml } as any); // parseSitemap call only
 
             const visited = new Set<string>();
             const processContent = vi.fn();
@@ -892,19 +885,15 @@ describe('ContentProcessor', () => {
             await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited);
 
             // processPage should be called for baseUrl AND the sitemap URL
-            expect(processPageSpy).toHaveBeenCalledWith('https://example.com', expect.anything(), expect.any(Function));
-            expect(processPageSpy).toHaveBeenCalledWith('https://example.com/from-sitemap', expect.anything(), expect.any(Function));
+            expect(processPageSpy).toHaveBeenCalledWith('https://example.com', expect.anything(), expect.any(Function), expect.anything());
+            expect(processPageSpy).toHaveBeenCalledWith('https://example.com/from-sitemap', expect.anything(), expect.any(Function), expect.anything());
         });
 
         it('should discover links from crawled pages and add them to queue', async () => {
-            const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue('# Content');
-            vi.spyOn(axios, 'get')
-                .mockResolvedValueOnce({
-                    data: '<html><body><a href="/page2">Page 2</a></body></html>'
-                } as any)
-                .mockResolvedValueOnce({
-                    data: '<html><body><p>No more links</p></body></html>'
-                } as any);
+            // First call returns links that include /page2, second call returns no links
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Content', links: ['/page2'], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Content', links: [], finalUrl: 'https://example.com/page2' });
 
             const visited = new Set<string>();
             const processContent = vi.fn();
@@ -936,35 +925,39 @@ describe('ContentProcessor', () => {
                 .mockResolvedValue('# PDF Content');
 
             const result = await processor.processPage('https://example.com/doc.pdf', pageConfig);
-            expect(result).toBe('# PDF Content');
+            expect(result.content).toBe('# PDF Content');
+            expect(result.links).toEqual([]);
             expect(pdfSpy).toHaveBeenCalledWith('https://example.com/doc.pdf', expect.anything());
         });
 
-        it('should return null when PDF content exceeds max_size', async () => {
+        it('should return null content when PDF content exceeds max_size', async () => {
             const bigContent = 'x'.repeat(200);
             vi.spyOn(processor as any, 'downloadAndConvertPdfFromUrl')
                 .mockResolvedValue(bigContent);
 
             const smallConfig = { ...pageConfig, max_size: 100 };
             const result = await processor.processPage('https://example.com/doc.pdf', smallConfig);
-            expect(result).toBeNull();
+            expect(result.content).toBeNull();
         });
 
-        it('should return null when PDF processing throws error', async () => {
+        it('should return null content when PDF processing throws error', async () => {
             vi.spyOn(processor as any, 'downloadAndConvertPdfFromUrl')
                 .mockRejectedValue(new Error('PDF parse error'));
 
             const result = await processor.processPage('https://example.com/doc.pdf', pageConfig);
-            expect(result).toBeNull();
+            expect(result.content).toBeNull();
         });
 
-        it('should return null when HTML content exceeds max_size', async () => {
+        it('should return null content when HTML content exceeds max_size', async () => {
             const bigHtml = '<p>' + 'x'.repeat(200) + '</p>';
             const puppeteerModule = await import('puppeteer');
 
             const mockPage = {
                 goto: vi.fn().mockResolvedValue(undefined),
-                evaluate: vi.fn().mockResolvedValue(bigHtml),
+                evaluate: vi.fn()
+                    .mockResolvedValueOnce([])  // link extraction
+                    .mockResolvedValueOnce(bigHtml),  // content extraction
+                url: vi.fn().mockReturnValue('https://example.com/page'),
             };
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
@@ -975,16 +968,19 @@ describe('ContentProcessor', () => {
 
             const smallConfig = { ...pageConfig, max_size: 100 };
             const result = await processor.processPage('https://example.com/page', smallConfig);
-            expect(result).toBeNull();
+            expect(result.content).toBeNull();
         });
 
-        it('should return null when Readability fails to parse', async () => {
+        it('should return null content when Readability fails to parse', async () => {
             const puppeteerModule = await import('puppeteer');
 
             // Return HTML that Readability will reject (empty/minimal content below charThreshold)
             const mockPage = {
                 goto: vi.fn().mockResolvedValue(undefined),
-                evaluate: vi.fn().mockResolvedValue(''),
+                evaluate: vi.fn()
+                    .mockResolvedValueOnce([])  // link extraction
+                    .mockResolvedValueOnce(''),  // content extraction
+                url: vi.fn().mockReturnValue('https://example.com/page'),
             };
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
@@ -995,15 +991,15 @@ describe('ContentProcessor', () => {
 
             const result = await processor.processPage('https://example.com/page', pageConfig);
             // With empty content, JSDOM + Readability will fail to extract an article
-            expect(result).toBeNull();
+            expect(result.content).toBeNull();
         });
 
-        it('should return null when puppeteer throws an error', async () => {
+        it('should return null content when puppeteer throws an error', async () => {
             const puppeteerModule = await import('puppeteer');
             vi.spyOn(puppeteerModule.default, 'launch').mockRejectedValue(new Error('Browser launch failed'));
 
             const result = await processor.processPage('https://example.com/page', pageConfig);
-            expect(result).toBeNull();
+            expect(result.content).toBeNull();
         });
     });
 
