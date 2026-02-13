@@ -18,6 +18,8 @@ import { DatabaseManager } from '../database';
 import { Logger, LogLevel } from '../logger';
 import type { WebsiteSourceConfig } from '../types';
 
+const TEST_EMBEDDING_DIMENSION = 3072;
+
 describe('MCP server helpers', () => {
     it('normalizes extensions to lowercase and dot-prefixed', () => {
         expect(normalizeExtensions(['ts', '.JS', 'Md'])).toEqual(['.ts', '.js', '.md']);
@@ -310,7 +312,7 @@ describe('MCP server end-to-end', () => {
         sqliteVec.load(db);
         db.exec(`
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-                embedding FLOAT[3072],
+                embedding FLOAT[${TEST_EMBEDDING_DIMENSION}],
                 product_name TEXT,
                 version TEXT,
                 branch TEXT,
@@ -341,7 +343,7 @@ describe('MCP server end-to-end', () => {
             };
 
             const chunks = await processor.chunkMarkdown(markdown, sourceConfig, baseUrl);
-            const embedding = new Array(3072).fill(0.1);
+            const embedding = new Array(TEST_EMBEDDING_DIMENSION).fill(0.1);
             for (const chunk of chunks) {
                 chunk.metadata.branch = '';
                 chunk.metadata.repo = '';
