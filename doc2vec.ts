@@ -37,6 +37,7 @@ export class Doc2Vec {
     private config: Config;
     private openai: OpenAI | AzureOpenAI;
     private embeddingModel: string;
+    private embeddingDimension: number;
     private contentProcessor: ContentProcessor;
     private logger: Logger;
     private configDir: string;
@@ -77,7 +78,8 @@ export class Doc2Vec {
                 apiVersion: azureApiVersion,
             });
             this.embeddingModel = azureDeploymentName;
-            this.logger.info(`Using Azure OpenAI with deployment: ${azureDeploymentName}`);
+            this.embeddingDimension = Utils.getEmbeddingDimension(azureDeploymentName);
+            this.logger.info(`Using Azure OpenAI with deployment: ${azureDeploymentName} (${this.embeddingDimension} dimensions)`);
         } else {
             const openaiApiKey = embeddingConfig.openai?.api_key || process.env.OPENAI_API_KEY;
             const openaiModel = embeddingConfig.openai?.model || process.env.OPENAI_MODEL || 'text-embedding-3-large';
@@ -89,7 +91,8 @@ export class Doc2Vec {
             
             this.openai = new OpenAI({ apiKey: openaiApiKey });
             this.embeddingModel = openaiModel;
-            this.logger.info(`Using OpenAI with model: ${openaiModel}`);
+            this.embeddingDimension = Utils.getEmbeddingDimension(openaiModel);
+            this.logger.info(`Using OpenAI with model: ${openaiModel} (${this.embeddingDimension} dimensions)`);
         }
         
         this.contentProcessor = new ContentProcessor(this.logger);
@@ -397,7 +400,7 @@ export class Doc2Vec {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for GitHub repo: ${config.repo}`);
         
-        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
         
         // Initialize metadata storage
         await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
@@ -414,8 +417,8 @@ export class Doc2Vec {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for website: ${config.url}`);
         
-        const dbConnection = await DatabaseManager.initDatabase(config, logger);
-        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+    const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
+    await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
         const validChunkIds: Set<string> = new Set();
         const visitedUrls: Set<string> = new Set();
         const urlPrefix = Utils.getUrlPrefix(config.url);
@@ -539,7 +542,7 @@ export class Doc2Vec {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for local directory: ${config.path}`);
         
-        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
         const validChunkIds: Set<string> = new Set();
         const processedFiles: Set<string> = new Set();
         
@@ -611,7 +614,7 @@ export class Doc2Vec {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for code source (${config.source})`);
 
-        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
         const validChunkIds: Set<string> = new Set();
         const processedFiles: Set<string> = new Set();
 
@@ -765,10 +768,10 @@ export class Doc2Vec {
                         }
                     }
 
-                    await DatabaseManager.setMetadataValue(dbConnection, fileListKey, JSON.stringify(currentList), logger);
+                    await DatabaseManager.setMetadataValue(dbConnection, fileListKey, JSON.stringify(currentList), logger, this.embeddingDimension);
                     if (lastMtimeKey) {
                         const nextMtime = maxObservedMtime > 0 ? maxObservedMtime : Date.now();
-                        await DatabaseManager.setMetadataValue(dbConnection, lastMtimeKey, `${nextMtime}`, logger);
+                        await DatabaseManager.setMetadataValue(dbConnection, lastMtimeKey, `${nextMtime}`, logger, this.embeddingDimension);
                     }
                 }
             } else {
@@ -785,7 +788,7 @@ export class Doc2Vec {
                 const headSha = await this.getRepoHeadSha(basePath, logger);
                 if (headSha) {
                     const shaKey = this.buildCodeShaMetadataKey(config.repo as string, repoBranch);
-                    await DatabaseManager.setMetadataValue(dbConnection, shaKey, headSha, logger);
+                    await DatabaseManager.setMetadataValue(dbConnection, shaKey, headSha, logger, this.embeddingDimension);
                 }
             }
 
@@ -974,7 +977,7 @@ export class Doc2Vec {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for Zendesk: ${config.zendesk_subdomain}.zendesk.com`);
         
-        const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
         
         // Initialize metadata storage
         await DatabaseManager.initDatabaseMetadata(dbConnection, logger);

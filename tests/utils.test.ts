@@ -341,6 +341,34 @@ describe('Utils', () => {
         });
     });
 
+    // ─── getEmbeddingDimension ──────────────────────────────────────
+    describe('getEmbeddingDimension', () => {
+        it('should return 1536 for text-embedding-3-small', () => {
+            expect(Utils.getEmbeddingDimension('text-embedding-3-small')).toBe(1536);
+        });
+
+        it('should return 3072 for text-embedding-3-large', () => {
+            expect(Utils.getEmbeddingDimension('text-embedding-3-large')).toBe(3072);
+        });
+
+        it('should return 1536 for text-embedding-ada-002', () => {
+            expect(Utils.getEmbeddingDimension('text-embedding-ada-002')).toBe(1536);
+        });
+
+        it('should return 3072 for gemini models', () => {
+            expect(Utils.getEmbeddingDimension('gemini-embedding-001')).toBe(3072);
+        });
+
+        it('should be case-insensitive', () => {
+            expect(Utils.getEmbeddingDimension('TEXT-EMBEDDING-3-SMALL')).toBe(1536);
+            expect(Utils.getEmbeddingDimension('Text-Embedding-3-Large')).toBe(3072);
+        });
+
+        it('should return 1536 for unknown models', () => {
+            expect(Utils.getEmbeddingDimension('unknown-model')).toBe(1536);
+        });
+    });
+
     // ─── shouldProcessUrl - invalid URL ─────────────────────────────
     describe('shouldProcessUrl - invalid URL', () => {
         it('should throw on invalid URL', () => {
