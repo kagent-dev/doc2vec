@@ -194,6 +194,9 @@ describe('Doc2Vec class', () => {
         }) as any;
         process.exit = mockProcessExit as any;
 
+        // Provide a dummy API key so the constructor validation doesn't call process.exit
+        process.env.OPENAI_API_KEY = 'test-key-for-tests';
+
         // Ensure test config directory exists
         if (!fs.existsSync(testConfigDir)) {
             fs.mkdirSync(testConfigDir, { recursive: true });
