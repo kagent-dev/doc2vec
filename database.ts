@@ -385,11 +385,11 @@ export class DatabaseManager {
                 ];
 
                 if (hasBranchColumn) {
-                    insertValues.push(chunk.metadata.branch ?? null);
+                    insertValues.push(chunk.metadata.branch ?? '');
                 }
 
                 if (hasRepoColumn) {
-                    insertValues.push(chunk.metadata.repo ?? null);
+                    insertValues.push(chunk.metadata.repo ?? '');
                 }
 
                 insertValues.push(
@@ -412,11 +412,11 @@ export class DatabaseManager {
                 ];
 
                 if (hasBranchColumn) {
-                    updateValues.push(chunk.metadata.branch ?? null);
+                    updateValues.push(chunk.metadata.branch ?? '');
                 }
 
                 if (hasRepoColumn) {
-                    updateValues.push(chunk.metadata.repo ?? null);
+                    updateValues.push(chunk.metadata.repo ?? '');
                 }
 
                 updateValues.push(

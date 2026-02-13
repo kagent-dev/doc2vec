@@ -263,86 +263,126 @@ export class ContentProcessor {
         let errorCount = 0;
         let hasNetworkErrors = false;
 
-        while (queue.length > 0) {
-            const url = queue.shift();
-            if (!url) continue;
+        // Launch a single browser instance and reuse one page (tab) for all URLs
+        let browser: Browser | null = null;
+        let page: Page | null = null;
 
-            const normalizedUrl = Utils.normalizeUrl(url);
-            if (visitedUrls.has(normalizedUrl)) continue;
-            visitedUrls.add(normalizedUrl);
-
-            if (!Utils.shouldProcessUrl(url)) {
-                logger.debug(`Skipping URL with unsupported extension: ${url}`);
-                skippedCount++;
-                continue;
+        const launchBrowser = async (): Promise<{ browser: Browser; page: Page }> => {
+            let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
+            if (!executablePath) {
+                if (fs.existsSync('/usr/bin/chromium')) {
+                    executablePath = '/usr/bin/chromium';
+                } else if (fs.existsSync('/usr/bin/chromium-browser')) {
+                    executablePath = '/usr/bin/chromium-browser';
+                }
             }
+            const b = await puppeteer.launch({
+                executablePath,
+                args: ['--no-sandbox', '--disable-setuid-sandbox'],
+            });
+            const p = await b.newPage();
+            return { browser: b, page: p };
+        };
 
-            try {
-                logger.info(`Crawling: ${url}`);
-                const sources = referrers.get(url) ?? new Set([baseUrl]);
-                const content = await this.processPage(url, sourceConfig, (reportedUrl, status) => {
-                    if (status === 404) {
-                        for (const source of sources) {
-                            addBrokenLink(source, reportedUrl);
-                        }
-                    }
-                });
+        const ensureBrowser = async (): Promise<Page> => {
+            if (!browser || !browser.isConnected()) {
+                logger.info(browser ? 'Browser disconnected, relaunching...' : 'Launching browser...');
+                const launched = await launchBrowser();
+                browser = launched.browser;
+                page = launched.page;
+            }
+            return page!;
+        };
 
-                if (content !== null) {
-                    await processPageContent(url, content);
-                    if (Utils.isPdfUrl(url)) {
-                        pdfProcessedCount++;
-                    } else {
-                        processedCount++;
-                    }
-                } else {
-                    skippedSizeCount++;
+        try {
+            while (queue.length > 0) {
+                const url = queue.shift();
+                if (!url) continue;
+
+                const normalizedUrl = Utils.normalizeUrl(url);
+                if (visitedUrls.has(normalizedUrl)) continue;
+                visitedUrls.add(normalizedUrl);
+
+                if (!Utils.shouldProcessUrl(url)) {
+                    logger.debug(`Skipping URL with unsupported extension: ${url}`);
+                    skippedCount++;
+                    continue;
                 }
 
-                // Only try to extract links from HTML pages, not PDFs
-                if (!Utils.isPdfUrl(url)) {
-                    const response = await axios.get(url);
-                    const $ = load(response.data);
-                    const pageUrlForLinks = response?.request?.res?.responseUrl || url;
+                try {
+                    logger.info(`Crawling: ${url}`);
+                    const sources = referrers.get(url) ?? new Set([baseUrl]);
 
-                    logger.debug(`Finding links on page ${url}`);
-                    let newLinksFound = 0;
+                    // For HTML pages, ensure the browser is running and pass the shared page
+                    // For PDFs, processPage handles them without Puppeteer
+                    const currentPage = Utils.isPdfUrl(url) ? undefined : await ensureBrowser();
 
-                    $('a[href]').each((_, element) => {
-                        const href = $(element).attr('href');
-                        if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
+                    const result = await this.processPage(url, sourceConfig, (reportedUrl, status) => {
+                        if (status === 404) {
+                            for (const source of sources) {
+                                addBrokenLink(source, reportedUrl);
+                            }
+                        }
+                    }, currentPage);
 
-                        const fullUrl = Utils.buildUrl(href, pageUrlForLinks);
-                        if (fullUrl.startsWith(sourceConfig.url)) {
-                            addReferrer(fullUrl, pageUrlForLinks);
-                            if (!visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
-                                if (!queue.includes(fullUrl)) {
-                                    queue.push(fullUrl);
-                                    newLinksFound++;
+                    if (result.content !== null) {
+                        await processPageContent(url, result.content);
+                        if (Utils.isPdfUrl(url)) {
+                            pdfProcessedCount++;
+                        } else {
+                            processedCount++;
+                        }
+                    } else {
+                        skippedSizeCount++;
+                    }
+
+                    // Use links extracted from the full rendered DOM by processPage
+                    // (no separate axios request needed)
+                    if (result.links.length > 0) {
+                        const pageUrlForLinks = result.finalUrl || url;
+                        logger.debug(`Finding links on page ${url}`);
+                        let newLinksFound = 0;
+
+                        for (const href of result.links) {
+                            const fullUrl = Utils.buildUrl(href, pageUrlForLinks);
+                            if (fullUrl.startsWith(sourceConfig.url)) {
+                                addReferrer(fullUrl, pageUrlForLinks);
+                                if (!visitedUrls.has(Utils.normalizeUrl(fullUrl))) {
+                                    if (!queue.includes(fullUrl)) {
+                                        queue.push(fullUrl);
+                                        newLinksFound++;
+                                    }
                                 }
                             }
                         }
-                    });
 
-                    logger.debug(`Found ${newLinksFound} new links on ${url}`);
-                }
-            } catch (error: any) {
-                logger.error(`Failed during processing or link discovery for ${url}:`, error);
-                errorCount++;
+                        logger.debug(`Found ${newLinksFound} new links on ${url}`);
+                    }
+                } catch (error: any) {
+                    logger.error(`Failed during processing or link discovery for ${url}:`, error);
+                    errorCount++;
 
-                const status = this.getHttpStatus(error);
-                if (status === 404) {
-                    const sources = referrers.get(url) ?? new Set([baseUrl]);
-                    for (const source of sources) {
-                        addBrokenLink(source, url);
+                    const status = this.getHttpStatus(error);
+                    if (status === 404) {
+                        const sources = referrers.get(url) ?? new Set([baseUrl]);
+                        for (const source of sources) {
+                            addBrokenLink(source, url);
+                        }
+                    }
+                    
+                    // Check if this is a network error (DNS resolution, connection issues, etc.)
+                    if (this.isNetworkError(error)) {
+                        hasNetworkErrors = true;
+                        logger.warn(`Network error detected for ${url}, this may affect cleanup decisions`);
                     }
                 }
-                
-                // Check if this is a network error (DNS resolution, connection issues, etc.)
-                if (this.isNetworkError(error)) {
-                    hasNetworkErrors = true;
-                    logger.warn(`Network error detected for ${url}, this may affect cleanup decisions`);
-                }
+            }
+        } finally {
+            // Close the shared browser instance when the crawl is done
+            const browserToClose = browser as Browser | null;
+            if (browserToClose && browserToClose.isConnected()) {
+                await browserToClose.close();
+                logger.debug('Shared browser closed after crawl completed');
             }
         }
 
@@ -394,8 +434,9 @@ export class ContentProcessor {
     async processPage(
         url: string,
         sourceConfig: SourceConfig,
-        onHttpStatus?: (url: string, status: number) => void
-    ): Promise<string | null> {
+        onHttpStatus?: (url: string, status: number) => void,
+        existingPage?: Page
+    ): Promise<{ content: string | null, links: string[], finalUrl: string }> {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing content from ${url}`);
 
@@ -408,10 +449,10 @@ export class ContentProcessor {
                 // Check size limit for PDF content
                 if (markdown.length > sourceConfig.max_size) {
                     logger.warn(`PDF content (${markdown.length} chars) exceeds max size (${sourceConfig.max_size}). Skipping ${url}.`);
-                    return null;
+                    return { content: null, links: [], finalUrl: url };
                 }
                 
-                return markdown;
+                return { content: markdown, links: [], finalUrl: url };
             } catch (error) {
                 const status = this.getHttpStatus(error);
                 if (status !== undefined && status >= 400) {
@@ -421,28 +462,36 @@ export class ContentProcessor {
                     throw error;
                 }
                 logger.error(`Failed to process PDF ${url}:`, error);
-                return null;
+                return { content: null, links: [], finalUrl: url };
             }
         }
 
-        // Original HTML page processing logic
+        // HTML page processing logic
+        // If an existing page (tab) is provided, reuse it; otherwise launch a standalone browser
         let browser: Browser | null = null;
+        let page: Page;
+        const ownsTheBrowser = !existingPage;
         try {
-            // Use system Chromium if available (for Docker environments)
-            let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
-            if (!executablePath) {
-                if (fs.existsSync('/usr/bin/chromium')) {
-                    executablePath = '/usr/bin/chromium';
-                } else if (fs.existsSync('/usr/bin/chromium-browser')) {
-                    executablePath = '/usr/bin/chromium-browser';
+            if (existingPage) {
+                page = existingPage;
+            } else {
+                // Standalone mode: launch a browser for this single page
+                let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
+                if (!executablePath) {
+                    if (fs.existsSync('/usr/bin/chromium')) {
+                        executablePath = '/usr/bin/chromium';
+                    } else if (fs.existsSync('/usr/bin/chromium-browser')) {
+                        executablePath = '/usr/bin/chromium-browser';
+                    }
                 }
+                
+                browser = await puppeteer.launch({
+                    executablePath,
+                    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                });
+                page = await browser.newPage();
             }
-            
-            browser = await puppeteer.launch({
-                executablePath,
-                args: ['--no-sandbox', '--disable-setuid-sandbox'],
-            });
-            const page: Page = await browser.newPage();
+
             logger.debug(`Navigating to ${url}`);
             const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
             const status = response?.status();
@@ -452,8 +501,26 @@ export class ContentProcessor {
                 throw error;
             }
 
+            // Get the final URL after any redirects
+            const finalUrl = page.url();
+
+            // Extract ALL links from the full rendered DOM before any content filtering
+            // This searches the entire document, not just the main content area
+            const links: string[] = await page.evaluate(() => {
+                const anchors = document.querySelectorAll('a[href]');
+                const hrefs: string[] = [];
+                anchors.forEach(a => {
+                    const href = a.getAttribute('href');
+                    if (href && !href.startsWith('#') && !href.startsWith('mailto:')) {
+                        hrefs.push(href);
+                    }
+                });
+                return hrefs;
+            });
+            logger.debug(`Extracted ${links.length} links from full DOM of ${url}`);
+
             const htmlContent: string = await page.evaluate(() => {
-                // 💡 Try specific content selectors first, then fall back to broader ones
+                // Try specific content selectors first, then fall back to broader ones
                 const mainContentElement = 
                     document.querySelector('.docs-content') ||        // Common docs pattern
                     document.querySelector('.doc-content') ||         // Alternative docs pattern
@@ -467,8 +534,7 @@ export class ContentProcessor {
 
             if (htmlContent.length > sourceConfig.max_size) {
                 logger.warn(`Raw HTML content (${htmlContent.length} chars) exceeds max size (${sourceConfig.max_size}). Skipping detailed processing for ${url}.`);
-                await browser.close();
-                return null;
+                return { content: null, links, finalUrl };
             }
 
             logger.debug(`Got HTML content (${htmlContent.length} chars), creating DOM`);
@@ -481,7 +547,7 @@ export class ContentProcessor {
                 this.markCodeParents(pre.parentElement);
             });
 
-            // 💡 Extract H1s BEFORE Readability - it often strips them as "chrome"
+            // Extract H1s BEFORE Readability - it often strips them as "chrome"
             // We'll inject them back after Readability processing
             const h1Elements = document.querySelectorAll('h1');
             const extractedH1s: string[] = [];
@@ -505,8 +571,7 @@ export class ContentProcessor {
 
             if (!article) {
                 logger.warn(`Failed to parse article content with Readability for ${url}`);
-                await browser.close();
-                return null;
+                return { content: null, links, finalUrl };
             }
             
             // Debug: Log what Readability extracted
@@ -517,7 +582,7 @@ export class ContentProcessor {
             logger.debug(`[Readability Debug] Contains H2 tag: ${article.content?.includes('<h2')}`);
             logger.debug(`[Readability Debug] Contains original-h1 class: ${article.content?.includes('original-h1')}`);
 
-            // 💡 Restore H1s: find elements with our marker class and convert back from H2
+            // Restore H1s: find elements with our marker class and convert back from H2
             const articleDom = new JSDOM(article.content);
             const articleDoc = articleDom.window.document;
             const originalH1Elements = articleDoc.querySelectorAll('.original-h1');
@@ -557,7 +622,7 @@ export class ContentProcessor {
             logger.debug(`Converting HTML to Markdown`);
             let markdown = this.turndownService.turndown(cleanHtml);
             
-            // 💡 Inject extracted H1s back if they're not in the markdown
+            // Inject extracted H1s back if they're not in the markdown
             // Readability often strips them as "page chrome"
             // Use article.title as fallback if no H1 was extracted
             const pageTitle = extractedH1s.length > 0 ? extractedH1s[0] : (article.title?.trim() || '');
@@ -578,7 +643,7 @@ export class ContentProcessor {
             }
             
             logger.debug(`Markdown conversion complete (${markdown.length} chars)`);
-            return markdown;
+            return { content: markdown, links, finalUrl };
         } catch (error) {
             const status = this.getHttpStatus(error);
             if (status !== undefined && status >= 400) {
@@ -588,9 +653,10 @@ export class ContentProcessor {
                 throw error;
             }
             logger.error(`Error processing page ${url}:`, error);
-            return null;
+            return { content: null, links: [], finalUrl: url };
         } finally {
-            if (browser && browser.isConnected()) {
+            // Only close the browser if we launched it ourselves (standalone mode)
+            if (ownsTheBrowser && browser && browser.isConnected()) {
                  await browser.close();
                  logger.debug(`Browser closed for ${url}`);
             }
