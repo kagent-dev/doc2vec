@@ -1,6 +1,6 @@
 {
     "name": "doc2vec",
-    "version": "2.2.0",
+    "version": "2.3.0",
     "type": "commonjs",
     "description": "",
     "main": "dist/doc2vec.js",
