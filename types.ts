@@ -79,8 +79,23 @@ export interface QdrantDatabaseParams {
     collection_name?: string;
 }
 
+export interface EmbeddingConfig {
+    provider: 'openai' | 'azure';
+    openai?: {
+        api_key?: string;  // Can also use OPENAI_API_KEY env var
+        model?: string;    // Default: text-embedding-3-large
+    };
+    azure?: {
+        api_key?: string;        // Can also use AZURE_OPENAI_KEY env var
+        endpoint?: string;       // Can also use AZURE_OPENAI_ENDPOINT env var
+        deployment_name?: string; // Can also use AZURE_OPENAI_DEPLOYMENT_NAME env var
+        api_version?: string;    // Default: 2024-10-21
+    };
+}
+
 export interface Config {
     sources: SourceConfig[];
+    embedding?: EmbeddingConfig;  // Optional, defaults to OpenAI
 }
 
 export interface DocumentChunk {
