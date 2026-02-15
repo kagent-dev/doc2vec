@@ -5,10 +5,10 @@
 | Metric | Value |
 |--------|-------|
 | **Framework** | [Vitest](https://vitest.dev/) v4 |
-| **Total tests** | 436 |
-| **Test files** | 6 |
-| **Total lines** | ~5,200 |
-| **Execution time** | ~800ms |
+| **Total tests** | 470 |
+| **Test files** | 8 |
+| **Total lines** | ~8,000 |
+| **Execution time** | ~8s |
 
 ## Running Tests
 
@@ -29,10 +29,12 @@ npm run test:coverage
 |------|-------|--------|-------------|
 | `tests/utils.test.ts` | 64 | `utils.ts` | Hashing, UUID generation, URL utilities, tokenization |
 | `tests/logger.test.ts` | 47 | `logger.ts` | Log levels, formatting, colors, child loggers, progress bars |
-| `tests/content-processor.test.ts` | 137 | `content-processor.ts` | HTML conversion, chunking, crawling, PDF/DOC processing |
-| `tests/database.test.ts` | 68 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup |
+| `tests/content-processor.test.ts` | 153 | `content-processor.ts` | HTML conversion, chunking, crawling, PDF/DOC processing, tab preprocessing |
+| `tests/database.test.ts` | 72 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup, URL-level hash queries |
 | `tests/code-chunker.test.ts` | 62 | `code-chunker.ts` | AST-based code chunking, language support, merge behavior, function boundary integrity |
 | `tests/doc2vec.test.ts` | 58 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings |
+| `tests/mcp-server.test.ts` | 18 | `mcp/src/server.ts` | MCP server helpers, query handlers, SQLite/Qdrant providers, end-to-end |
+| `tests/e2e.test.ts` | 3 | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, and website source |
 
 ---
 
@@ -147,7 +149,7 @@ npm run test:coverage
 
 ---
 
-### `tests/content-processor.test.ts` (137 tests)
+### `tests/content-processor.test.ts` (153 tests)
 
 #### `convertHtmlToMarkdown`
 - Converts headings (H1-H6), bold, italic, links, lists, code blocks, inline code, blockquotes
@@ -244,9 +246,29 @@ npm run test:coverage
 - Does not detect axios errors with response or non-network errors
 - Handles null/undefined error
 
+#### `preprocessTabs`
+- Injects tab labels into panels matched by `aria-controls`
+- Uses positional fallback when `aria-controls` is missing
+- Removes tab buttons after processing
+- Makes hidden panels visible by removing `data-state`
+- Removes common hiding CSS classes from panels (`hx-hidden`, `d-none`)
+- Handles inline `display:none` style
+- Does nothing when no `role="tab"` elements exist
+- Skips tabs with empty labels
+- Works with Hextra-style tab HTML structure
+- Marks panels with `article-content` class for Readability
+- Does NOT duplicate labels when multiple tab groups share the same panel IDs
+
+#### `convertHtmlToMarkdown with tabs`
+- Converts tabbed HTML to markdown with tab labels
+- Does not affect HTML without tabs
+
+#### `tabs through full processPage pipeline`
+- Does NOT duplicate tab labels through full `processPage` pipeline (Puppeteer + JSDOM + Readability)
+
 ---
 
-### `tests/database.test.ts` (68 tests)
+### `tests/database.test.ts` (72 tests)
 
 #### `initDatabase`
 - **SQLite**: Generates default `db_path` from product_name and version; uses custom `db_path`; returns `SqliteDB` connection
@@ -290,6 +312,11 @@ npm run test:coverage
 #### `removeChunksByUrlSQLite`
 - Deletes all chunks matching a specific URL
 - Does not error when no chunks match
+
+#### `getChunkHashesByUrlSQLite`
+- Returns sorted hashes for chunks matching a URL
+- Returns empty array when no chunks match
+- Returns duplicate hashes correctly (preserves all entries)
 
 #### `removeObsoleteFilesSQLite`
 - Direct path mode: removes chunks for deleted files
@@ -488,6 +515,80 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 - Config with only code sources
 - Creates embeddings with correct model name (`text-embedding-3-large`)
 
+#### Mocks specific to `doc2vec.test.ts`
+- `DatabaseManager` is fully mocked with: `initDatabase`, `initDatabaseMetadata`, `prepareSQLiteStatements`, `insertVectorsSQLite`, `removeObsoleteChunksSQLite`, `removeObsoleteFilesSQLite`, `removeChunksByUrlSQLite`, `removeChunksByUrlQdrant`, `getChunkHashesByUrlSQLite`, `getChunkHashesByUrlQdrant`, `getMetadataValue`, `setMetadataValue`, `getLastRunDate`, `updateLastRunDate`, `storeChunkInQdrant`, `createCollectionQdrant`, `removeObsoleteChunksQdrant`, `removeObsoleteFilesQdrant`
+
+---
+
+### `tests/mcp-server.test.ts` (18 tests)
+
+#### `MCP server helpers`
+- `normalizeExtensions` normalizes extensions to lowercase and dot-prefixed
+- `filterResultsByUrl` filters results by URL prefix and extensions
+- `filterResultsWithContent` filters results with empty or non-string content
+
+#### `MCP query handlers`
+- Returns validation message when `query_documentation` params are missing
+- Filters empty content and URL prefix in `queryDocumentation`
+- Returns empty-content warning for `query_code` when all matches are empty
+- Formats `get_chunks` results with chunk index
+
+#### `SQLite provider compatibility`
+- Falls back when `chunk_index` column is missing (old database schema)
+- Resolves DB paths with normalized extension
+
+#### `Qdrant provider`
+- Maps `dbName` to collection and returns search results
+- Scrolls chunks and sorts by `chunk_index`
+
+#### `MCP server end-to-end`
+- Full pipeline: starts local HTTP server, fetches HTML, converts to Markdown, chunks, stores in SQLite, queries via MCP handler, and verifies the unique phrase is returned in results
+
+---
+
+### `tests/e2e.test.ts` (3 tests)
+
+End-to-end integration tests that validate the full processing pipeline — from source content through chunking, hashing, embedding, and storage — with URL-level change detection. Each test creates 3 documents, processes them, modifies only the 2nd, re-processes all 3, and verifies that only the modified document is re-embedded while the others are skipped entirely.
+
+**Components used (real, not mocked):**
+- SQLite with `better-sqlite3` + `sqlite-vec` (in-memory databases)
+- `ContentProcessor` (real chunking, HTML conversion, Puppeteer rendering)
+- `DatabaseManager` (real `insertVectorsSQLite`, `getChunkHashesByUrlSQLite`, `removeChunksByUrlSQLite`)
+- Chonkie + Tree-sitter (real AST-based code chunking for code source test)
+- Puppeteer (real headless browser for website source test)
+- Local HTTP server (for website source test)
+
+**Only embeddings are stubbed:** deterministic `Array(3072).fill(0.1)` with call tracking via `createEmbeddingTracker`.
+
+#### `E2E: Local Directory (Markdown)`
+- Creates 3 Markdown files in a temp directory
+- First run: all 3 files are chunked, embedded, and stored
+- Modifies only `doc2.md` (appends a paragraph)
+- Second run: only `doc2.md` is re-embedded; `doc1.md` and `doc3.md` are skipped
+- Verifies `chunk_index`/`total_chunks` consistency for all files
+- Verifies `doc1` and `doc3` chunks are byte-identical across runs
+- Verifies no orphaned chunks (total DB count equals sum of per-URL counts)
+
+#### `E2E: Code Source (Local Directory)`
+- Creates 3 TypeScript files in a temp directory (`greet`/`farewell`, `Calculator` class, `fetchData` async function)
+- Uses real Chonkie + Tree-sitter for AST-aware code chunking
+- First run: all 3 files are chunked, embedded, and stored
+- Modifies only `file2.ts` (adds `subtract` and `divide` methods to Calculator)
+- Second run: only `file2.ts` is re-embedded; `file1.ts` and `file3.ts` are skipped
+- Verifies `chunk_index`/`total_chunks` consistency for all files
+- Verifies `file1` and `file3` chunks are byte-identical across runs
+- Verifies no orphaned chunks
+
+#### `E2E: Website Source` (60s timeout)
+- Starts a local HTTP server serving 3 HTML pages
+- Uses real Puppeteer to render each page via `processPage`
+- First run: all 3 pages are processed, chunked, embedded, and stored
+- Modifies only page 2 content (adds a paragraph via mutable `pageContent` map)
+- Second run: only page 2 is re-embedded; pages 1 and 3 are skipped
+- Verifies `chunk_index`/`total_chunks` consistency for all pages
+- Verifies page 1 and page 3 chunks are byte-identical across runs
+- Verifies no orphaned chunks
+
 ---
 
 ## Mocking Strategy
@@ -508,6 +609,9 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 - `ContentProcessor` with suppressed logger (`LogLevel.NONE`)
 - `TurndownService` (HTML-to-Markdown conversion)
 - `web-tree-sitter` (AST parsing for code chunking)
+- Puppeteer (E2E website test uses real headless browser)
+- Chonkie + Tree-sitter (E2E code test uses real AST-based chunking)
+- Local HTTP server (E2E website test serves pages via `http.createServer`)
 - Filesystem operations (temp directories created/cleaned per test)
 
 ### Private method access:

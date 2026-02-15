@@ -600,6 +600,52 @@ export class DatabaseManager {
         }
     }
 
+    /**
+     * Fetch all stored chunk content hashes for a given URL.
+     * Returns a sorted array of hash strings for comparison.
+     */
+    static getChunkHashesByUrlSQLite(db: Database, url: string): string[] {
+        const stmt = db.prepare('SELECT hash FROM vec_items WHERE url = ?');
+        const rows = stmt.all(url) as { hash: string }[];
+        return rows.map(r => r.hash).sort();
+    }
+
+    /**
+     * Fetch all stored chunk content hashes for a given URL from Qdrant.
+     * Returns a sorted array of hash strings for comparison.
+     */
+    static async getChunkHashesByUrlQdrant(db: QdrantDB, url: string): Promise<string[]> {
+        const { client, collectionName } = db;
+        try {
+            const response = await client.scroll(collectionName, {
+                limit: 10000,
+                with_payload: { include: ['hash'] },
+                with_vector: false,
+                filter: {
+                    must: [
+                        {
+                            key: 'url',
+                            match: { value: url }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: 'is_metadata',
+                            match: { value: true }
+                        }
+                    ]
+                }
+            });
+            return response.points
+                .map((point: any) => point.payload?.hash as string)
+                .filter(Boolean)
+                .sort();
+        } catch (error) {
+            // On error, return empty array so the caller treats it as "changed" (safe default)
+            return [];
+        }
+    }
+
     static removeObsoleteFilesSQLite(
         db: Database, 
         processedFiles: Set<string>, 

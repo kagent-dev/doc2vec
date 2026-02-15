@@ -28,6 +28,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
     *   **Smart H1 Preservation:** Automatically extracts and preserves page titles (H1 headings) that Readability might strip as "page chrome", ensuring proper heading hierarchy.
     *   **Flexible Content Selectors:** Supports multiple content container patterns (`.docs-content`, `.doc-content`, `.markdown-body`, `article`, etc.) for better compatibility with various documentation sites.
+    *   **Tabbed Content Support:** Automatically detects WAI-ARIA tabs (`role="tab"` / `role="tabpanel"`) and injects tab labels into panel content so each tab's context is preserved after conversion to Markdown.
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
     *   **Clean Heading Text:** Automatically removes anchor links (like `[](#section-id)`) from heading text for cleaner hierarchy display.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
@@ -35,7 +36,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
     *   **SQLite:** Using `better-sqlite3` and the `sqlite-vec` extension for efficient vector search.
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
-*   **Change Detection:** Uses content hashing to detect changes and only re-embeds and updates chunks that have actually been modified.
+*   **Change Detection:** Uses URL-level content hashing to detect changes. All chunk hashes for a URL are compared against stored values; unchanged URLs are skipped entirely, while changed URLs are fully re-processed with correct chunk ordering and no orphaned chunks.
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
@@ -520,13 +521,36 @@ If you don't specify a config path, it will look for config.yaml in the current 
           *   Track last run date to support incremental updates.
     3.  **Process Content:** For each processed page, issue, or file:
         *   **Chunk:** Split Markdown into smaller `DocumentChunk` objects based on headings and size.
-        *   **Hash Check:** Generate a hash of the chunk content. Check if a chunk with the same ID exists in the DB and if its hash matches.
-        *   **Embed (if needed):** If the chunk is new or changed, call the OpenAI API (`createEmbeddings`) to get the vector embedding.
-        *   **Store:** Insert or update the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
+        *   **URL-Level Change Detection:** Compute content hashes for all new chunks and compare them against stored hashes for that URL. If all hashes match, the entire URL is skipped (no embedding or DB writes needed).
+        *   **Re-process (if changed):** If any hash differs, delete all existing chunks for the URL and re-embed/insert all new chunks. This ensures consistent `chunk_index`/`total_chunks` values and eliminates orphaned chunks when content shifts (e.g., a paragraph is added in the middle).
+        *   **Embed:** Call the OpenAI API (`createEmbeddings`) to get the vector embedding for each chunk.
+        *   **Store:** Insert the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
     4.  **Cleanup:** After processing, remove any obsolete chunks from the database.
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Tabbed Content Support
+- Automatically detects tabbed UI components using the WAI-ARIA tabs pattern (`role="tab"` + `role="tabpanel"`)
+- Injects tab labels (e.g., "Anthropic v1/messages", "OpenAI-compatible") as bold headings into each panel's content
+- Makes hidden tab panels visible so all tab content is captured, not just the selected tab
+- Handles pages with multiple tab groups that share the same panel IDs
+- Falls back to positional matching when `aria-controls` attributes are missing
+- Works in both the Puppeteer crawl pipeline and the standalone `convertHtmlToMarkdown` method
+
+### URL-Level Change Detection
+- Replaced per-chunk hash comparison with URL-level change detection across all source types (website, local directory, code, Zendesk)
+- Computes content hashes for all chunks of a URL and compares them against stored hashes in a single DB query
+- Unchanged URLs are skipped entirely (no embedding API calls, no DB writes)
+- Changed URLs get all old chunks deleted and fresh chunks inserted with correct `chunk_index` and `total_chunks`
+- Eliminates orphaned chunks and inconsistent metadata that occurred when content shifted (e.g., a paragraph added in the middle)
+- Consolidated four duplicated chunk processing loops into a single shared `processChunksForUrl` method
+
+### Puppeteer Resilience
+- Added `protocolTimeout: 60000` to browser launch to fail faster on stuck protocol calls (down from default 180s)
+- Added `evaluateWithTimeout` helper that wraps `page.evaluate` calls with a 30-second timeout to prevent indefinite hangs on pages with heavy/infinite JavaScript
+- Added `about:blank` navigation between pages to clear lingering JavaScript, timers, WebSocket connections, and event listeners
+- Added automatic page recreation after errors: when a page times out or errors, the next URL gets a fresh tab instead of reusing the potentially corrupted page
 
 ### Word Document Support
 - Added support for legacy `.doc` files using the `word-extractor` library

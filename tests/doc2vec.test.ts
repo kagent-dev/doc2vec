@@ -72,6 +72,8 @@ vi.mock('../database', () => ({
         removeObsoleteFilesQdrant: vi.fn().mockResolvedValue(undefined),
         removeChunksByUrlSQLite: vi.fn(),
         removeChunksByUrlQdrant: vi.fn().mockResolvedValue(undefined),
+        getChunkHashesByUrlSQLite: vi.fn().mockReturnValue([]),
+        getChunkHashesByUrlQdrant: vi.fn().mockResolvedValue([]),
     },
 }));
 

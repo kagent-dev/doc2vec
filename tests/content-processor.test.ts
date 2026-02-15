@@ -1577,6 +1577,352 @@ describe('ContentProcessor', () => {
         });
     });
 
+    // ─── preprocessTabs ──────────────────────────────────────────────
+    describe('preprocessTabs', () => {
+        const preprocessTabs = (html: string) => {
+            const { JSDOM } = require('jsdom');
+            const dom = new JSDOM(html);
+            (processor as any).preprocessTabs(dom.window.document, testLogger);
+            return dom.window.document.body.innerHTML;
+        };
+
+        it('should inject tab labels into panels matched by aria-controls', () => {
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="panel-0">Tab One</button>
+                    <button role="tab" aria-controls="panel-1">Tab Two</button>
+                </div>
+                <div role="tabpanel" id="panel-0"><p>Content A</p></div>
+                <div role="tabpanel" id="panel-1"><p>Content B</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).toContain('<strong>Tab One:</strong>');
+            expect(result).toContain('<strong>Tab Two:</strong>');
+            expect(result).toContain('Content A');
+            expect(result).toContain('Content B');
+        });
+
+        it('should use positional fallback when aria-controls is missing', () => {
+            const html = `
+                <div>
+                    <button role="tab">First</button>
+                    <button role="tab">Second</button>
+                </div>
+                <div role="tabpanel"><p>Panel 1</p></div>
+                <div role="tabpanel"><p>Panel 2</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).toContain('<strong>First:</strong>');
+            expect(result).toContain('<strong>Second:</strong>');
+        });
+
+        it('should remove tab buttons after processing', () => {
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="p0">My Tab</button>
+                </div>
+                <div role="tabpanel" id="p0"><p>Panel content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            // Tab button itself should be removed
+            expect(result).not.toContain('role="tab"');
+            // But label should be injected into panel
+            expect(result).toContain('<strong>My Tab:</strong>');
+        });
+
+        it('should make hidden panels visible by removing data-state', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Visible</button>
+                <button role="tab" aria-controls="p1">Hidden</button>
+                <div role="tabpanel" id="p0" data-state="selected"><p>A</p></div>
+                <div role="tabpanel" id="p1" data-state=""><p>B</p></div>
+            `;
+            const result = preprocessTabs(html);
+            // Both panels should have data-state="selected"
+            expect(result).not.toContain('data-state=""');
+        });
+
+        it('should remove common hiding CSS classes from panels', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Tab</button>
+                <div role="tabpanel" id="p0" class="hx-hidden hidden d-none"><p>Content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).not.toContain('hx-hidden');
+            expect(result).not.toContain('"hidden"');
+            expect(result).not.toContain('d-none');
+        });
+
+        it('should handle inline display:none style', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Tab</button>
+                <div role="tabpanel" id="p0" style="display: none;"><p>Content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).not.toContain('display: none');
+        });
+
+        it('should do nothing when no role="tab" elements exist', () => {
+            const html = '<div><p>No tabs here</p></div>';
+            const result = preprocessTabs(html);
+            expect(result).toContain('No tabs here');
+        });
+
+        it('should skip tabs with empty labels', () => {
+            const html = `
+                <button role="tab" aria-controls="p0"></button>
+                <button role="tab" aria-controls="p1">Real Tab</button>
+                <div role="tabpanel" id="p0"><p>Panel 0</p></div>
+                <div role="tabpanel" id="p1"><p>Panel 1</p></div>
+            `;
+            const result = preprocessTabs(html);
+            // Only the non-empty tab should be injected
+            expect(result).toContain('<strong>Real Tab:</strong>');
+            // Panel 0 should not have a label injected
+            const panel0Match = result.match(/Panel 0/);
+            expect(panel0Match).toBeTruthy();
+        });
+
+        it('should work with Hextra-style tab HTML structure', () => {
+            // Simulated Hextra tabs like the user's example
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="tabs-panel-0" data-state="selected">Anthropic v1/messages</button>
+                    <button role="tab" aria-controls="tabs-panel-1" data-state="">OpenAI-compatible v1/chat/completions</button>
+                    <button role="tab" aria-controls="tabs-panel-2" data-state="">Custom route</button>
+                </div>
+                <div>
+                    <div role="tabpanel" id="tabs-panel-0" data-state="selected" class="hextra-tabs-panel">
+                        <pre><code>kubectl apply anthropic...</code></pre>
+                    </div>
+                    <div role="tabpanel" id="tabs-panel-1" data-state="" class="hextra-tabs-panel hx-hidden">
+                        <pre><code>kubectl apply openai...</code></pre>
+                    </div>
+                    <div role="tabpanel" id="tabs-panel-2" data-state="" class="hextra-tabs-panel hx-hidden">
+                        <pre><code>kubectl apply custom...</code></pre>
+                    </div>
+                </div>
+            `;
+            const result = preprocessTabs(html);
+
+            // All three panels should have their tab labels injected
+            expect(result).toContain('<strong>Anthropic v1/messages:</strong>');
+            expect(result).toContain('<strong>OpenAI-compatible v1/chat/completions:</strong>');
+            expect(result).toContain('<strong>Custom route:</strong>');
+
+            // Hidden panels should be made visible
+            expect(result).not.toContain('hx-hidden');
+
+            // Tab buttons should be removed
+            expect(result).not.toContain('role="tab"');
+
+            // All code content should be present
+            expect(result).toContain('kubectl apply anthropic');
+            expect(result).toContain('kubectl apply openai');
+            expect(result).toContain('kubectl apply custom');
+        });
+
+        it('should mark panels with article-content class for Readability', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Tab</button>
+                <div role="tabpanel" id="p0"><p>Content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).toContain('article-content');
+            expect(result).toContain('data-readable-content-score="100"');
+        });
+
+        it('should NOT duplicate labels when multiple tab groups share the same panel IDs', () => {
+            // This reproduces the real-world Hextra bug: two separate tab groups
+            // on the same page both use aria-controls pointing to tabs-panel-0,
+            // tabs-panel-1, etc. Since getElementById returns the first match,
+            // both tab groups try to inject into the same panel.
+            const html = `
+                <div>
+                    <!-- First tab group -->
+                    <button role="tab" aria-controls="tabs-panel-0" data-state="selected">Tab A</button>
+                    <button role="tab" aria-controls="tabs-panel-1" data-state="">Tab B</button>
+                    <button role="tab" aria-controls="tabs-panel-2" data-state="">Tab C</button>
+                </div>
+                <div>
+                    <div role="tabpanel" id="tabs-panel-0" data-state="selected"><p>Content A</p></div>
+                    <div role="tabpanel" id="tabs-panel-1" data-state="" class="hx-hidden"><p>Content B</p></div>
+                    <div role="tabpanel" id="tabs-panel-2" data-state="" class="hx-hidden"><p>Content C</p></div>
+                </div>
+                <div>
+                    <!-- Second tab group (reuses same panel IDs!) -->
+                    <button role="tab" aria-controls="tabs-panel-0" data-state="selected">Tab A duplicate</button>
+                    <button role="tab" aria-controls="tabs-panel-1" data-state="">Tab B duplicate</button>
+                    <button role="tab" aria-controls="tabs-panel-2" data-state="">Tab C duplicate</button>
+                </div>
+                <div>
+                    <div role="tabpanel" id="tabs-panel-0" data-state="selected"><p>Content A2</p></div>
+                    <div role="tabpanel" id="tabs-panel-1" data-state="" class="hx-hidden"><p>Content B2</p></div>
+                    <div role="tabpanel" id="tabs-panel-2" data-state="" class="hx-hidden"><p>Content C2</p></div>
+                </div>
+            `;
+            const result = preprocessTabs(html);
+
+            // Each panel should have exactly ONE label injected, not two
+            const tabACount = (result.match(/<strong>Tab A:<\/strong>/g) || []).length;
+            const tabBCount = (result.match(/<strong>Tab B:<\/strong>/g) || []).length;
+            const tabCCount = (result.match(/<strong>Tab C:<\/strong>/g) || []).length;
+
+            expect(tabACount).toBe(1);
+            expect(tabBCount).toBe(1);
+            expect(tabCCount).toBe(1);
+
+            // The duplicate tab labels should NOT appear
+            expect(result).not.toContain('Tab A duplicate');
+            expect(result).not.toContain('Tab B duplicate');
+            expect(result).not.toContain('Tab C duplicate');
+        });
+    });
+
+    // ─── convertHtmlToMarkdown with tabs ─────────────────────────────
+    describe('convertHtmlToMarkdown with tabs', () => {
+        it('should convert tabbed HTML to markdown with tab labels', () => {
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="p0">Tab A</button>
+                    <button role="tab" aria-controls="p1">Tab B</button>
+                </div>
+                <div role="tabpanel" id="p0"><p>Content for A</p></div>
+                <div role="tabpanel" id="p1" class="hidden"><p>Content for B</p></div>
+            `;
+            const md = processor.convertHtmlToMarkdown(html);
+            expect(md).toContain('**Tab A:**');
+            expect(md).toContain('**Tab B:**');
+            expect(md).toContain('Content for A');
+            expect(md).toContain('Content for B');
+        });
+
+        it('should not affect HTML without tabs', () => {
+            const html = '<h1>Title</h1><p>No tabs here</p>';
+            const md = processor.convertHtmlToMarkdown(html);
+            expect(md).toContain('# Title');
+            expect(md).toContain('No tabs here');
+        });
+    });
+
+    // ─── Full pipeline tab test (simulates processPage without Puppeteer) ─
+    describe('tabs through full processPage pipeline', () => {
+        it('should NOT duplicate tab labels through full processPage pipeline', () => {
+            const { JSDOM } = require('jsdom');
+            const { Readability } = require('@mozilla/readability');
+            const sanitizeHtml = require('sanitize-html');
+
+            // Simulate the ORIGINAL page HTML as extracted by Puppeteer (no preprocessing).
+            // Tab buttons are present, hidden panels have hx-hidden and data-state="".
+            // This tests the full pipeline: JSDOM -> preprocessTabs -> Readability -> sanitize -> Turndown.
+            const rawPageHtml = `
+                <html><head><title>Route Config</title></head><body>
+                <article>
+                    <h1>Route Configuration</h1>
+                    <p>Configure routes below.</p>
+                    <div class="hx-mt-4 hx-flex">
+                        <button role="tab" aria-controls="tabs-panel-0" aria-selected="true" data-state="selected">Anthropic v1/messages</button>
+                        <button role="tab" aria-controls="tabs-panel-1" data-state="">OpenAI-compatible v1/chat/completions</button>
+                        <button role="tab" aria-controls="tabs-panel-2" data-state="">Custom route</button>
+                    </div>
+                    <div>
+                        <div class="hextra-tabs-panel hx-rounded hx-pt-6" id="tabs-panel-0" role="tabpanel" tabindex="0" data-state="selected">
+                            <div class="hextra-code-block hx-relative hx-mt-6 first:hx-mt-0 hx-group/code">
+                                <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-yaml" data-lang="yaml"><span class="line"><span class="cl"><span class="l">kubectl apply -f- &lt;&lt;EOF</span>
+</span></span><span class="line"><span class="cl"><span class="nt">apiVersion</span><span class="p">:</span> <span class="l">gateway.networking.k8s.io/v1</span>
+</span></span><span class="line"><span class="cl"><span class="nt">kind</span><span class="p">:</span> <span class="l">HTTPRoute</span>
+</span></span><span class="line"><span class="cl"><span class="nt">metadata</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl">  <span class="nt">name</span><span class="p">:</span> <span class="l">anthropic</span>
+</span></span><span class="line"><span class="cl"><span class="l">EOF</span></span></span></code></pre></div></div>
+                                <div class="hextra-code-copy-btn-container hx-opacity-0">
+                                    <button class="hextra-code-copy-btn" title="Copy code">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hextra-tabs-panel hx-rounded hx-pt-6 hx-hidden" id="tabs-panel-1" role="tabpanel" data-state="">
+                            <div class="hextra-code-block hx-relative hx-mt-6 first:hx-mt-0 hx-group/code">
+                                <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-yaml" data-lang="yaml"><span class="line"><span class="cl"><span class="l">kubectl apply -f- &lt;&lt;EOF</span>
+</span></span><span class="line"><span class="cl"><span class="nt">apiVersion</span><span class="p">:</span> <span class="l">gateway.networking.k8s.io/v1</span>
+</span></span><span class="line"><span class="cl"><span class="nt">kind</span><span class="p">:</span> <span class="l">HTTPRoute</span>
+</span></span><span class="line"><span class="cl"><span class="nt">metadata</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl">  <span class="nt">name</span><span class="p">:</span> <span class="l">openai</span>
+</span></span><span class="line"><span class="cl"><span class="l">EOF</span></span></span></code></pre></div></div>
+                                <div class="hextra-code-copy-btn-container hx-opacity-0">
+                                    <button class="hextra-code-copy-btn" title="Copy code">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hextra-tabs-panel hx-rounded hx-pt-6 hx-hidden" id="tabs-panel-2" role="tabpanel" data-state="">
+                            <div class="hextra-code-block hx-relative hx-mt-6 first:hx-mt-0 hx-group/code">
+                                <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-yaml" data-lang="yaml"><span class="line"><span class="cl"><span class="l">kubectl apply -f- &lt;&lt;EOF</span>
+</span></span><span class="line"><span class="cl"><span class="nt">apiVersion</span><span class="p">:</span> <span class="l">gateway.networking.k8s.io/v1</span>
+</span></span><span class="line"><span class="cl"><span class="nt">kind</span><span class="p">:</span> <span class="l">HTTPRoute</span>
+</span></span><span class="line"><span class="cl"><span class="nt">metadata</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl">  <span class="nt">name</span><span class="p">:</span> <span class="l">custom</span>
+</span></span><span class="line"><span class="cl"><span class="l">EOF</span></span></span></code></pre></div></div>
+                                <div class="hextra-code-copy-btn-container hx-opacity-0">
+                                    <button class="hextra-code-copy-btn" title="Copy code">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </article>
+                </body></html>
+            `;
+
+            // Step 1: JSDOM — simulates what processPage does with the raw HTML
+            const dom = new JSDOM(rawPageHtml);
+            const document = dom.window.document;
+
+            // Mark pre tags (same as processPage)
+            document.querySelectorAll('pre').forEach((pre: any) => {
+                pre.classList.add('article-content');
+                pre.setAttribute('data-readable-content-score', '100');
+                (processor as any).markCodeParents(pre.parentElement);
+            });
+
+            // Tab preprocessing in JSDOM (simulating what page.evaluate would do,
+            // since in test we don't have Puppeteer)
+            (processor as any).preprocessTabs(document, testLogger);
+
+            // Step 2: Readability (same as processPage)
+            const reader = new Readability(document, {
+                charThreshold: 20,
+                classesToPreserve: ['article-content'],
+            });
+            const article = reader.parse();
+            expect(article).not.toBeNull();
+
+            // Step 3: sanitize-html (same as processPage)
+            const cleanHtml = sanitizeHtml(article!.content, {
+                allowedTags: [
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                ],
+                allowedAttributes: {
+                    'a': ['href'],
+                    'pre': ['class', 'data-language'],
+                    'code': ['class', 'data-language'],
+                    'div': ['class'],
+                    'span': ['class']
+                }
+            });
+
+            // Step 4: Turndown (same as processPage)
+            const markdown = (processor as any).turndownService.turndown(cleanHtml);
+
+            // Verify: each label should appear EXACTLY once
+            const anthropicMatches = markdown.match(/Anthropic v1\/messages/g) || [];
+            const openaiMatches = markdown.match(/OpenAI-compatible v1\/chat\/completions/g) || [];
+            const customMatches = markdown.match(/Custom route/g) || [];
+
+            expect(anthropicMatches.length).toBe(1);
+            expect(openaiMatches.length).toBe(1);
+            expect(customMatches.length).toBe(1);
+        });
+    });
+
     // ─── markCodeParents ─────────────────────────────────────────────
     describe('markCodeParents', () => {
         const markCodeParents = (node: any) => (processor as any).markCodeParents(node);

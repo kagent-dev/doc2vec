@@ -144,6 +144,15 @@ export class ContentProcessor {
             return '';
         }
 
+        // Pre-process tabbed content before sanitization strips ARIA attributes
+        const dom = new JSDOM(html);
+        const tabButtons = dom.window.document.querySelectorAll('[role="tab"]');
+        if (tabButtons.length > 0) {
+            const logger = this.logger.child('markdown');
+            this.preprocessTabs(dom.window.document, logger);
+            html = dom.window.document.body.innerHTML;
+        }
+
         // Sanitize the HTML first
         const cleanHtml = sanitizeHtml(html, {
             allowedTags: [
@@ -279,10 +288,14 @@ export class ContentProcessor {
             const b = await puppeteer.launch({
                 executablePath,
                 args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                protocolTimeout: 60000,
             });
             const p = await b.newPage();
             return { browser: b, page: p };
         };
+
+        // Track whether the page needs to be recreated (e.g., after a timeout error)
+        let pageNeedsRecreation = false;
 
         const ensureBrowser = async (): Promise<Page> => {
             if (!browser || !browser.isConnected()) {
@@ -290,6 +303,18 @@ export class ContentProcessor {
                 const launched = await launchBrowser();
                 browser = launched.browser;
                 page = launched.page;
+                pageNeedsRecreation = false;
+            } else if (pageNeedsRecreation) {
+                // The previous page.evaluate or navigation timed out / errored.
+                // Close the stale page and create a fresh one to avoid corrupted state.
+                logger.info('Recreating page after previous error...');
+                try {
+                    if (page) await page.close();
+                } catch {
+                    // Ignore errors closing a stale page
+                }
+                page = await browser.newPage();
+                pageNeedsRecreation = false;
             }
             return page!;
         };
@@ -358,9 +383,24 @@ export class ContentProcessor {
 
                         logger.debug(`Found ${newLinksFound} new links on ${url}`);
                     }
+
+                    // Navigate to about:blank to clear any lingering JS, timers, or
+                    // event listeners from the processed page before moving to the next URL.
+                    if (currentPage) {
+                        try {
+                            await currentPage.goto('about:blank', { waitUntil: 'load', timeout: 5000 });
+                        } catch {
+                            // If even about:blank fails, the page is stuck — mark for recreation
+                            pageNeedsRecreation = true;
+                        }
+                    }
                 } catch (error: any) {
                     logger.error(`Failed during processing or link discovery for ${url}:`, error);
                     errorCount++;
+
+                    // Mark the page for recreation so the next URL gets a clean tab.
+                    // This prevents cascading failures from a stuck/corrupted page state.
+                    pageNeedsRecreation = true;
 
                     const status = this.getHttpStatus(error);
                     if (status === 404) {
@@ -488,6 +528,7 @@ export class ContentProcessor {
                 browser = await puppeteer.launch({
                     executablePath,
                     args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                    protocolTimeout: 60000,
                 });
                 page = await browser.newPage();
             }
@@ -506,7 +547,7 @@ export class ContentProcessor {
 
             // Extract ALL links from the full rendered DOM before any content filtering
             // This searches the entire document, not just the main content area
-            const links: string[] = await page.evaluate(() => {
+            const links: string[] = await this.evaluateWithTimeout(page, () => {
                 const anchors = document.querySelectorAll('a[href]');
                 const hrefs: string[] = [];
                 anchors.forEach(a => {
@@ -519,7 +560,7 @@ export class ContentProcessor {
             });
             logger.debug(`Extracted ${links.length} links from full DOM of ${url}`);
 
-            const htmlContent: string = await page.evaluate(() => {
+            const htmlContent: string = await this.evaluateWithTimeout(page, () => {
                 // Try specific content selectors first, then fall back to broader ones
                 const mainContentElement = 
                     document.querySelector('.docs-content') ||        // Common docs pattern
@@ -546,6 +587,12 @@ export class ContentProcessor {
                 pre.setAttribute('data-readable-content-score', '100');
                 this.markCodeParents(pre.parentElement);
             });
+
+            // Pre-process tabbed content: inject tab labels into panels
+            // and make hidden panels visible so Readability doesn't discard them.
+            // Done in JSDOM (not in Puppeteer's page.evaluate) to avoid triggering
+            // reactive framework re-renders when modifying data-state attributes.
+            this.preprocessTabs(document, logger);
 
             // Extract H1s BEFORE Readability - it often strips them as "chrome"
             // We'll inject them back after Readability processing
@@ -663,6 +710,19 @@ export class ContentProcessor {
         }
     }
 
+    /**
+     * Wraps a page.evaluate call with a timeout to prevent indefinite hangs.
+     * Some pages have heavy/infinite JavaScript that blocks evaluate calls.
+     */
+    private evaluateWithTimeout<T>(page: Page, fn: () => T, timeoutMs: number = 30000): Promise<T> {
+        return Promise.race([
+            page.evaluate(fn),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`page.evaluate timed out after ${timeoutMs}ms`)), timeoutMs)
+            )
+        ]);
+    }
+
     private getHttpStatus(error: any): number | undefined {
         if (typeof error?.status === 'number') {
             return error.status;
@@ -673,6 +733,114 @@ export class ContentProcessor {
         }
 
         return undefined;
+    }
+
+    /**
+     * Pre-processes tabbed content in the DOM before Readability runs.
+     * 
+     * Detects tabs using the standard WAI-ARIA tabs pattern:
+     * - Tab buttons: elements with role="tab" and aria-controls pointing to a panel
+     * - Tab panels: elements with role="tabpanel" matched by id
+     * 
+     * For each tab/panel pair, injects the tab label as a bold heading into
+     * the panel content, so the context is preserved after conversion to markdown.
+     * Also ensures hidden panels are visible so Readability doesn't discard them.
+     * 
+     * Falls back to positional matching (nth tab -> nth panel) when aria-controls
+     * is missing.
+     */
+    private preprocessTabs(document: Document, logger: Logger) {
+        // Find all tab buttons using the WAI-ARIA role="tab" attribute
+        const tabButtons = document.querySelectorAll('[role="tab"]');
+        if (tabButtons.length === 0) return;
+
+        logger.debug(`[Tab Preprocessing] Found ${tabButtons.length} tab buttons`);
+
+        // Collect all tabpanels for fallback positional matching
+        const allPanels = document.querySelectorAll('[role="tabpanel"]');
+
+        // Track panels that have already been labeled to avoid duplicates.
+        // Pages can have multiple tab groups that reuse the same panel IDs
+        // (e.g., two separate tab sets both using tabs-panel-0, tabs-panel-1, etc.),
+        // causing getElementById to return the same panel for different tab buttons.
+        const labeledPanels = new Set<Element>();
+
+        tabButtons.forEach((tab: Element, index: number) => {
+            const label = tab.textContent?.trim();
+            if (!label) {
+                logger.debug(`[Tab Preprocessing] Skipping tab[${index}] with empty label`);
+                return;
+            }
+
+            // Try to find the linked panel via aria-controls -> id
+            let panel: Element | null = null;
+            const controlsId = tab.getAttribute('aria-controls');
+            if (controlsId) {
+                panel = document.getElementById(controlsId);
+            }
+
+            // Fallback: positional matching (nth tab -> nth panel)
+            if (!panel && index < allPanels.length) {
+                panel = allPanels[index];
+                logger.debug(`[Tab Preprocessing] Using positional fallback for tab[${index}]: "${label}"`);
+            }
+
+            if (!panel) {
+                logger.debug(`[Tab Preprocessing] No panel found for tab[${index}]: "${label}"`);
+                return;
+            }
+
+            // Skip if this panel has already been labeled (duplicate panel ID across tab groups)
+            if (labeledPanels.has(panel)) {
+                logger.debug(`[Tab Preprocessing] Skipping tab[${index}]: "${label}" — panel already labeled`);
+                return;
+            }
+            labeledPanels.add(panel);
+
+            logger.debug(`[Tab Preprocessing] Injecting label for tab[${index}]: "${label}"`);
+
+            // Inject the tab label as bold text at the top of the panel
+            const labelElement = document.createElement('p');
+            const strong = document.createElement('strong');
+            strong.textContent = label + ':';
+            labelElement.appendChild(strong);
+            panel.insertBefore(labelElement, panel.firstChild);
+
+            // Ensure the panel is visible so Readability doesn't skip it.
+            // Remove common hiding patterns:
+            // 1. data-state attribute (used by Hextra, Radix, etc.)
+            if (panel.getAttribute('data-state') !== 'selected') {
+                panel.setAttribute('data-state', 'selected');
+            }
+            // 2. CSS classes that hide content
+            const classList = panel.classList;
+            // Common hiding classes across frameworks
+            const hidingClasses = ['hidden', 'hx-hidden', 'is-hidden', 'display-none', 'd-none', 'invisible'];
+            hidingClasses.forEach(cls => classList.remove(cls));
+            // Also remove any class containing 'hidden' as a segment (e.g., 'hx-hidden')
+            Array.from(classList).forEach(cls => {
+                if (/\bhidden\b/i.test(cls)) {
+                    classList.remove(cls);
+                }
+            });
+            // 3. Inline style hiding
+            const style = panel.getAttribute('style') || '';
+            if (style.includes('display') && style.includes('none')) {
+                panel.setAttribute('style', style.replace(/display\s*:\s*none\s*;?/gi, ''));
+            }
+
+            // Mark the panel as content so Readability preserves it
+            panel.classList.add('article-content');
+            panel.setAttribute('data-readable-content-score', '100');
+        });
+
+        // Remove the tab buttons since we've injected the labels into panels
+        // This prevents the tab labels from appearing twice in the output
+        tabButtons.forEach((tab: Element) => {
+            tab.remove();
+        });
+
+        logger.debug(`[Tab Preprocessing] Completed tab preprocessing`);
     }
 
     private markCodeParents(node: Element | null) {

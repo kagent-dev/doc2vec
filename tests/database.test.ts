@@ -452,6 +452,60 @@ describe('DatabaseManager', () => {
         });
     });
 
+    // ─── getChunkHashesByUrlSQLite ──────────────────────────────────
+    describe('getChunkHashesByUrlSQLite', () => {
+        let db: BetterSqlite3.Database;
+
+        beforeEach(() => {
+            db = createTestDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('should return sorted hashes for chunks matching a URL', () => {
+            const embedding = createTestEmbedding();
+
+            const hashes = ['hash-c', 'hash-a', 'hash-b'];
+            for (let i = 0; i < 3; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = `chunk-${i}`;
+                chunk.metadata.url = 'https://example.com/page';
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, hashes[i]);
+            }
+
+            // Add a chunk with a different URL
+            const other = createTestChunk();
+            other.metadata.chunk_id = 'other';
+            other.metadata.url = 'https://example.com/other';
+            DatabaseManager.insertVectorsSQLite(db, other, embedding, testLogger, 'hash-other');
+
+            const result = DatabaseManager.getChunkHashesByUrlSQLite(db, 'https://example.com/page');
+            expect(result).toEqual(['hash-a', 'hash-b', 'hash-c']);
+        });
+
+        it('should return empty array when no chunks match', () => {
+            const result = DatabaseManager.getChunkHashesByUrlSQLite(db, 'https://nonexistent.com/page');
+            expect(result).toEqual([]);
+        });
+
+        it('should return duplicate hashes correctly', () => {
+            const embedding = createTestEmbedding();
+
+            // Two chunks with the same hash (identical content under different headings)
+            for (let i = 0; i < 2; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = `chunk-${i}`;
+                chunk.metadata.url = 'https://example.com/page';
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, 'same-hash');
+            }
+
+            const result = DatabaseManager.getChunkHashesByUrlSQLite(db, 'https://example.com/page');
+            expect(result).toEqual(['same-hash', 'same-hash']);
+        });
+    });
+
     // ─── removeObsoleteFilesSQLite ───────────────────────────────────
     describe('removeObsoleteFilesSQLite', () => {
         let db: BetterSqlite3.Database;
