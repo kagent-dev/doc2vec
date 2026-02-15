@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import BetterSqlite3 from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+import { QdrantClient } from '@qdrant/js-client-rest';
 import { ContentProcessor } from '../content-processor';
 import { DatabaseManager } from '../database';
 import { Utils } from '../utils';
@@ -12,6 +13,7 @@ import { Logger, LogLevel } from '../logger';
 import {
     DocumentChunk,
     SqliteDB,
+    QdrantDB,
     LocalDirectorySourceConfig,
     CodeSourceConfig,
     WebsiteSourceConfig,
@@ -642,4 +644,297 @@ describe('E2E: Website Source', () => {
             countChunksForUrl(db, page3Url);
         expect(totalChunksRun2).toBe(expectedTotal);
     }, 60000); // 60s timeout for Puppeteer-based test
+});
+
+// ─── Qdrant Website Source E2E (conditional) ────────────────────────────────
+
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
+const QDRANT_URL = process.env.QDRANT_URL;
+const QDRANT_PORT = process.env.QDRANT_PORT;
+const QDRANT_TEST_COLLECTION = process.env.QDRANT_TEST_COLLECTION;
+
+const canRunQdrantTests = !!(QDRANT_API_KEY && QDRANT_URL && QDRANT_PORT && QDRANT_TEST_COLLECTION);
+
+/**
+ * Replicates Doc2Vec.processChunksForUrl for Qdrant.
+ * Compares chunk hashes per URL: skip if unchanged, delete+re-insert if changed.
+ */
+async function processChunksForUrlQdrant(
+    chunks: DocumentChunk[],
+    url: string,
+    qdrantDb: QdrantDB,
+    embedFn: (url: string) => number[],
+    logger: Logger
+): Promise<number> {
+    if (chunks.length === 0) return 0;
+
+    const newHashes = chunks.map(c => Utils.generateHash(c.content));
+    const newHashesSorted = newHashes.slice().sort();
+
+    const existingHashesSorted = await DatabaseManager.getChunkHashesByUrlQdrant(qdrantDb, url);
+
+    const unchanged = newHashesSorted.length === existingHashesSorted.length &&
+        newHashesSorted.every((h, i) => h === existingHashesSorted[i]);
+
+    if (unchanged) {
+        return 0;
+    }
+
+    if (existingHashesSorted.length > 0) {
+        await DatabaseManager.removeChunksByUrlQdrant(qdrantDb, url, logger);
+    }
+
+    let embeddedCount = 0;
+    for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkHash = newHashes[i];
+        chunk.metadata.branch = chunk.metadata.branch || '';
+        chunk.metadata.repo = chunk.metadata.repo || '';
+        const embedding = embedFn(url);
+        await DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, embedding, chunkHash);
+        embeddedCount++;
+    }
+    return embeddedCount;
+}
+
+/**
+ * Returns chunks for a URL from Qdrant, sorted by chunk_index.
+ */
+async function getChunksForUrlQdrant(qdrantDb: QdrantDB, url: string) {
+    const { client, collectionName } = qdrantDb;
+    const response = await client.scroll(collectionName, {
+        limit: 10000,
+        with_payload: true,
+        with_vector: false,
+        filter: {
+            must: [{ key: 'url', match: { value: url } }],
+            must_not: [{ key: 'is_metadata', match: { value: true } }],
+        },
+    });
+    return response.points
+        .map((p: any) => ({
+            chunk_id: p.payload?.original_chunk_id as string,
+            content: p.payload?.content as string,
+            hash: p.payload?.hash as string,
+            chunk_index: p.payload?.chunk_index as number,
+            total_chunks: p.payload?.total_chunks as number,
+        }))
+        .sort((a: any, b: any) => a.chunk_index - b.chunk_index);
+}
+
+/**
+ * Returns the count of non-metadata points in the collection.
+ */
+async function countAllChunksQdrant(qdrantDb: QdrantDB): Promise<number> {
+    const { client, collectionName } = qdrantDb;
+    const response = await client.scroll(collectionName, {
+        limit: 10000,
+        with_payload: false,
+        with_vector: false,
+        filter: {
+            must_not: [{ key: 'is_metadata', match: { value: true } }],
+        },
+    });
+    return response.points.length;
+}
+
+// Use describe.skipIf to conditionally skip when env vars are not set
+describe.skipIf(!canRunQdrantTests)('E2E: Qdrant Website Source', () => {
+    let server: http.Server;
+    let baseUrl: string;
+    let qdrantClient: QdrantClient;
+    let qdrantDb: QdrantDB;
+    let tracker: ReturnType<typeof createEmbeddingTracker>;
+    let processor: ContentProcessor;
+
+    const pageContent: Record<string, string> = {};
+
+    beforeEach(async () => {
+        // Set up page content
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two</h1>
+                <p>This is the second page about monitoring and observability best practices.</p>
+                <p>Learn how to set up dashboards and configure alerting rules.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three</h1>
+                <p>This is the third page describing security hardening procedures.</p>
+                <p>Covers TLS configuration, network policies, and access control.</p>
+            </article>
+            </body></html>
+        `;
+
+        // Start local HTTP server
+        server = http.createServer((req, res) => {
+            const content = pageContent[req.url || ''];
+            if (content) {
+                res.writeHead(200, { 'Content-Type': 'text/html' });
+                res.end(content);
+            } else {
+                res.writeHead(404);
+                res.end('Not found');
+            }
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const address = server.address();
+        if (!address || typeof address === 'string') {
+            throw new Error('Failed to start test server');
+        }
+        baseUrl = `http://127.0.0.1:${address.port}`;
+
+        // Connect to Qdrant and delete the test collection if it exists
+        qdrantClient = new QdrantClient({
+            url: QDRANT_URL!,
+            apiKey: QDRANT_API_KEY!,
+            port: parseInt(QDRANT_PORT!, 10),
+        });
+
+        try {
+            await qdrantClient.deleteCollection(QDRANT_TEST_COLLECTION!);
+        } catch {
+            // Collection may not exist yet — that's fine
+        }
+
+        // Create the collection
+        await qdrantClient.createCollection(QDRANT_TEST_COLLECTION!, {
+            vectors: { size: 3072, distance: 'Cosine' },
+        });
+
+        qdrantDb = {
+            client: qdrantClient,
+            collectionName: QDRANT_TEST_COLLECTION!,
+            type: 'qdrant',
+        };
+
+        tracker = createEmbeddingTracker();
+        processor = new ContentProcessor(testLogger);
+    });
+
+    afterEach(async () => {
+        server.close();
+        try {
+            await qdrantClient.deleteCollection(QDRANT_TEST_COLLECTION!);
+        } catch {
+            // Ignore cleanup errors
+        }
+    });
+
+    it('should embed all pages on first run and only modified page on second run', async () => {
+        const pages = ['/page1', '/page2', '/page3'];
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-qdrant',
+            version: '1.0',
+            url: baseUrl,
+            max_size: 1048576,
+            database_config: {
+                type: 'qdrant',
+                params: {
+                    qdrant_url: QDRANT_URL!,
+                    qdrant_port: parseInt(QDRANT_PORT!, 10),
+                    collection_name: QDRANT_TEST_COLLECTION!,
+                },
+            },
+        };
+
+        // ── Run 1: Process all 3 pages via Puppeteer ────────────────
+        for (const pagePath of pages) {
+            const url = `${baseUrl}${pagePath}`;
+            const result = await processor.processPage(url, config);
+
+            expect(result.content).not.toBeNull();
+            const chunks = await processor.chunkMarkdown(result.content!, config, url);
+            expect(chunks.length).toBeGreaterThan(0);
+            await processChunksForUrlQdrant(chunks, url, qdrantDb, (u) => tracker.embed(u), testLogger);
+        }
+
+        // All 3 pages should have been embedded
+        expect(tracker.embeddedUrls.size).toBe(3);
+        const totalChunksRun1 = await countAllChunksQdrant(qdrantDb);
+        expect(totalChunksRun1).toBeGreaterThan(0);
+
+        // Verify chunk_index / total_chunks consistency
+        for (const pagePath of pages) {
+            const url = `${baseUrl}${pagePath}`;
+            const chunks = await getChunksForUrlQdrant(qdrantDb, url);
+            expect(chunks.length).toBeGreaterThan(0);
+            for (let i = 0; i < chunks.length; i++) {
+                expect(Number(chunks[i].chunk_index)).toBe(i);
+                expect(Number(chunks[i].total_chunks)).toBe(chunks.length);
+            }
+        }
+
+        // Save page1 and page3 chunk data
+        const page1Url = `${baseUrl}/page1`;
+        const page3Url = `${baseUrl}/page3`;
+        const page1ChunksBefore = await getChunksForUrlQdrant(qdrantDb, page1Url);
+        const page3ChunksBefore = await getChunksForUrlQdrant(qdrantDb, page3Url);
+
+        // ── Modify page 2 content ───────────────────────────────────
+        tracker.reset();
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two</h1>
+                <p>This is the second page about monitoring and observability best practices.</p>
+                <p>This paragraph was added between runs to test change detection.</p>
+                <p>Learn how to set up dashboards and configure alerting rules.</p>
+            </article>
+            </body></html>
+        `;
+
+        // ── Run 2: Re-process all 3 pages ───────────────────────────
+        for (const pagePath of pages) {
+            const url = `${baseUrl}${pagePath}`;
+            const result = await processor.processPage(url, config);
+
+            expect(result.content).not.toBeNull();
+            const chunks = await processor.chunkMarkdown(result.content!, config, url);
+            await processChunksForUrlQdrant(chunks, url, qdrantDb, (u) => tracker.embed(u), testLogger);
+        }
+
+        // Only page2 should have been re-embedded
+        const page2Url = `${baseUrl}/page2`;
+        expect(tracker.embeddedUrls.size).toBe(1);
+        expect(tracker.embeddedUrls.has(page2Url)).toBe(true);
+        expect(tracker.embeddedUrls.has(page1Url)).toBe(false);
+        expect(tracker.embeddedUrls.has(page3Url)).toBe(false);
+
+        // page1 and page3 chunks should be unchanged
+        const page1ChunksAfter = await getChunksForUrlQdrant(qdrantDb, page1Url);
+        const page3ChunksAfter = await getChunksForUrlQdrant(qdrantDb, page3Url);
+        expect(page1ChunksAfter).toEqual(page1ChunksBefore);
+        expect(page3ChunksAfter).toEqual(page3ChunksBefore);
+
+        // page2 chunks should have correct chunk_index/total_chunks
+        const page2Chunks = await getChunksForUrlQdrant(qdrantDb, page2Url);
+        expect(page2Chunks.length).toBeGreaterThan(0);
+        for (let i = 0; i < page2Chunks.length; i++) {
+            expect(Number(page2Chunks[i].chunk_index)).toBe(i);
+            expect(Number(page2Chunks[i].total_chunks)).toBe(page2Chunks.length);
+        }
+
+        // No orphaned chunks
+        const totalChunksRun2 = await countAllChunksQdrant(qdrantDb);
+        const page1Count = (await getChunksForUrlQdrant(qdrantDb, page1Url)).length;
+        const page2Count = (await getChunksForUrlQdrant(qdrantDb, page2Url)).length;
+        const page3Count = (await getChunksForUrlQdrant(qdrantDb, page3Url)).length;
+        expect(totalChunksRun2).toBe(page1Count + page2Count + page3Count);
+    }, 60000);
 });

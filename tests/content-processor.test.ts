@@ -1131,6 +1131,115 @@ describe('ContentProcessor', () => {
             expect(processPageSpy).toHaveBeenCalledTimes(3);
             expect(processContent).toHaveBeenCalledTimes(2);
         }, 30000);
+
+        it('should skip page when ETag matches stored value', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
+                headers: { etag: '"abc123"' },
+            });
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"abc123"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // processPage should NOT be called — the page was skipped via ETag
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            // URL should still be marked as visited (so cleanup doesn't delete it)
+            expect(visited.has('https://example.com')).toBe(true);
+        });
+
+        it('should process page when ETag differs from stored value', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
+                headers: { etag: '"new-etag"' },
+            });
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"new-etag"',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"old-etag"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // ETag should be stored after successful processing
+            expect(etagStore.set).toHaveBeenCalledWith('https://example.com', '"new-etag"');
+        });
+
+        it('should process page when HEAD request fails', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(new Error('Network error'));
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"etag"',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Should fall through to full processing
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should process page when no ETag in HEAD response', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
+                headers: {},  // no etag header
+            });
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Should process since there's no ETag to compare
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // etagStore.get should NOT be called since there's no ETag in the response
+            expect(etagStore.get).not.toHaveBeenCalled();
+        });
+
+        it('should pre-seed queue with known URLs', async () => {
+            vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Page 1', links: [], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
+
+            const knownUrls = new Set(['https://example.com/page2']);
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { knownUrls });
+
+            // Both the base URL and the known URL should be processed
+            expect(processContent).toHaveBeenCalledTimes(2);
+        });
     });
 
     // ─── processPage ─────────────────────────────────────────────────

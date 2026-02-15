@@ -219,7 +219,14 @@ export class ContentProcessor {
         sourceConfig: WebsiteSourceConfig,
         processPageContent: (url: string, content: string) => Promise<void>,
         parentLogger: Logger,
-        visitedUrls: Set<string>
+        visitedUrls: Set<string>,
+        options?: {
+            knownUrls?: Set<string>;
+            etagStore?: {
+                get: (url: string) => Promise<string | undefined>;
+                set: (url: string, etag: string) => Promise<void>;
+            };
+        }
     ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[] }> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
@@ -244,7 +251,20 @@ export class ContentProcessor {
         };
 
         addReferrer(baseUrl, baseUrl);
-        
+
+        const { knownUrls, etagStore } = options ?? {};
+
+        // Pre-seed queue with previously-known URLs so link discovery isn't lost
+        // when pages are skipped via ETag matching on re-runs
+        if (knownUrls && knownUrls.size > 0) {
+            for (const url of knownUrls) {
+                if (url.startsWith(sourceConfig.url) && !queue.includes(url)) {
+                    queue.push(url);
+                }
+            }
+            logger.info(`Pre-seeded ${knownUrls.size} known URLs from database into crawl queue`);
+        }
+
         // Process sitemap if provided
         if (sourceConfig.sitemap_url) {
             logger.section('SITEMAP PROCESSING');
@@ -268,9 +288,15 @@ export class ContentProcessor {
         let processedCount = 0;
         let skippedCount = 0;
         let skippedSizeCount = 0;
+        let etagSkippedCount = 0;
         let pdfProcessedCount = 0;
         let errorCount = 0;
         let hasNetworkErrors = false;
+        // Tracks whether the server supports ETags. Starts true and is set to false
+        // after a few consecutive pages return no ETag, avoiding wasted HEAD requests.
+        let serverSupportsEtags = true;
+        let consecutiveNoEtag = 0;
+        const NO_ETAG_THRESHOLD = 3; // Disable after 3 consecutive pages without ETag
 
         // Track per-URL retry counts for rate limiting (429) responses
         const retryCounts: Map<string, number> = new Map();
@@ -371,6 +397,45 @@ export class ContentProcessor {
                     continue;
                 }
 
+                // ETag-based skip: send a lightweight HEAD request and compare the ETag
+                // to the stored value. If unchanged, skip the entire page (no Puppeteer,
+                // no content extraction, no chunking, no embedding).
+                if (!Utils.isPdfUrl(url) && etagStore && serverSupportsEtags) {
+                    try {
+                        const headResponse = await axios.head(url, {
+                            timeout: 10000,
+                            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; doc2vec crawler)' },
+                            // Follow redirects to get the ETag of the final page
+                            maxRedirects: 5,
+                        });
+                        const headEtag = headResponse.headers['etag'];
+                        if (headEtag) {
+                            consecutiveNoEtag = 0; // Reset counter on success
+                            const storedEtag = await etagStore.get(url);
+                            if (storedEtag && storedEtag === headEtag) {
+                                logger.info(`ETag unchanged, skipping: ${url}`);
+                                visitedUrls.add(url);
+                                etagSkippedCount++;
+                                continue;
+                            }
+                        } else {
+                            consecutiveNoEtag++;
+                            if (consecutiveNoEtag >= NO_ETAG_THRESHOLD) {
+                                serverSupportsEtags = false;
+                                logger.info(`Server does not return ETag headers (${NO_ETAG_THRESHOLD} consecutive pages without ETag). Disabling ETag-based skip for this crawl.`);
+                            }
+                        }
+                    } catch {
+                        // HEAD request failed (network error, server doesn't support HEAD, WAF blocks it, etc.)
+                        // Disable ETag checks to avoid repeated failed requests.
+                        consecutiveNoEtag++;
+                        if (consecutiveNoEtag >= NO_ETAG_THRESHOLD) {
+                            serverSupportsEtags = false;
+                            logger.info(`HEAD requests failing (${NO_ETAG_THRESHOLD} consecutive failures). Disabling ETag-based skip for this crawl.`);
+                        }
+                    }
+                }
+
                 try {
                     logger.info(`Crawling: ${url}`);
                     const sources = referrers.get(url) ?? new Set([baseUrl]);
@@ -419,6 +484,15 @@ export class ContentProcessor {
                         }
 
                         logger.debug(`Found ${newLinksFound} new links on ${url}`);
+                    }
+
+                    // Store the ETag for this URL so subsequent runs can skip it
+                    if (result.etag && etagStore) {
+                        try {
+                            await etagStore.set(url, result.etag);
+                        } catch {
+                            // ETag storage failure is non-critical
+                        }
                     }
 
                     // Page processed successfully — reset protocol error counter and
@@ -515,7 +589,7 @@ export class ContentProcessor {
             }
         }
 
-        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
+        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (ETag): ${etagSkippedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
         
         if (hasNetworkErrors) {
             logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');
@@ -581,7 +655,7 @@ export class ContentProcessor {
         sourceConfig: SourceConfig,
         onHttpStatus?: (url: string, status: number) => void,
         existingPage?: Page
-    ): Promise<{ content: string | null, links: string[], finalUrl: string }> {
+    ): Promise<{ content: string | null, links: string[], finalUrl: string, etag?: string }> {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing content from ${url}`);
 
@@ -669,6 +743,9 @@ export class ContentProcessor {
             // Get the final URL after any redirects
             const finalUrl = page.url();
 
+            // Extract ETag header for change detection on subsequent runs
+            const etag = response?.headers()['etag'] || undefined;
+
             // Extract ALL links from the full rendered DOM before any content filtering
             // This searches the entire document, not just the main content area
             const links: string[] = await this.evaluateWithTimeout(page, () => {
@@ -699,7 +776,7 @@ export class ContentProcessor {
 
             if (htmlContent.length > sourceConfig.max_size) {
                 logger.warn(`Raw HTML content (${htmlContent.length} chars) exceeds max size (${sourceConfig.max_size}). Skipping detailed processing for ${url}.`);
-                return { content: null, links, finalUrl };
+                return { content: null, links, finalUrl, etag };
             }
 
             logger.debug(`Got HTML content (${htmlContent.length} chars), creating DOM`);
@@ -742,7 +819,7 @@ export class ContentProcessor {
 
             if (!article) {
                 logger.warn(`Failed to parse article content with Readability for ${url}`);
-                return { content: null, links, finalUrl };
+                return { content: null, links, finalUrl, etag };
             }
             
             // Debug: Log what Readability extracted
@@ -814,7 +891,7 @@ export class ContentProcessor {
             }
             
             logger.debug(`Markdown conversion complete (${markdown.length} chars)`);
-            return { content: markdown, links, finalUrl };
+            return { content: markdown, links, finalUrl, etag };
         } catch (error) {
             const status = this.getHttpStatus(error);
             if (status !== undefined && status >= 400) {

@@ -415,11 +415,40 @@ export class Doc2Vec {
         logger.info(`Starting processing for website: ${config.url}`);
         
         const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
         const validChunkIds: Set<string> = new Set();
         const visitedUrls: Set<string> = new Set();
         const urlPrefix = Utils.getUrlPrefix(config.url);
         
         logger.section('CRAWL AND EMBEDDING');
+
+        // Pre-load known URLs from the database so the queue includes pages from
+        // previous runs. This ensures link discovery isn't lost when pages are
+        // skipped via ETag matching.
+        let knownUrls: Set<string> | undefined;
+        if (dbConnection.type === 'sqlite') {
+            const urls = DatabaseManager.getStoredUrlsByPrefixSQLite(dbConnection.db, urlPrefix);
+            if (urls.length > 0) {
+                knownUrls = new Set(urls);
+                logger.info(`Found ${urls.length} known URLs in database for pre-seeding`);
+            }
+        } else if (dbConnection.type === 'qdrant') {
+            const urls = await DatabaseManager.getStoredUrlsByPrefixQdrant(dbConnection, urlPrefix);
+            if (urls.length > 0) {
+                knownUrls = new Set(urls);
+                logger.info(`Found ${urls.length} known URLs in Qdrant for pre-seeding`);
+            }
+        }
+
+        // ETag store for caching page ETags across runs
+        const etagStore = {
+            get: async (url: string): Promise<string | undefined> => {
+                return DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, logger);
+            },
+            set: async (url: string, etag: string): Promise<void> => {
+                await DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, logger);
+            },
+        };
 
         const crawlResult = await this.contentProcessor.crawlWebsite(config.url, config, async (url, content) => {
             visitedUrls.add(url);
@@ -438,7 +467,7 @@ export class Doc2Vec {
                 logger.error(`Error during chunking or embedding for ${url}:`, error);
             }
 
-        }, logger, visitedUrls);
+        }, logger, visitedUrls, { knownUrls, etagStore });
 
         this.recordBrokenLinks(config.url, crawlResult.brokenLinks);
         this.writeBrokenLinksReport();

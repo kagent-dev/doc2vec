@@ -601,6 +601,52 @@ export class DatabaseManager {
     }
 
     /**
+     * Fetch all distinct URLs stored under a given URL prefix.
+     * Used to pre-seed the crawl queue on re-runs so link discovery isn't lost
+     * when pages are skipped via ETag matching.
+     */
+    static getStoredUrlsByPrefixSQLite(db: Database, urlPrefix: string): string[] {
+        const stmt = db.prepare('SELECT DISTINCT url FROM vec_items WHERE url LIKE ? || \'%\'');
+        const rows = stmt.all(urlPrefix) as { url: string }[];
+        return rows.map(r => r.url);
+    }
+
+    static async getStoredUrlsByPrefixQdrant(db: QdrantDB, urlPrefix: string): Promise<string[]> {
+        const { client, collectionName } = db;
+        try {
+            const response = await client.scroll(collectionName, {
+                limit: 10000,
+                with_payload: { include: ['url'] },
+                with_vector: false,
+                filter: {
+                    must: [
+                        {
+                            key: 'url',
+                            match: { text: urlPrefix }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: 'is_metadata',
+                            match: { value: true }
+                        }
+                    ]
+                }
+            });
+            const urls = new Set<string>();
+            for (const point of response.points) {
+                const url = (point as any).payload?.url as string;
+                if (url && url.startsWith(urlPrefix)) {
+                    urls.add(url);
+                }
+            }
+            return Array.from(urls);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    /**
      * Fetch all stored chunk content hashes for a given URL.
      * Returns a sorted array of hash strings for comparison.
      */

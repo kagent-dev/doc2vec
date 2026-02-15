@@ -506,6 +506,50 @@ describe('DatabaseManager', () => {
         });
     });
 
+    // ─── getStoredUrlsByPrefixSQLite ────────────────────────────────
+    describe('getStoredUrlsByPrefixSQLite', () => {
+        let db: BetterSqlite3.Database;
+
+        beforeEach(() => {
+            db = createTestDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('should return distinct URLs matching the prefix', () => {
+            const embedding = createTestEmbedding();
+            const urls = ['https://example.com/page1', 'https://example.com/page1', 'https://example.com/page2', 'https://other.com/page'];
+            const ids = ['c1', 'c2', 'c3', 'c4'];
+            for (let i = 0; i < urls.length; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = ids[i];
+                chunk.metadata.url = urls[i];
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, `hash-${ids[i]}`);
+            }
+
+            const result = DatabaseManager.getStoredUrlsByPrefixSQLite(db, 'https://example.com/');
+            expect(result.sort()).toEqual(['https://example.com/page1', 'https://example.com/page2']);
+        });
+
+        it('should return empty array when no URLs match', () => {
+            const embedding = createTestEmbedding();
+            const chunk = createTestChunk();
+            chunk.metadata.chunk_id = 'c1';
+            chunk.metadata.url = 'https://other.com/page';
+            DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, 'h1');
+
+            const result = DatabaseManager.getStoredUrlsByPrefixSQLite(db, 'https://example.com/');
+            expect(result).toEqual([]);
+        });
+
+        it('should return empty array for empty database', () => {
+            const result = DatabaseManager.getStoredUrlsByPrefixSQLite(db, 'https://example.com/');
+            expect(result).toEqual([]);
+        });
+    });
+
     // ─── removeObsoleteFilesSQLite ───────────────────────────────────
     describe('removeObsoleteFilesSQLite', () => {
         let db: BetterSqlite3.Database;
