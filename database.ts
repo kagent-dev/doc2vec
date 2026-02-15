@@ -580,7 +580,7 @@ export class DatabaseManager {
                         {
                             key: 'url',
                             match: {
-                                text: url
+                                value: url  // Exact match — must match getChunkHashesByUrlQdrant's filter
                             }
                         }
                     ],

@@ -272,6 +272,12 @@ export class ContentProcessor {
         let errorCount = 0;
         let hasNetworkErrors = false;
 
+        // Track per-URL retry counts for rate limiting (429) responses
+        const retryCounts: Map<string, number> = new Map();
+        const MAX_RETRIES_PER_URL = 3;
+        const DEFAULT_RETRY_DELAY_MS = 30000; // 30s default when no Retry-After header
+        const MAX_RETRY_DELAY_MS = 120000;    // Cap at 2 minutes
+
         // Launch a single browser instance and reuse one page (tab) for all URLs
         let browser: Browser | null = null;
         let page: Page | null = null;
@@ -287,7 +293,13 @@ export class ContentProcessor {
             }
             const b = await puppeteer.launch({
                 executablePath,
-                args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',  // Use /tmp instead of /dev/shm (critical in Docker, default 64MB)
+                    '--disable-gpu',
+                    '--disable-extensions',
+                ],
                 protocolTimeout: 60000,
             });
             const p = await b.newPage();
@@ -296,14 +308,39 @@ export class ContentProcessor {
 
         // Track whether the page needs to be recreated (e.g., after a timeout error)
         let pageNeedsRecreation = false;
+        // Track consecutive protocol-level errors (indicates browser process is degraded)
+        let consecutiveProtocolErrors = 0;
+        // Track pages processed since the last browser (re)launch for periodic restarts
+        let pagesSinceRestart = 0;
+        // Restart the browser every N pages to prevent memory accumulation
+        const PAGES_BETWEEN_RESTARTS = 50;
+
+        const restartBrowser = async (reason: string): Promise<void> => {
+            logger.warn(`Restarting browser: ${reason}`);
+            if (browser) {
+                try { await browser.close(); } catch { /* ignore close errors on a degraded browser */ }
+            }
+            const launched = await launchBrowser();
+            browser = launched.browser;
+            page = launched.page;
+            pageNeedsRecreation = false;
+            consecutiveProtocolErrors = 0;
+            pagesSinceRestart = 0;
+        };
 
         const ensureBrowser = async (): Promise<Page> => {
-            if (!browser || !browser.isConnected()) {
-                logger.info(browser ? 'Browser disconnected, relaunching...' : 'Launching browser...');
-                const launched = await launchBrowser();
-                browser = launched.browser;
-                page = launched.page;
-                pageNeedsRecreation = false;
+            // If protocol errors are persisting after page recreation, the browser
+            // process itself is degraded — a full restart is needed.
+            const needsBrowserRestart = pageNeedsRecreation && consecutiveProtocolErrors >= 1;
+
+            if (!browser || !browser.isConnected() || needsBrowserRestart) {
+                const reason = needsBrowserRestart
+                    ? `protocol errors persisting after page recreation (${consecutiveProtocolErrors} consecutive)`
+                    : browser ? 'browser disconnected' : 'initial launch';
+                await restartBrowser(reason);
+            } else if (pagesSinceRestart >= PAGES_BETWEEN_RESTARTS) {
+                // Periodic restart to prevent memory accumulation from long crawls
+                await restartBrowser(`periodic restart after ${pagesSinceRestart} pages`);
             } else if (pageNeedsRecreation) {
                 // The previous page.evaluate or navigation timed out / errored.
                 // Close the stale page and create a fresh one to avoid corrupted state.
@@ -384,6 +421,13 @@ export class ContentProcessor {
                         logger.debug(`Found ${newLinksFound} new links on ${url}`);
                     }
 
+                    // Page processed successfully — reset protocol error counter and
+                    // increment the periodic restart counter
+                    consecutiveProtocolErrors = 0;
+                    if (!Utils.isPdfUrl(url)) {
+                        pagesSinceRestart++;
+                    }
+
                     // Navigate to about:blank to clear any lingering JS, timers, or
                     // event listeners from the processed page before moving to the next URL.
                     if (currentPage) {
@@ -395,6 +439,42 @@ export class ContentProcessor {
                         }
                     }
                 } catch (error: any) {
+                    const status = this.getHttpStatus(error);
+
+                    // ── Handle 429 (Too Many Requests) with retry ──
+                    if (status === 429) {
+                        const retries = retryCounts.get(url) ?? 0;
+                        if (retries < MAX_RETRIES_PER_URL) {
+                            const retryAfterMs = error.retryAfterMs as number | undefined;
+                            const delayMs = Math.min(
+                                retryAfterMs ?? DEFAULT_RETRY_DELAY_MS,
+                                MAX_RETRY_DELAY_MS
+                            );
+                            retryCounts.set(url, retries + 1);
+
+                            logger.warn(
+                                `Rate limited (429) on ${url} (attempt ${retries + 1}/${MAX_RETRIES_PER_URL}). ` +
+                                `Waiting ${Math.round(delayMs / 1000)}s before retry...`
+                            );
+
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+
+                            // Re-add to the front of the queue so it's retried next.
+                            // Remove from visitedUrls so it's not skipped.
+                            visitedUrls.delete(normalizedUrl);
+                            queue.unshift(url);
+
+                            // Do NOT set pageNeedsRecreation — the page/browser is healthy,
+                            // the server is just rate-limiting us.
+                            // Do NOT increment errorCount — this is a temporary condition.
+                            continue;
+                        }
+
+                        // Max retries exhausted — fall through to normal error handling
+                        logger.error(`Rate limit retries exhausted for ${url} after ${MAX_RETRIES_PER_URL} attempts`);
+                    }
+
+                    // ── General error handling ──
                     logger.error(`Failed during processing or link discovery for ${url}:`, error);
                     errorCount++;
 
@@ -402,7 +482,16 @@ export class ContentProcessor {
                     // This prevents cascading failures from a stuck/corrupted page state.
                     pageNeedsRecreation = true;
 
-                    const status = this.getHttpStatus(error);
+                    // Track protocol-level errors separately — these indicate the browser
+                    // process itself is degraded, not just the page. If they persist after
+                    // page recreation, ensureBrowser() will escalate to a full browser restart.
+                    if (this.isProtocolError(error)) {
+                        consecutiveProtocolErrors++;
+                        logger.warn(`Protocol error detected (${consecutiveProtocolErrors} consecutive), browser may need restart`);
+                    } else {
+                        consecutiveProtocolErrors = 0;
+                    }
+
                     if (status === 404) {
                         const sources = referrers.get(url) ?? new Set([baseUrl]);
                         for (const source of sources) {
@@ -433,6 +522,22 @@ export class ContentProcessor {
         }
         
         return { hasNetworkErrors, brokenLinks };
+    }
+
+    /**
+     * Detects Chrome DevTools Protocol-level errors that indicate the browser
+     * process is degraded/stuck (not just a single page issue).
+     * These errors cannot be fixed by page recreation alone — the browser needs a full restart.
+     */
+    private isProtocolError(error: any): boolean {
+        const msg = error?.message || '';
+        return msg.includes('ProtocolError') ||
+            msg.includes('Protocol error') ||
+            (msg.includes('timed out') && msg.includes('protocolTimeout')) ||
+            msg.includes('Target closed') ||
+            msg.includes('Session closed') ||
+            msg.includes('Network.enable timed out') ||
+            msg.includes('Connection closed');
     }
 
     private isNetworkError(error: any): boolean {
@@ -527,7 +632,13 @@ export class ContentProcessor {
                 
                 browser = await puppeteer.launch({
                     executablePath,
-                    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-extensions',
+                    ],
                     protocolTimeout: 60000,
                 });
                 page = await browser.newPage();
@@ -539,6 +650,19 @@ export class ContentProcessor {
             if (status !== undefined && status >= 400) {
                 const error = new Error(`Failed to load page: HTTP ${status}`);
                 (error as any).status = status;
+
+                // For 429 (Too Many Requests), extract the Retry-After header so the
+                // caller can wait the right amount of time before retrying.
+                if (status === 429 && response) {
+                    const retryAfterMs = this.parseRetryAfter(response.headers()['retry-after']);
+                    if (retryAfterMs !== undefined) {
+                        (error as any).retryAfterMs = retryAfterMs;
+                        logger.info(`Rate limited (429). Retry-After: ${retryAfterMs}ms`);
+                    } else {
+                        logger.info(`Rate limited (429). No Retry-After header present.`);
+                    }
+                }
+
                 throw error;
             }
 
@@ -730,6 +854,35 @@ export class ContentProcessor {
 
         if (typeof error?.response?.status === 'number') {
             return error.response.status;
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Parses a Retry-After header value into milliseconds.
+     * 
+     * The header can be either:
+     * - A number of seconds (e.g., "60")
+     * - An HTTP-date (e.g., "Thu, 15 Feb 2026 14:21:00 GMT")
+     * 
+     * Returns undefined if the header is missing, empty, or unparseable.
+     * Returns a minimum of 1000ms even if the header indicates 0 or a past date.
+     */
+    parseRetryAfter(headerValue: string | undefined): number | undefined {
+        if (!headerValue) return undefined;
+
+        // Try parsing as a number of seconds first
+        const seconds = Number(headerValue);
+        if (!isNaN(seconds) && isFinite(seconds)) {
+            return Math.max(1000, Math.round(seconds * 1000));
+        }
+
+        // Try parsing as an HTTP-date
+        const date = new Date(headerValue);
+        if (!isNaN(date.getTime())) {
+            const delayMs = date.getTime() - Date.now();
+            return Math.max(1000, delayMs);
         }
 
         return undefined;

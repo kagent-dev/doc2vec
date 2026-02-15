@@ -746,6 +746,100 @@ describe('ContentProcessor', () => {
         });
     });
 
+    // ─── isProtocolError (browser-level degradation detection) ─────
+    describe('protocol error detection', () => {
+        const isProtocolError = (ContentProcessor.prototype as any).isProtocolError;
+
+        it('should detect ProtocolError messages', () => {
+            expect(isProtocolError({ message: 'ProtocolError: something failed' })).toBe(true);
+        });
+
+        it('should detect Protocol error messages (lowercase)', () => {
+            expect(isProtocolError({ message: 'Protocol error (Runtime.callFunctionOn): Session closed.' })).toBe(true);
+        });
+
+        it('should detect Network.enable timed out', () => {
+            const error = { message: 'Network.enable timed out. Increase the \'protocolTimeout\' setting in launch/connect calls for a higher timeout if needed.' };
+            expect(isProtocolError(error)).toBe(true);
+        });
+
+        it('should detect Target closed', () => {
+            expect(isProtocolError({ message: 'Target closed' })).toBe(true);
+        });
+
+        it('should detect Session closed', () => {
+            expect(isProtocolError({ message: 'Session closed' })).toBe(true);
+        });
+
+        it('should detect Connection closed', () => {
+            expect(isProtocolError({ message: 'Connection closed' })).toBe(true);
+        });
+
+        it('should detect protocolTimeout messages', () => {
+            expect(isProtocolError({ message: 'Something timed out. Increase the protocolTimeout' })).toBe(true);
+        });
+
+        it('should NOT detect regular navigation errors', () => {
+            expect(isProtocolError({ message: 'Navigation timeout of 60000ms exceeded' })).toBe(false);
+        });
+
+        it('should NOT detect network errors', () => {
+            expect(isProtocolError({ message: 'getaddrinfo ENOTFOUND example.com' })).toBe(false);
+        });
+
+        it('should NOT detect HTTP errors', () => {
+            expect(isProtocolError({ message: 'Failed to load page: HTTP 404' })).toBe(false);
+        });
+
+        it('should handle null/undefined error', () => {
+            expect(isProtocolError(null)).toBe(false);
+            expect(isProtocolError(undefined)).toBe(false);
+        });
+    });
+
+    // ─── parseRetryAfter ────────────────────────────────────────────
+    describe('parseRetryAfter', () => {
+        const parseRetryAfter = (value: string | undefined) =>
+            (processor as any).parseRetryAfter(value);
+
+        it('should parse numeric seconds', () => {
+            expect(parseRetryAfter('60')).toBe(60000);
+        });
+
+        it('should parse zero seconds to minimum 1000ms', () => {
+            expect(parseRetryAfter('0')).toBe(1000);
+        });
+
+        it('should parse fractional seconds', () => {
+            expect(parseRetryAfter('1.5')).toBe(1500);
+        });
+
+        it('should parse HTTP-date format', () => {
+            const futureDate = new Date(Date.now() + 45000);
+            const result = parseRetryAfter(futureDate.toUTCString());
+            // Should be approximately 45000ms (allow 2s tolerance for test execution time)
+            expect(result).toBeGreaterThanOrEqual(43000);
+            expect(result).toBeLessThanOrEqual(46000);
+        });
+
+        it('should return minimum 1000ms for past HTTP-date', () => {
+            const pastDate = new Date(Date.now() - 10000);
+            expect(parseRetryAfter(pastDate.toUTCString())).toBe(1000);
+        });
+
+        it('should return undefined for empty string', () => {
+            expect(parseRetryAfter('')).toBeUndefined();
+        });
+
+        it('should return undefined for undefined', () => {
+            expect(parseRetryAfter(undefined)).toBeUndefined();
+        });
+
+        it('should return undefined for unparseable value', () => {
+            expect(parseRetryAfter('not-a-number-or-date')).toBeUndefined();
+        });
+    });
+
     // ─── parseSitemap ────────────────────────────────────────────────
     describe('parseSitemap', () => {
         afterEach(() => {
@@ -903,6 +997,140 @@ describe('ContentProcessor', () => {
             expect(processPageSpy).toHaveBeenCalledTimes(2);
             expect(processContent).toHaveBeenCalledTimes(2);
         });
+
+        it('should retry on 429 with retryAfterMs and succeed on second attempt', async () => {
+            const error429 = new Error('Failed to load page: HTTP 429');
+            (error429 as any).status = 429;
+            (error429 as any).retryAfterMs = 50; // 50ms for fast test
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ content: '# Content', links: [], finalUrl: 'https://example.com' });
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+            const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+
+            // processPage called twice: first 429, then success
+            expect(processPageSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // 429 retry should NOT count as a network error
+            expect(result.hasNetworkErrors).toBe(false);
+        });
+
+        it('should retry on 429 without retryAfterMs using default delay', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), close: vi.fn(), evaluate: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                isConnected: vi.fn().mockReturnValue(true),
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+
+            const error429 = new Error('Failed to load page: HTTP 429');
+            (error429 as any).status = 429;
+            // No retryAfterMs — should use the default delay (DEFAULT_RETRY_DELAY_MS = 30s)
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ content: '# Retried Content', links: [], finalUrl: 'https://example.com' });
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+
+            // Use fake timers to avoid waiting the real 30s default delay.
+            // Must mock puppeteer.launch too since fake timers freeze its internals.
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            for (let i = 0; i < 35; i++) {
+                await vi.advanceTimersByTimeAsync(1000);
+            }
+            await crawlPromise;
+            vi.useRealTimers();
+
+            expect(processPageSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(1);
+        }, 30000);
+
+        it('should give up after MAX_RETRIES_PER_URL (3) attempts on 429', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), close: vi.fn(), evaluate: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                isConnected: vi.fn().mockReturnValue(true),
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+
+            const make429 = () => {
+                const e = new Error('Failed to load page: HTTP 429');
+                (e as any).status = 429;
+                (e as any).retryAfterMs = 10; // minimal delay for fast test
+                return e;
+            };
+
+            // Return a fresh 429 error for each call (4 total: 1 initial + 3 retries)
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(make429())
+                .mockRejectedValueOnce(make429())
+                .mockRejectedValueOnce(make429())
+                .mockRejectedValueOnce(make429());
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            for (let i = 0; i < 10; i++) {
+                await vi.advanceTimersByTimeAsync(1000);
+            }
+            const result = await crawlPromise;
+            vi.useRealTimers();
+
+            // 1 initial + 3 retries = 4 total calls
+            expect(processPageSpy).toHaveBeenCalledTimes(4);
+            expect(processContent).not.toHaveBeenCalled();
+            // After exhausting retries, it should count as an error (not network error)
+            expect(result.hasNetworkErrors).toBe(false);
+        }, 30000);
+
+        it('should not set pageNeedsRecreation on 429 retry', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), close: vi.fn(), evaluate: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                isConnected: vi.fn().mockReturnValue(true),
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+
+            const error429 = new Error('Failed to load page: HTTP 429');
+            (error429 as any).status = 429;
+            (error429 as any).retryAfterMs = 10; // minimal delay for fast test
+
+            // First call: 429, second call: success with links to /page2, third call: success
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ content: '# Content', links: ['/page2'], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
+
+            const visited = new Set<string>();
+            const processContent = vi.fn();
+
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            for (let i = 0; i < 5; i++) {
+                await vi.advanceTimersByTimeAsync(1000);
+            }
+            await crawlPromise;
+            vi.useRealTimers();
+
+            // All three calls should happen — the 429 didn't corrupt the page,
+            // so page2 should also be processed without browser recreation
+            expect(processPageSpy).toHaveBeenCalledTimes(3);
+            expect(processContent).toHaveBeenCalledTimes(2);
+        }, 30000);
     });
 
     // ─── processPage ─────────────────────────────────────────────────

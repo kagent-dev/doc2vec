@@ -747,7 +747,7 @@ describe('DatabaseManager', () => {
 
             expect(mockClient.delete).toHaveBeenCalledOnce();
             const deleteCall = mockClient.delete.mock.calls[0];
-            expect(deleteCall[1].filter.must[0].match.text).toBe('https://example.com/page');
+            expect(deleteCall[1].filter.must[0].match.value).toBe('https://example.com/page');
         });
 
         it('should set metadata value in Qdrant', async () => {
