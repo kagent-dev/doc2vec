@@ -565,8 +565,18 @@ export class ContentProcessor {
                             } catch {
                                 logger.debug(`HEAD retry also failed for ${url}, falling through to full processing`);
                             }
+                        } else if (headStatus && headStatus >= 400 && headStatus < 500 && headStatus !== 405) {
+                            // Client error (404, 403, 410, etc.) — the page doesn't
+                            // exist or is inaccessible. Skip instead of wasting a
+                            // full Puppeteer load on a non-existent page.
+                            // 405 (Method Not Allowed) is excluded because the server
+                            // may not support HEAD but the page may still exist via GET.
+                            logger.debug(`HEAD returned ${headStatus} for ${url}, skipping`);
+                            skippedCount++;
+                            continue;
                         } else {
-                            // Non-429 failure — transient network issue, etc.
+                            // Non-HTTP failure (network error, timeout), 5xx server
+                            // error, or 405 — fall through to full processing.
                             // Do NOT count toward the missing-ETag threshold.
                             logger.debug(`HEAD request failed for ${url}: ${headError?.message || headError}. Falling through to full processing.`);
                         }

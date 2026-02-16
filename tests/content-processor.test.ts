@@ -1224,6 +1224,101 @@ describe('ContentProcessor', () => {
             expect(processContent).toHaveBeenCalledTimes(1);
         });
 
+        it('should skip URL when HEAD returns 404', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 404'), {
+                    response: { status: 404 },
+                })
+            );
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Should skip — no processPage, no processContent
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+        });
+
+        it('should skip URL when HEAD returns 403', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 403'), {
+                    response: { status: 403 },
+                })
+            );
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+        });
+
+        it('should fall through to full processing when HEAD returns 405', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 405'), {
+                    response: { status: 405 },
+                })
+            );
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // 405 means server doesn't support HEAD but page may exist — should process
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should fall through to full processing when HEAD returns 500', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 500'), {
+                    response: { status: 500 },
+                })
+            );
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // 500 is a server error — should fall through and try full processing
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
         it('should process page when no ETag in HEAD response', async () => {
             const axiosModule = await import('axios');
             vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
