@@ -144,6 +144,15 @@ export class ContentProcessor {
             return '';
         }
 
+        // Pre-process tabbed content before sanitization strips ARIA attributes
+        const dom = new JSDOM(html);
+        const tabButtons = dom.window.document.querySelectorAll('[role="tab"]');
+        if (tabButtons.length > 0) {
+            const logger = this.logger.child('markdown');
+            this.preprocessTabs(dom.window.document, logger);
+            html = dom.window.document.body.innerHTML;
+        }
+
         // Sanitize the HTML first
         const cleanHtml = sanitizeHtml(html, {
             allowedTags: [
@@ -165,19 +174,20 @@ export class ContentProcessor {
         return this.turndownService.turndown(cleanHtml).trim();
     }
 
-    async parseSitemap(sitemapUrl: string, logger: Logger): Promise<string[]> {
+    async parseSitemap(sitemapUrl: string, logger: Logger): Promise<Map<string, string | undefined>> {
         logger.info(`Parsing sitemap from ${sitemapUrl}`);
         try {
             const response = await axios.get(sitemapUrl);
             const $ = load(response.data, { xmlMode: true });
             
-            const urls: string[] = [];
+            const urlMap = new Map<string, string | undefined>();
             
-            // Handle standard sitemaps
-            $('url > loc').each((_, element) => {
-                const url = $(element).text().trim();
-                if (url) {
-                    urls.push(url);
+            // Handle standard sitemaps — extract <loc> and optional <lastmod>
+            $('url').each((_, element) => {
+                const loc = $(element).find('loc').text().trim();
+                const lastmod = $(element).find('lastmod').text().trim() || undefined;
+                if (loc) {
+                    urlMap.set(loc, lastmod);
                 }
             });
             
@@ -193,24 +203,38 @@ export class ContentProcessor {
             // Recursively process nested sitemaps
             for (const nestedSitemapUrl of sitemapLinks) {
                 logger.debug(`Found nested sitemap: ${nestedSitemapUrl}`);
-                const nestedUrls = await this.parseSitemap(nestedSitemapUrl, logger);
-                urls.push(...nestedUrls);
+                const nestedMap = await this.parseSitemap(nestedSitemapUrl, logger);
+                for (const [url, lastmod] of nestedMap) {
+                    urlMap.set(url, lastmod);
+                }
             }
             
-            logger.info(`Found ${urls.length} URLs in sitemap ${sitemapUrl}`);
-            return urls;
+            const withLastmod = [...urlMap.values()].filter(v => v !== undefined).length;
+            logger.info(`Found ${urlMap.size} URLs in sitemap ${sitemapUrl} (${withLastmod} with lastmod)`);
+            return urlMap;
         } catch (error) {
             logger.error(`Error parsing sitemap at ${sitemapUrl}:`, error);
-            return [];
+            return new Map();
         }
     }
 
     async crawlWebsite(
         baseUrl: string,
         sourceConfig: WebsiteSourceConfig,
-        processPageContent: (url: string, content: string) => Promise<void>,
+        processPageContent: (url: string, content: string) => Promise<boolean>,
         parentLogger: Logger,
-        visitedUrls: Set<string>
+        visitedUrls: Set<string>,
+        options?: {
+            knownUrls?: Set<string>;
+            etagStore?: {
+                get: (url: string) => Promise<string | undefined>;
+                set: (url: string, etag: string) => Promise<void>;
+            };
+            lastmodStore?: {
+                get: (url: string) => Promise<string | undefined>;
+                set: (url: string, lastmod: string) => Promise<void>;
+            };
+        }
     ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[] }> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
@@ -235,16 +259,43 @@ export class ContentProcessor {
         };
 
         addReferrer(baseUrl, baseUrl);
-        
-        // Process sitemap if provided
+
+        const { knownUrls, etagStore, lastmodStore } = options ?? {};
+
+        // Pre-seed queue with previously-known URLs so link discovery isn't lost
+        // when pages are skipped via ETag/lastmod matching on re-runs
+        if (knownUrls && knownUrls.size > 0) {
+            for (const url of knownUrls) {
+                if (url.startsWith(sourceConfig.url) && !queue.includes(url)) {
+                    queue.push(url);
+                }
+            }
+            logger.info(`Pre-seeded ${knownUrls.size} known URLs from database into crawl queue`);
+        }
+
+        // Process sitemap if provided — extract URLs and lastmod dates
+        // The lastmod map is used later in the crawl loop for change detection
+        const sitemapLastmod = new Map<string, string>();
         if (sourceConfig.sitemap_url) {
             logger.section('SITEMAP PROCESSING');
-            const sitemapUrls = await this.parseSitemap(sourceConfig.sitemap_url, logger);
+            const sitemapData = await this.parseSitemap(sourceConfig.sitemap_url, logger);
             
-            // Add sitemap URLs to the queue if they're within the website scope
-            for (const url of sitemapUrls) {
+            // Collect parent URLs that have lastmod (directories ending with /)
+            // so we can inherit lastmod for child URLs that lack their own.
+            // Example: /gloo-mesh/2.10.x/ has lastmod but /gloo-mesh/2.10.x/reference/... doesn't.
+            const parentLastmods: Array<{ prefix: string; lastmod: string }> = [];
+            
+            // First pass: add URLs to queue and collect explicit lastmod values
+            for (const [url, lastmod] of sitemapData) {
                 if (url.startsWith(sourceConfig.url)) {
                     addReferrer(url, sourceConfig.sitemap_url);
+                    if (lastmod) {
+                        sitemapLastmod.set(url, lastmod);
+                        // Track as a potential parent for child URL inheritance
+                        if (url.endsWith('/')) {
+                            parentLastmods.push({ prefix: url, lastmod });
+                        }
+                    }
                     if (!queue.includes(url)) {
                         logger.debug(`Adding URL from sitemap to queue: ${url}`);
                         queue.push(url);
@@ -252,16 +303,60 @@ export class ContentProcessor {
                 }
             }
             
-            logger.info(`Added ${queue.length - 1} URLs from sitemap to the crawl queue`);
+            // Second pass: inherit lastmod from the most specific parent for URLs
+            // that don't have their own lastmod
+            if (parentLastmods.length > 0) {
+                // Sort by prefix length descending so longest (most specific) match wins
+                parentLastmods.sort((a, b) => b.prefix.length - a.prefix.length);
+                let inheritedCount = 0;
+                for (const [url] of sitemapData) {
+                    if (url.startsWith(sourceConfig.url) && !sitemapLastmod.has(url)) {
+                        const parent = parentLastmods.find(p => url.startsWith(p.prefix));
+                        if (parent) {
+                            sitemapLastmod.set(url, parent.lastmod);
+                            inheritedCount++;
+                        }
+                    }
+                }
+                if (inheritedCount > 0) {
+                    logger.info(`Inherited lastmod from parent URLs for ${inheritedCount} child URLs without their own lastmod`);
+                }
+            }
+            
+            logger.info(`Added ${queue.length - 1} URLs from sitemap to the crawl queue (${sitemapLastmod.size} with lastmod)`);
         }
 
         logger.info(`Starting crawl from ${baseUrl} with ${queue.length} URLs in initial queue`);
         let processedCount = 0;
         let skippedCount = 0;
         let skippedSizeCount = 0;
+        let etagSkippedCount = 0;
+        let lastmodSkippedCount = 0;
         let pdfProcessedCount = 0;
         let errorCount = 0;
         let hasNetworkErrors = false;
+        // Tracks whether the server supports ETags. Starts true and is set to false
+        // after a few consecutive successful HEAD responses return no ETag header,
+        // avoiding wasted HEAD requests for servers that don't support ETags.
+        // HEAD request failures (network errors, timeouts) do NOT count toward
+        // this threshold — they're transient issues, not evidence of missing ETag support.
+        let serverSupportsEtags = true;
+        let consecutiveMissingEtag = 0;
+        const MISSING_ETAG_THRESHOLD = 3;
+
+        // Track per-URL retry counts for rate limiting (429) responses
+        const retryCounts: Map<string, number> = new Map();
+        const MAX_RETRIES_PER_URL = 3;
+        const DEFAULT_RETRY_DELAY_MS = 30000; // 30s default when no Retry-After header
+        const MAX_RETRY_DELAY_MS = 120000;    // Cap at 2 minutes
+
+        // Adaptive backoff for HEAD requests: starts at 0 (no delay), increases
+        // on 429 responses, and decays back toward 0 on successful responses.
+        let headBackoffMs = 0;
+        const HEAD_BACKOFF_INITIAL_MS = 200;  // First backoff step after a 429
+        const HEAD_BACKOFF_MAX_MS = 5000;     // Cap at 5 seconds
+        const HEAD_BACKOFF_DECAY_FACTOR = 0.5; // Halve delay on each success
+        const HEAD_BACKOFF_FLOOR_MS = 10;     // Below this, snap to 0
 
         // Launch a single browser instance and reuse one page (tab) for all URLs
         let browser: Browser | null = null;
@@ -278,18 +373,65 @@ export class ContentProcessor {
             }
             const b = await puppeteer.launch({
                 executablePath,
-                args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',  // Use /tmp instead of /dev/shm (critical in Docker, default 64MB)
+                    '--disable-gpu',
+                    '--disable-extensions',
+                ],
+                protocolTimeout: 60000,
             });
             const p = await b.newPage();
             return { browser: b, page: p };
         };
 
+        // Track whether the page needs to be recreated (e.g., after a timeout error)
+        let pageNeedsRecreation = false;
+        // Track consecutive protocol-level errors (indicates browser process is degraded)
+        let consecutiveProtocolErrors = 0;
+        // Track pages processed since the last browser (re)launch for periodic restarts
+        let pagesSinceRestart = 0;
+        // Restart the browser every N pages to prevent memory accumulation
+        const PAGES_BETWEEN_RESTARTS = 50;
+
+        const restartBrowser = async (reason: string): Promise<void> => {
+            logger.warn(`Restarting browser: ${reason}`);
+            if (browser) {
+                try { await browser.close(); } catch { /* ignore close errors on a degraded browser */ }
+            }
+            const launched = await launchBrowser();
+            browser = launched.browser;
+            page = launched.page;
+            pageNeedsRecreation = false;
+            consecutiveProtocolErrors = 0;
+            pagesSinceRestart = 0;
+        };
+
         const ensureBrowser = async (): Promise<Page> => {
-            if (!browser || !browser.isConnected()) {
-                logger.info(browser ? 'Browser disconnected, relaunching...' : 'Launching browser...');
-                const launched = await launchBrowser();
-                browser = launched.browser;
-                page = launched.page;
+            // If protocol errors are persisting after page recreation, the browser
+            // process itself is degraded — a full restart is needed.
+            const needsBrowserRestart = pageNeedsRecreation && consecutiveProtocolErrors >= 1;
+
+            if (!browser || !browser.isConnected() || needsBrowserRestart) {
+                const reason = needsBrowserRestart
+                    ? `protocol errors persisting after page recreation (${consecutiveProtocolErrors} consecutive)`
+                    : browser ? 'browser disconnected' : 'initial launch';
+                await restartBrowser(reason);
+            } else if (pagesSinceRestart >= PAGES_BETWEEN_RESTARTS) {
+                // Periodic restart to prevent memory accumulation from long crawls
+                await restartBrowser(`periodic restart after ${pagesSinceRestart} pages`);
+            } else if (pageNeedsRecreation) {
+                // The previous page.evaluate or navigation timed out / errored.
+                // Close the stale page and create a fresh one to avoid corrupted state.
+                logger.info('Recreating page after previous error...');
+                try {
+                    if (page) await page.close();
+                } catch {
+                    // Ignore errors closing a stale page
+                }
+                page = await browser.newPage();
+                pageNeedsRecreation = false;
             }
             return page!;
         };
@@ -309,6 +451,138 @@ export class ContentProcessor {
                     continue;
                 }
 
+                // Sitemap lastmod-based skip: if the sitemap provides a lastmod date for
+                // this URL and it matches the stored value, skip entirely. This avoids
+                // both HEAD requests and full page loads — the sitemap is fetched once
+                // for the entire crawl.
+                const urlLastmod = sitemapLastmod.get(url);
+                if (urlLastmod && lastmodStore) {
+                    const storedLastmod = await lastmodStore.get(url);
+                    if (storedLastmod && storedLastmod === urlLastmod) {
+                        logger.info(`Lastmod unchanged (${urlLastmod}), skipping: ${url}`);
+                        visitedUrls.add(url);
+                        lastmodSkippedCount++;
+                        continue;
+                    } else if (storedLastmod) {
+                        logger.debug(`Lastmod changed (stored: ${storedLastmod}, sitemap: ${urlLastmod}), processing: ${url}`);
+                    } else {
+                        logger.debug(`No stored lastmod for ${url}, processing`);
+                    }
+                }
+
+                // ETag-based skip: send a lightweight HEAD request and compare the ETag
+                // to the stored value. If unchanged, skip the entire page (no Puppeteer,
+                // no content extraction, no chunking, no embedding).
+                // Skip ETag check if the URL has a lastmod from the sitemap — we trust
+                // lastmod as the primary change-detection signal when available.
+                if (!urlLastmod && !Utils.isPdfUrl(url) && etagStore && serverSupportsEtags) {
+                    // Adaptive backoff: wait before HEAD if we've been rate-limited recently
+                    if (headBackoffMs > 0) {
+                        await new Promise(resolve => setTimeout(resolve, headBackoffMs));
+                    }
+
+                    const headConfig = {
+                        timeout: 10000,
+                        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; doc2vec crawler)' },
+                        maxRedirects: 5,
+                    };
+
+                    // Checks an ETag from a HEAD response against the stored value.
+                    // Returns 'skip' if unchanged, 'process' if changed/missing, 'no-etag' if header absent.
+                    const checkEtag = async (etag: string | undefined): Promise<'skip' | 'process' | 'no-etag'> => {
+                        if (!etag) return 'no-etag';
+                        consecutiveMissingEtag = 0;
+                        const storedEtag = await etagStore.get(url);
+                        if (storedEtag && storedEtag === etag) {
+                            return 'skip';
+                        } else if (storedEtag) {
+                            logger.debug(`ETag changed (stored: ${storedEtag}, received: ${etag}), processing: ${url}`);
+                        } else {
+                            logger.debug(`No stored ETag for ${url}, processing`);
+                        }
+                        return 'process';
+                    };
+
+                    // Decay backoff on successful HEAD (non-429)
+                    const decayBackoff = () => {
+                        if (headBackoffMs > 0) {
+                            headBackoffMs = headBackoffMs * HEAD_BACKOFF_DECAY_FACTOR;
+                            if (headBackoffMs < HEAD_BACKOFF_FLOOR_MS) {
+                                headBackoffMs = 0;
+                                logger.debug('HEAD backoff decayed to 0ms');
+                            }
+                        }
+                    };
+
+                    // Increase backoff on 429
+                    const increaseBackoff = () => {
+                        const previousMs = headBackoffMs;
+                        headBackoffMs = headBackoffMs === 0
+                            ? HEAD_BACKOFF_INITIAL_MS
+                            : Math.min(headBackoffMs * 2, HEAD_BACKOFF_MAX_MS);
+                        logger.debug(`HEAD backoff increased: ${previousMs}ms → ${headBackoffMs}ms`);
+                    };
+
+                    try {
+                        const headResponse = await axios.head(url, headConfig);
+                        decayBackoff();
+                        const result = await checkEtag(headResponse.headers['etag']);
+                        if (result === 'skip') {
+                            logger.info(`ETag unchanged, skipping: ${url}`);
+                            visitedUrls.add(url);
+                            etagSkippedCount++;
+                            continue;
+                        } else if (result === 'no-etag') {
+                            consecutiveMissingEtag++;
+                            logger.debug(`No ETag in HEAD response for ${url} (${consecutiveMissingEtag}/${MISSING_ETAG_THRESHOLD})`);
+                            if (consecutiveMissingEtag >= MISSING_ETAG_THRESHOLD) {
+                                serverSupportsEtags = false;
+                                logger.warn(`Server does not return ETag headers (${MISSING_ETAG_THRESHOLD} consecutive pages without ETag). Disabling ETag-based skip for this crawl.`);
+                            }
+                        }
+                    } catch (headError: any) {
+                        // If the HEAD request was rate-limited (429), increase backoff,
+                        // wait, and retry once. The backoff ensures subsequent HEAD
+                        // requests are spaced out to avoid further 429s.
+                        const headStatus = headError?.response?.status;
+                        if (headStatus === 429) {
+                            increaseBackoff();
+                            const retryAfterMs = this.parseRetryAfter(headError.response?.headers?.['retry-after']);
+                            const delayMs = Math.min(retryAfterMs ?? 5000, 30000);
+                            logger.debug(`HEAD rate-limited (429) for ${url}, waiting ${Math.round(delayMs / 1000)}s before retry`);
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+                            try {
+                                const retryResponse = await axios.head(url, headConfig);
+                                decayBackoff();
+                                const result = await checkEtag(retryResponse.headers['etag']);
+                                if (result === 'skip') {
+                                    logger.info(`ETag unchanged, skipping: ${url}`);
+                                    visitedUrls.add(url);
+                                    etagSkippedCount++;
+                                    continue;
+                                }
+                                // 'process' or 'no-etag' — fall through to full processing
+                            } catch {
+                                logger.debug(`HEAD retry also failed for ${url}, falling through to full processing`);
+                            }
+                        } else if (headStatus && headStatus >= 400 && headStatus < 500 && headStatus !== 405) {
+                            // Client error (404, 403, 410, etc.) — the page doesn't
+                            // exist or is inaccessible. Skip instead of wasting a
+                            // full Puppeteer load on a non-existent page.
+                            // 405 (Method Not Allowed) is excluded because the server
+                            // may not support HEAD but the page may still exist via GET.
+                            logger.debug(`HEAD returned ${headStatus} for ${url}, skipping`);
+                            skippedCount++;
+                            continue;
+                        } else {
+                            // Non-HTTP failure (network error, timeout), 5xx server
+                            // error, or 405 — fall through to full processing.
+                            // Do NOT count toward the missing-ETag threshold.
+                            logger.debug(`HEAD request failed for ${url}: ${headError?.message || headError}. Falling through to full processing.`);
+                        }
+                    }
+                }
+
                 try {
                     logger.info(`Crawling: ${url}`);
                     const sources = referrers.get(url) ?? new Set([baseUrl]);
@@ -325,8 +599,9 @@ export class ContentProcessor {
                         }
                     }, currentPage);
 
+                    let contentProcessedSuccessfully = false;
                     if (result.content !== null) {
-                        await processPageContent(url, result.content);
+                        contentProcessedSuccessfully = await processPageContent(url, result.content);
                         if (Utils.isPdfUrl(url)) {
                             pdfProcessedCount++;
                         } else {
@@ -358,11 +633,102 @@ export class ContentProcessor {
 
                         logger.debug(`Found ${newLinksFound} new links on ${url}`);
                     }
+
+                    // Only store ETag/lastmod when content was processed successfully.
+                    // If chunking or embedding failed, we want the next run to retry
+                    // this page rather than skipping it based on stale metadata.
+                    if (contentProcessedSuccessfully) {
+                        // Store the ETag for this URL so subsequent runs can skip it
+                        if (result.etag && etagStore) {
+                            try {
+                                await etagStore.set(url, result.etag);
+                            } catch {
+                                // ETag storage failure is non-critical
+                            }
+                        }
+
+                        // Store the sitemap lastmod for this URL so subsequent runs can
+                        // skip it without any HTTP requests when the lastmod hasn't changed
+                        if (urlLastmod && lastmodStore) {
+                            try {
+                                await lastmodStore.set(url, urlLastmod);
+                            } catch {
+                                // Lastmod storage failure is non-critical
+                            }
+                        }
+                    }
+
+                    // Page processed successfully — reset protocol error counter and
+                    // increment the periodic restart counter
+                    consecutiveProtocolErrors = 0;
+                    if (!Utils.isPdfUrl(url)) {
+                        pagesSinceRestart++;
+                    }
+
+                    // Navigate to about:blank to clear any lingering JS, timers, or
+                    // event listeners from the processed page before moving to the next URL.
+                    if (currentPage) {
+                        try {
+                            await currentPage.goto('about:blank', { waitUntil: 'load', timeout: 5000 });
+                        } catch {
+                            // If even about:blank fails, the page is stuck — mark for recreation
+                            pageNeedsRecreation = true;
+                        }
+                    }
                 } catch (error: any) {
+                    const status = this.getHttpStatus(error);
+
+                    // ── Handle 429 (Too Many Requests) with retry ──
+                    if (status === 429) {
+                        const retries = retryCounts.get(url) ?? 0;
+                        if (retries < MAX_RETRIES_PER_URL) {
+                            const retryAfterMs = error.retryAfterMs as number | undefined;
+                            const delayMs = Math.min(
+                                retryAfterMs ?? DEFAULT_RETRY_DELAY_MS,
+                                MAX_RETRY_DELAY_MS
+                            );
+                            retryCounts.set(url, retries + 1);
+
+                            logger.warn(
+                                `Rate limited (429) on ${url} (attempt ${retries + 1}/${MAX_RETRIES_PER_URL}). ` +
+                                `Waiting ${Math.round(delayMs / 1000)}s before retry...`
+                            );
+
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+
+                            // Re-add to the front of the queue so it's retried next.
+                            // Remove from visitedUrls so it's not skipped.
+                            visitedUrls.delete(normalizedUrl);
+                            queue.unshift(url);
+
+                            // Do NOT set pageNeedsRecreation — the page/browser is healthy,
+                            // the server is just rate-limiting us.
+                            // Do NOT increment errorCount — this is a temporary condition.
+                            continue;
+                        }
+
+                        // Max retries exhausted — fall through to normal error handling
+                        logger.error(`Rate limit retries exhausted for ${url} after ${MAX_RETRIES_PER_URL} attempts`);
+                    }
+
+                    // ── General error handling ──
                     logger.error(`Failed during processing or link discovery for ${url}:`, error);
                     errorCount++;
 
-                    const status = this.getHttpStatus(error);
+                    // Mark the page for recreation so the next URL gets a clean tab.
+                    // This prevents cascading failures from a stuck/corrupted page state.
+                    pageNeedsRecreation = true;
+
+                    // Track protocol-level errors separately — these indicate the browser
+                    // process itself is degraded, not just the page. If they persist after
+                    // page recreation, ensureBrowser() will escalate to a full browser restart.
+                    if (this.isProtocolError(error)) {
+                        consecutiveProtocolErrors++;
+                        logger.warn(`Protocol error detected (${consecutiveProtocolErrors} consecutive), browser may need restart`);
+                    } else {
+                        consecutiveProtocolErrors = 0;
+                    }
+
                     if (status === 404) {
                         const sources = referrers.get(url) ?? new Set([baseUrl]);
                         for (const source of sources) {
@@ -386,13 +752,29 @@ export class ContentProcessor {
             }
         }
 
-        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
+        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (Lastmod): ${lastmodSkippedCount}, Skipped (ETag): ${etagSkippedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
         
         if (hasNetworkErrors) {
             logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');
         }
         
         return { hasNetworkErrors, brokenLinks };
+    }
+
+    /**
+     * Detects Chrome DevTools Protocol-level errors that indicate the browser
+     * process is degraded/stuck (not just a single page issue).
+     * These errors cannot be fixed by page recreation alone — the browser needs a full restart.
+     */
+    private isProtocolError(error: any): boolean {
+        const msg = error?.message || '';
+        return msg.includes('ProtocolError') ||
+            msg.includes('Protocol error') ||
+            (msg.includes('timed out') && msg.includes('protocolTimeout')) ||
+            msg.includes('Target closed') ||
+            msg.includes('Session closed') ||
+            msg.includes('Network.enable timed out') ||
+            msg.includes('Connection closed');
     }
 
     private isNetworkError(error: any): boolean {
@@ -436,7 +818,7 @@ export class ContentProcessor {
         sourceConfig: SourceConfig,
         onHttpStatus?: (url: string, status: number) => void,
         existingPage?: Page
-    ): Promise<{ content: string | null, links: string[], finalUrl: string }> {
+    ): Promise<{ content: string | null, links: string[], finalUrl: string, etag?: string }> {
         const logger = this.logger.child('page-processor');
         logger.debug(`Processing content from ${url}`);
 
@@ -487,7 +869,14 @@ export class ContentProcessor {
                 
                 browser = await puppeteer.launch({
                     executablePath,
-                    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-extensions',
+                    ],
+                    protocolTimeout: 60000,
                 });
                 page = await browser.newPage();
             }
@@ -498,15 +887,31 @@ export class ContentProcessor {
             if (status !== undefined && status >= 400) {
                 const error = new Error(`Failed to load page: HTTP ${status}`);
                 (error as any).status = status;
+
+                // For 429 (Too Many Requests), extract the Retry-After header so the
+                // caller can wait the right amount of time before retrying.
+                if (status === 429 && response) {
+                    const retryAfterMs = this.parseRetryAfter(response.headers()['retry-after']);
+                    if (retryAfterMs !== undefined) {
+                        (error as any).retryAfterMs = retryAfterMs;
+                        logger.info(`Rate limited (429). Retry-After: ${retryAfterMs}ms`);
+                    } else {
+                        logger.info(`Rate limited (429). No Retry-After header present.`);
+                    }
+                }
+
                 throw error;
             }
 
             // Get the final URL after any redirects
             const finalUrl = page.url();
 
+            // Extract ETag header for change detection on subsequent runs
+            const etag = response?.headers()['etag'] || undefined;
+
             // Extract ALL links from the full rendered DOM before any content filtering
             // This searches the entire document, not just the main content area
-            const links: string[] = await page.evaluate(() => {
+            const links: string[] = await this.evaluateWithTimeout(page, () => {
                 const anchors = document.querySelectorAll('a[href]');
                 const hrefs: string[] = [];
                 anchors.forEach(a => {
@@ -519,7 +924,7 @@ export class ContentProcessor {
             });
             logger.debug(`Extracted ${links.length} links from full DOM of ${url}`);
 
-            const htmlContent: string = await page.evaluate(() => {
+            const htmlContent: string = await this.evaluateWithTimeout(page, () => {
                 // Try specific content selectors first, then fall back to broader ones
                 const mainContentElement = 
                     document.querySelector('.docs-content') ||        // Common docs pattern
@@ -534,7 +939,7 @@ export class ContentProcessor {
 
             if (htmlContent.length > sourceConfig.max_size) {
                 logger.warn(`Raw HTML content (${htmlContent.length} chars) exceeds max size (${sourceConfig.max_size}). Skipping detailed processing for ${url}.`);
-                return { content: null, links, finalUrl };
+                return { content: null, links, finalUrl, etag };
             }
 
             logger.debug(`Got HTML content (${htmlContent.length} chars), creating DOM`);
@@ -546,6 +951,12 @@ export class ContentProcessor {
                 pre.setAttribute('data-readable-content-score', '100');
                 this.markCodeParents(pre.parentElement);
             });
+
+            // Pre-process tabbed content: inject tab labels into panels
+            // and make hidden panels visible so Readability doesn't discard them.
+            // Done in JSDOM (not in Puppeteer's page.evaluate) to avoid triggering
+            // reactive framework re-renders when modifying data-state attributes.
+            this.preprocessTabs(document, logger);
 
             // Extract H1s BEFORE Readability - it often strips them as "chrome"
             // We'll inject them back after Readability processing
@@ -571,7 +982,7 @@ export class ContentProcessor {
 
             if (!article) {
                 logger.warn(`Failed to parse article content with Readability for ${url}`);
-                return { content: null, links, finalUrl };
+                return { content: null, links, finalUrl, etag };
             }
             
             // Debug: Log what Readability extracted
@@ -643,7 +1054,7 @@ export class ContentProcessor {
             }
             
             logger.debug(`Markdown conversion complete (${markdown.length} chars)`);
-            return { content: markdown, links, finalUrl };
+            return { content: markdown, links, finalUrl, etag };
         } catch (error) {
             const status = this.getHttpStatus(error);
             if (status !== undefined && status >= 400) {
@@ -663,6 +1074,19 @@ export class ContentProcessor {
         }
     }
 
+    /**
+     * Wraps a page.evaluate call with a timeout to prevent indefinite hangs.
+     * Some pages have heavy/infinite JavaScript that blocks evaluate calls.
+     */
+    private evaluateWithTimeout<T>(page: Page, fn: () => T, timeoutMs: number = 30000): Promise<T> {
+        return Promise.race([
+            page.evaluate(fn),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`page.evaluate timed out after ${timeoutMs}ms`)), timeoutMs)
+            )
+        ]);
+    }
+
     private getHttpStatus(error: any): number | undefined {
         if (typeof error?.status === 'number') {
             return error.status;
@@ -673,6 +1097,143 @@ export class ContentProcessor {
         }
 
         return undefined;
+    }
+
+    /**
+     * Parses a Retry-After header value into milliseconds.
+     * 
+     * The header can be either:
+     * - A number of seconds (e.g., "60")
+     * - An HTTP-date (e.g., "Thu, 15 Feb 2026 14:21:00 GMT")
+     * 
+     * Returns undefined if the header is missing, empty, or unparseable.
+     * Returns a minimum of 1000ms even if the header indicates 0 or a past date.
+     */
+    parseRetryAfter(headerValue: string | undefined): number | undefined {
+        if (!headerValue) return undefined;
+
+        // Try parsing as a number of seconds first
+        const seconds = Number(headerValue);
+        if (!isNaN(seconds) && isFinite(seconds)) {
+            return Math.max(1000, Math.round(seconds * 1000));
+        }
+
+        // Try parsing as an HTTP-date
+        const date = new Date(headerValue);
+        if (!isNaN(date.getTime())) {
+            const delayMs = date.getTime() - Date.now();
+            return Math.max(1000, delayMs);
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Pre-processes tabbed content in the DOM before Readability runs.
+     * 
+     * Detects tabs using the standard WAI-ARIA tabs pattern:
+     * - Tab buttons: elements with role="tab" and aria-controls pointing to a panel
+     * - Tab panels: elements with role="tabpanel" matched by id
+     * 
+     * For each tab/panel pair, injects the tab label as a bold heading into
+     * the panel content, so the context is preserved after conversion to markdown.
+     * Also ensures hidden panels are visible so Readability doesn't discard them.
+     * 
+     * Falls back to positional matching (nth tab -> nth panel) when aria-controls
+     * is missing.
+     */
+    private preprocessTabs(document: Document, logger: Logger) {
+        // Find all tab buttons using the WAI-ARIA role="tab" attribute
+        const tabButtons = document.querySelectorAll('[role="tab"]');
+        if (tabButtons.length === 0) return;
+
+        logger.debug(`[Tab Preprocessing] Found ${tabButtons.length} tab buttons`);
+
+        // Collect all tabpanels for fallback positional matching
+        const allPanels = document.querySelectorAll('[role="tabpanel"]');
+
+        // Track panels that have already been labeled to avoid duplicates.
+        // Pages can have multiple tab groups that reuse the same panel IDs
+        // (e.g., two separate tab sets both using tabs-panel-0, tabs-panel-1, etc.),
+        // causing getElementById to return the same panel for different tab buttons.
+        const labeledPanels = new Set<Element>();
+
+        tabButtons.forEach((tab: Element, index: number) => {
+            const label = tab.textContent?.trim();
+            if (!label) {
+                logger.debug(`[Tab Preprocessing] Skipping tab[${index}] with empty label`);
+                return;
+            }
+
+            // Try to find the linked panel via aria-controls -> id
+            let panel: Element | null = null;
+            const controlsId = tab.getAttribute('aria-controls');
+            if (controlsId) {
+                panel = document.getElementById(controlsId);
+            }
+
+            // Fallback: positional matching (nth tab -> nth panel)
+            if (!panel && index < allPanels.length) {
+                panel = allPanels[index];
+                logger.debug(`[Tab Preprocessing] Using positional fallback for tab[${index}]: "${label}"`);
+            }
+
+            if (!panel) {
+                logger.debug(`[Tab Preprocessing] No panel found for tab[${index}]: "${label}"`);
+                return;
+            }
+
+            // Skip if this panel has already been labeled (duplicate panel ID across tab groups)
+            if (labeledPanels.has(panel)) {
+                logger.debug(`[Tab Preprocessing] Skipping tab[${index}]: "${label}" — panel already labeled`);
+                return;
+            }
+            labeledPanels.add(panel);
+
+            logger.debug(`[Tab Preprocessing] Injecting label for tab[${index}]: "${label}"`);
+
+            // Inject the tab label as bold text at the top of the panel
+            const labelElement = document.createElement('p');
+            const strong = document.createElement('strong');
+            strong.textContent = label + ':';
+            labelElement.appendChild(strong);
+            panel.insertBefore(labelElement, panel.firstChild);
+
+            // Ensure the panel is visible so Readability doesn't skip it.
+            // Remove common hiding patterns:
+            // 1. data-state attribute (used by Hextra, Radix, etc.)
+            if (panel.getAttribute('data-state') !== 'selected') {
+                panel.setAttribute('data-state', 'selected');
+            }
+            // 2. CSS classes that hide content
+            const classList = panel.classList;
+            // Common hiding classes across frameworks
+            const hidingClasses = ['hidden', 'hx-hidden', 'is-hidden', 'display-none', 'd-none', 'invisible'];
+            hidingClasses.forEach(cls => classList.remove(cls));
+            // Also remove any class containing 'hidden' as a segment (e.g., 'hx-hidden')
+            Array.from(classList).forEach(cls => {
+                if (/\bhidden\b/i.test(cls)) {
+                    classList.remove(cls);
+                }
+            });
+            // 3. Inline style hiding
+            const style = panel.getAttribute('style') || '';
+            if (style.includes('display') && style.includes('none')) {
+                panel.setAttribute('style', style.replace(/display\s*:\s*none\s*;?/gi, ''));
+            }
+
+            // Mark the panel as content so Readability preserves it
+            panel.classList.add('article-content');
+            panel.setAttribute('data-readable-content-score', '100');
+        });
+
+        // Remove the tab buttons since we've injected the labels into panels
+        // This prevents the tab labels from appearing twice in the output
+        tabButtons.forEach((tab: Element) => {
+            tab.remove();
+        });
+
+        logger.debug(`[Tab Preprocessing] Completed tab preprocessing`);
     }
 
     private markCodeParents(node: Element | null) {

@@ -415,11 +415,49 @@ export class Doc2Vec {
         logger.info(`Starting processing for website: ${config.url}`);
         
         const dbConnection = await DatabaseManager.initDatabase(config, logger);
+        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
         const validChunkIds: Set<string> = new Set();
         const visitedUrls: Set<string> = new Set();
         const urlPrefix = Utils.getUrlPrefix(config.url);
         
         logger.section('CRAWL AND EMBEDDING');
+
+        // Pre-load known URLs from the database so the queue includes pages from
+        // previous runs. This ensures link discovery isn't lost when pages are
+        // skipped via ETag matching.
+        let knownUrls: Set<string> | undefined;
+        if (dbConnection.type === 'sqlite') {
+            const urls = DatabaseManager.getStoredUrlsByPrefixSQLite(dbConnection.db, urlPrefix);
+            if (urls.length > 0) {
+                knownUrls = new Set(urls);
+                logger.info(`Found ${urls.length} known URLs in database for pre-seeding`);
+            }
+        } else if (dbConnection.type === 'qdrant') {
+            const urls = await DatabaseManager.getStoredUrlsByPrefixQdrant(dbConnection, urlPrefix);
+            if (urls.length > 0) {
+                knownUrls = new Set(urls);
+                logger.info(`Found ${urls.length} known URLs in Qdrant for pre-seeding`);
+            }
+        }
+
+        // ETag store for caching page ETags across runs
+        const etagStore = {
+            get: async (url: string): Promise<string | undefined> => {
+                return DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, logger);
+            },
+            set: async (url: string, etag: string): Promise<void> => {
+                await DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, logger);
+            },
+        };
+
+        const lastmodStore = {
+            get: async (url: string): Promise<string | undefined> => {
+                return DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, logger);
+            },
+            set: async (url: string, lastmod: string): Promise<void> => {
+                await DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, logger);
+            },
+        };
 
         const crawlResult = await this.contentProcessor.crawlWebsite(config.url, config, async (url, content) => {
             visitedUrls.add(url);
@@ -429,82 +467,18 @@ export class Doc2Vec {
                 const chunks = await this.contentProcessor.chunkMarkdown(content, config, url);
                 logger.info(`Created ${chunks.length} chunks`);
 
-                if (chunks.length > 0) {
-                    const chunkProgress = logger.progress(`Processing chunks for ${url}`, chunks.length);
-
-                    for (let i = 0; i < chunks.length; i++) {
-                        const chunk = chunks[i];
-                        validChunkIds.add(chunk.metadata.chunk_id);
-
-                        const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-
-                        let needsEmbedding = true;
-                        const chunkHash = Utils.generateHash(chunk.content);
-
-                        if (dbConnection.type === 'sqlite') {
-                            const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                            const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-
-                            if (existing && existing.hash === chunkHash) {
-                                needsEmbedding = false;
-                                chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            }
-                        } else if (dbConnection.type === 'qdrant') {
-                            try {
-                                let pointId: string;
-                                try {
-                                    pointId = chunk.metadata.chunk_id;
-                                    if (!Utils.isValidUuid(pointId)) {
-                                        pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                                    }
-                                } catch (e) {
-                                    pointId = crypto.randomUUID();
-                                }
-
-                                const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                                    ids: [pointId],
-                                    with_payload: true,
-                                    with_vector: false,
-                                });
-
-                                if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                                    needsEmbedding = false;
-                                    chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                    logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                }
-                            } catch (error) {
-                                logger.error(`Error checking existing point in Qdrant:`, error);
-                            }
-                        }
-
-
-                        if (needsEmbedding) {
-                            const embeddings = await this.createEmbeddings([chunk.content]);
-                            if (embeddings.length > 0) {
-                                const embedding = embeddings[0];
-                                if (dbConnection.type === 'sqlite') {
-                                    DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
-                                    chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
-                                } else if (dbConnection.type === 'qdrant') {
-                                    await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
-                                    chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                                }
-                            } else {
-                                logger.error(`Embedding failed for chunk: ${chunkId}`);
-                                chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
-                            }
-                        }
-                    }
-
-                    chunkProgress.complete();
+                for (const chunk of chunks) {
+                    validChunkIds.add(chunk.metadata.chunk_id);
                 }
 
+                await this.processChunksForUrl(chunks, url, dbConnection, logger);
+                return true;
             } catch (error) {
                 logger.error(`Error during chunking or embedding for ${url}:`, error);
+                return false;
             }
 
-        }, logger, visitedUrls);
+        }, logger, visitedUrls, { knownUrls, etagStore, lastmodStore });
 
         this.recordBrokenLinks(config.url, crawlResult.brokenLinks);
         this.writeBrokenLinksReport();
@@ -608,76 +582,12 @@ export class Doc2Vec {
                     
                     const chunks = await this.contentProcessor.chunkMarkdown(content, config, fileUrl);
                     logger.info(`Created ${chunks.length} chunks`);
-                    
-                    if (chunks.length > 0) {
-                        const chunkProgress = logger.progress(`Processing chunks for ${filePath}`, chunks.length);
-                        
-                        for (let i = 0; i < chunks.length; i++) {
-                            const chunk = chunks[i];
-                            validChunkIds.add(chunk.metadata.chunk_id);
-                            
-                            const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                            
-                            let needsEmbedding = true;
-                            const chunkHash = Utils.generateHash(chunk.content);
-                            
-                            if (dbConnection.type === 'sqlite') {
-                                const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                                const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                                
-                                if (existing && existing.hash === chunkHash) {
-                                    needsEmbedding = false;
-                                    chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                    logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                }
-                            } else if (dbConnection.type === 'qdrant') {
-                                try {
-                                    let pointId: string;
-                                    try {
-                                        pointId = chunk.metadata.chunk_id;
-                                        if (!Utils.isValidUuid(pointId)) {
-                                            pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                                        }
-                                    } catch (e) {
-                                        pointId = crypto.randomUUID();
-                                    }
-                                    
-                                    const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                                        ids: [pointId],
-                                        with_payload: true,
-                                        with_vector: false,
-                                    });
-                                    
-                                    if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                                        needsEmbedding = false;
-                                        chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                    }
-                                } catch (error) {
-                                    logger.error(`Error checking existing point in Qdrant:`, error);
-                                }
-                            }
-                            
-                            if (needsEmbedding) {
-                                const embeddings = await this.createEmbeddings([chunk.content]);
-                                if (embeddings.length > 0) {
-                                    const embedding = embeddings[0];
-                                    if (dbConnection.type === 'sqlite') {
-                                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
-                                        chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
-                                    } else if (dbConnection.type === 'qdrant') {
-                                        await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
-                                        chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                                    }
-                                } else {
-                                    logger.error(`Embedding failed for chunk: ${chunkId}`);
-                                    chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
-                                }
-                            }
-                        }
-                        
-                        chunkProgress.complete();
+
+                    for (const chunk of chunks) {
+                        validChunkIds.add(chunk.metadata.chunk_id);
                     }
+
+                    await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
                 } catch (error) {
                     logger.error(`Error during chunking or embedding for ${filePath}:`, error);
                 }
@@ -802,74 +712,11 @@ export class Doc2Vec {
                         );
                         logger.info(`Created ${chunks.length} chunks`);
 
-                        if (chunks.length > 0) {
-                            const chunkProgress = logger.progress(`Processing chunks for ${relativePath || filePath}`, chunks.length);
-
-                            for (let i = 0; i < chunks.length; i++) {
-                                const chunk = chunks[i];
-                                validChunkIds.add(chunk.metadata.chunk_id);
-
-                                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                                let needsEmbedding = true;
-                                const chunkHash = Utils.generateHash(chunk.content);
-
-                                if (dbConnection.type === 'sqlite') {
-                                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-
-                                    if (existing && existing.hash === chunkHash) {
-                                        needsEmbedding = false;
-                                        chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                    }
-                                } else if (dbConnection.type === 'qdrant') {
-                                    try {
-                                        let pointId: string;
-                                        try {
-                                            pointId = chunk.metadata.chunk_id;
-                                            if (!Utils.isValidUuid(pointId)) {
-                                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                                            }
-                                        } catch (e) {
-                                            pointId = crypto.randomUUID();
-                                        }
-
-                                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                                            ids: [pointId],
-                                            with_payload: true,
-                                            with_vector: false,
-                                        });
-
-                                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                                            needsEmbedding = false;
-                                            chunkProgress.update(1, `Skipping unchanged chunk ${chunkId}`);
-                                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                                        }
-                                    } catch (error) {
-                                        logger.error(`Error checking existing point in Qdrant:`, error);
-                                    }
-                                }
-
-                                if (needsEmbedding) {
-                                    const embeddings = await this.createEmbeddings([chunk.content]);
-                                    if (embeddings.length > 0) {
-                                        const embedding = embeddings[0];
-                                        if (dbConnection.type === 'sqlite') {
-                                            DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
-                                            chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
-                                        } else if (dbConnection.type === 'qdrant') {
-                                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
-                                            chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                                        }
-                                    } else {
-                                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                                        chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
-                                    }
-                                }
-                            }
-
-                            chunkProgress.complete();
+                        for (const chunk of chunks) {
+                            validChunkIds.add(chunk.metadata.chunk_id);
                         }
+
+                        await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
                     } catch (error) {
                         logger.error(`Error during code chunking or embedding for ${filePath}:`, error);
                     }
@@ -1421,63 +1268,8 @@ export class Doc2Vec {
             
             const chunks = await this.contentProcessor.chunkMarkdown(markdown, articleConfig, url);
             logger.info(`Article #${articleId}: Created ${chunks.length} chunks`);
-            
-            // Process and store each chunk (similar to ticket processing)
-            for (const chunk of chunks) {
-                const chunkHash = Utils.generateHash(chunk.content);
-                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
 
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
-                } else if (dbConnection.type === 'qdrant') {
-                    try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
-
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
-                    }
-                }
-            }
+            await this.processChunksForUrl(chunks, url, dbConnection, logger);
         };
 
         logger.info(`Fetching Zendesk help center articles updated since ${startDate}`);
@@ -1517,13 +1309,119 @@ export class Doc2Vec {
         logger.info(`Successfully processed ${processedArticles} of ${totalArticles} articles (filtered by date >= ${startDate})`);
     }
 
+    /**
+     * Process chunks for a given URL with change detection.
+     * 
+     * Compares the new chunk hashes against existing hashes stored in the DB.
+     * - If all hashes match (same content, same count): skip entirely (no embedding, no DB writes).
+     * - If any hash differs: delete all existing chunks for this URL and re-embed/insert all new chunks.
+     * 
+     * This ensures chunk_index and total_chunks are always consistent, and no orphaned
+     * chunks are left behind when content shifts (e.g., a paragraph is added in the middle).
+     * 
+     * @returns The number of chunks that were embedded (0 if skipped).
+     */
+    private async processChunksForUrl(
+        chunks: DocumentChunk[],
+        url: string,
+        dbConnection: DatabaseConnection,
+        logger: Logger
+    ): Promise<number> {
+        if (chunks.length === 0) return 0;
+
+        // 1. Compute hashes for all new chunks
+        const newHashes = chunks.map(c => Utils.generateHash(c.content));
+        const newHashesSorted = newHashes.slice().sort();
+
+        // 2. Fetch existing hashes for this URL from the DB
+        let existingHashesSorted: string[];
+        if (dbConnection.type === 'sqlite') {
+            existingHashesSorted = DatabaseManager.getChunkHashesByUrlSQLite(dbConnection.db, url);
+        } else {
+            existingHashesSorted = await DatabaseManager.getChunkHashesByUrlQdrant(dbConnection, url);
+        }
+
+        // 3. Compare: if identical sorted arrays, content is unchanged — skip
+        const unchanged = newHashesSorted.length === existingHashesSorted.length &&
+            newHashesSorted.every((h, i) => h === existingHashesSorted[i]);
+
+        if (unchanged) {
+            logger.info(`Skipping unchanged URL (${chunks.length} chunks): ${url}`);
+            return 0;
+        }
+
+        // 4. Content changed — delete all existing chunks for this URL
+        if (existingHashesSorted.length > 0) {
+            logger.info(`Content changed for ${url} (${existingHashesSorted.length} old chunks → ${chunks.length} new chunks), re-embedding all`);
+            if (dbConnection.type === 'sqlite') {
+                DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+            } else {
+                await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+            }
+        }
+
+        // 5. Embed and insert all new chunks
+        let embeddedCount = 0;
+        const chunkProgress = logger.progress(`Embedding chunks for ${url}`, chunks.length);
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const chunkHash = newHashes[i];
+            const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+
+            const embeddings = await this.createEmbeddings([chunk.content]);
+            if (embeddings.length > 0) {
+                const embedding = embeddings[0];
+                if (dbConnection.type === 'sqlite') {
+                    DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
+                    chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
+                } else if (dbConnection.type === 'qdrant') {
+                    await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
+                    chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
+                }
+                embeddedCount++;
+            } else {
+                logger.error(`Embedding failed for chunk: ${chunkId}`);
+                chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
+            }
+        }
+
+        chunkProgress.complete();
+        return embeddedCount;
+    }
+
+    // Embedding model token limit and character-based estimate.
+    // OpenAI's text-embedding-3-large has an 8,191-token context limit.
+    // Using ~4 chars per BPE token as a conservative estimate (actual average
+    // is ~3.5 for English, lower for code/URLs/config paths).
+    private static readonly MAX_EMBEDDING_TOKENS = 8191;
+    private static readonly CHARS_PER_TOKEN = 4;
+    private static readonly MAX_EMBEDDING_CHARS = Doc2Vec.MAX_EMBEDDING_TOKENS * Doc2Vec.CHARS_PER_TOKEN;
+
     private async createEmbeddings(texts: string[]): Promise<number[][]> {
         const logger = this.logger.child('embeddings');
         try {
-            logger.debug(`Creating embeddings for ${texts.length} texts`);
+            // Truncate any texts that exceed the embedding model's token limit.
+            // This is a safety net for pages with dense content (e.g., large API
+            // reference pages with deeply nested config paths) where the chunker's
+            // whitespace-based token count drastically underestimates BPE tokens.
+            const safeTexts = texts.map(text => {
+                if (text.length > Doc2Vec.MAX_EMBEDDING_CHARS) {
+                    const estimatedTokens = Math.ceil(text.length / Doc2Vec.CHARS_PER_TOKEN);
+                    logger.warn(
+                        `Truncating oversized chunk (${text.length} chars, ~${estimatedTokens} tokens) ` +
+                        `to ${Doc2Vec.MAX_EMBEDDING_CHARS} chars (~${Doc2Vec.MAX_EMBEDDING_TOKENS} tokens) ` +
+                        `to fit embedding model limit`
+                    );
+                    return text.substring(0, Doc2Vec.MAX_EMBEDDING_CHARS);
+                }
+                return text;
+            });
+
+            logger.debug(`Creating embeddings for ${safeTexts.length} texts`);
             const response = await this.openai.embeddings.create({
                 model: this.embeddingModel,
-                input: texts,
+                input: safeTexts,
             });
             logger.debug(`Successfully created ${response.data.length} embeddings`);
             return response.data.map(d => d.embedding);

@@ -72,6 +72,8 @@ vi.mock('../database', () => ({
         removeObsoleteFilesQdrant: vi.fn().mockResolvedValue(undefined),
         removeChunksByUrlSQLite: vi.fn(),
         removeChunksByUrlQdrant: vi.fn().mockResolvedValue(undefined),
+        getChunkHashesByUrlSQLite: vi.fn().mockReturnValue([]),
+        getChunkHashesByUrlQdrant: vi.fn().mockResolvedValue([]),
     },
 }));
 
@@ -652,6 +654,57 @@ sources:
 
             const result = await (instance as any).createEmbeddings(['test text']);
             expect(result).toEqual([]);
+        });
+
+        it('should truncate text exceeding MAX_EMBEDDING_CHARS', async () => {
+            const maxChars = (Doc2Vec as any).MAX_EMBEDDING_CHARS; // 8191 * 4 = 32764
+            const oversizedText = 'x'.repeat(maxChars + 1000);
+
+            const mockEmbedding = [0.1, 0.2, 0.3];
+            mockEmbeddingsCreate.mockResolvedValue({
+                data: [{ embedding: mockEmbedding }],
+            });
+
+            const result = await (instance as any).createEmbeddings([oversizedText]);
+
+            // Should still produce an embedding (truncated, not skipped)
+            expect(result).toEqual([mockEmbedding]);
+            // The input sent to OpenAI should be truncated
+            const calledInput = mockEmbeddingsCreate.mock.calls[0][0].input;
+            expect(calledInput[0].length).toBe(maxChars);
+        });
+
+        it('should not truncate text under MAX_EMBEDDING_CHARS', async () => {
+            const normalText = 'hello world';
+            const mockEmbedding = [0.1, 0.2, 0.3];
+            mockEmbeddingsCreate.mockResolvedValue({
+                data: [{ embedding: mockEmbedding }],
+            });
+
+            await (instance as any).createEmbeddings([normalText]);
+
+            const calledInput = mockEmbeddingsCreate.mock.calls[0][0].input;
+            expect(calledInput[0]).toBe(normalText);
+        });
+
+        it('should only truncate the oversized text in a mixed batch', async () => {
+            const maxChars = (Doc2Vec as any).MAX_EMBEDDING_CHARS;
+            const normalText = 'short text';
+            const oversizedText = 'y'.repeat(maxChars + 5000);
+
+            const mockEmbeddings = [[0.1], [0.2]];
+            mockEmbeddingsCreate.mockResolvedValue({
+                data: mockEmbeddings.map(e => ({ embedding: e })),
+            });
+
+            const result = await (instance as any).createEmbeddings([normalText, oversizedText]);
+
+            expect(result).toEqual(mockEmbeddings);
+            const calledInput = mockEmbeddingsCreate.mock.calls[0][0].input;
+            // First text should be unchanged
+            expect(calledInput[0]).toBe(normalText);
+            // Second text should be truncated
+            expect(calledInput[1].length).toBe(maxChars);
         });
     });
 

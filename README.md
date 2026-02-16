@@ -11,7 +11,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 ## Key Features
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
-    * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation.
+    * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation. When sitemaps include `<lastmod>` dates, pages are skipped without any HTTP requests if the date hasn't changed since the last sync.
     * **PDF Support:** Automatically downloads and processes PDF files linked from websites.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
 *   **Zendesk Integration:** Fetches support tickets and knowledge base articles from Zendesk, converting them to searchable chunks.
@@ -28,6 +28,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Content Extraction:** Uses Puppeteer for rendering JavaScript-heavy pages and `@mozilla/readability` to extract the main article content.
     *   **Smart H1 Preservation:** Automatically extracts and preserves page titles (H1 headings) that Readability might strip as "page chrome", ensuring proper heading hierarchy.
     *   **Flexible Content Selectors:** Supports multiple content container patterns (`.docs-content`, `.doc-content`, `.markdown-body`, `article`, etc.) for better compatibility with various documentation sites.
+    *   **Tabbed Content Support:** Automatically detects WAI-ARIA tabs (`role="tab"` / `role="tabpanel"`) and injects tab labels into panel content so each tab's context is preserved after conversion to Markdown.
 *   **HTML to Markdown:** Converts extracted HTML to clean Markdown using `turndown`, preserving code blocks and basic formatting.
     *   **Clean Heading Text:** Automatically removes anchor links (like `[](#section-id)`) from heading text for cleaner hierarchy display.
 *   **Intelligent Chunking:** Splits Markdown content into manageable chunks based on headings and token limits, preserving context.
@@ -35,7 +36,13 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
     *   **SQLite:** Using `better-sqlite3` and the `sqlite-vec` extension for efficient vector search.
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
-*   **Change Detection:** Uses content hashing to detect changes and only re-embeds and updates chunks that have actually been modified.
+*   **Multi-Layer Change Detection:** Four layers of change detection minimize unnecessary re-processing:
+    1. **Sitemap `lastmod`:** When available, compares the sitemap's `<lastmod>` date against the stored value — skips without any HTTP request. Child URLs inherit `lastmod` from their most specific parent directory.
+    2. **ETag via HEAD request:** For URLs without `lastmod`, sends a lightweight HEAD request and compares the ETag header against the stored value. Adaptive backoff prevents rate limiting (starts at 0ms delay, increases on 429 responses, decays on success).
+    3. **Content hash comparison:** After full page load, compares chunk content hashes against stored values — skips embedding if content is unchanged.
+    4. **Embedding:** Only re-embeds chunks when content has actually changed.
+    
+    ETag and lastmod values are only stored when chunking and embedding succeed, ensuring failed pages are retried on the next run.
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
@@ -496,12 +503,16 @@ If you don't specify a config path, it will look for config.yaml in the current 
     2.  **Process by Source Type:**
         - **For Websites:**
           *   Start at the base `url`.
-          *   If `sitemap_url` is provided, fetch and parse the sitemap to extract additional URLs.
-          *   Use Puppeteer (`processPage`) to fetch and render HTML for web pages.
+          *   If `sitemap_url` is provided, fetch and parse the sitemap to extract URLs and `lastmod` dates.
+          *   Pre-seed the crawl queue with known URLs from the database (ensures link discovery isn't lost when pages are skipped).
+          *   For each URL, apply multi-layer change detection:
+              1.  If `lastmod` is available (from sitemap), compare against stored value — skip if unchanged.
+              2.  Otherwise, send a HEAD request and compare the ETag — skip if unchanged. Adaptive backoff prevents rate limiting.
+              3.  If no skip, use Puppeteer (`processPage`) to fetch and render the full page.
           *   For PDF URLs, download and extract text using Mozilla's PDF.js.
           *   Use Readability to extract main content from HTML pages.
           *   Sanitize HTML and convert to Markdown using Turndown.
-          *   Use `axios`/`cheerio` on HTML pages to find new links to add to the crawl queue.
+          *   Discover links from the rendered DOM to add to the crawl queue.
           *   Keep track of all visited URLs.
         - **For GitHub Repositories:**
           *   Fetch issues and comments using the GitHub API.
@@ -520,13 +531,62 @@ If you don't specify a config path, it will look for config.yaml in the current 
           *   Track last run date to support incremental updates.
     3.  **Process Content:** For each processed page, issue, or file:
         *   **Chunk:** Split Markdown into smaller `DocumentChunk` objects based on headings and size.
-        *   **Hash Check:** Generate a hash of the chunk content. Check if a chunk with the same ID exists in the DB and if its hash matches.
-        *   **Embed (if needed):** If the chunk is new or changed, call the OpenAI API (`createEmbeddings`) to get the vector embedding.
-        *   **Store:** Insert or update the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
+        *   **URL-Level Change Detection:** Compute content hashes for all new chunks and compare them against stored hashes for that URL. If all hashes match, the entire URL is skipped (no embedding or DB writes needed).
+        *   **Re-process (if changed):** If any hash differs, delete all existing chunks for the URL and re-embed/insert all new chunks. This ensures consistent `chunk_index`/`total_chunks` values and eliminates orphaned chunks when content shifts (e.g., a paragraph is added in the middle).
+        *   **Embed:** Call the OpenAI API (`createEmbeddings`) to get the vector embedding for each chunk.
+        *   **Store:** Insert the chunk, metadata, hash, and embedding in the database (SQLite `vec_items` table or Qdrant collection).
     4.  **Cleanup:** After processing, remove any obsolete chunks from the database.
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Multi-Layer Change Detection for Websites
+- **Sitemap `lastmod` support:** When a sitemap includes `<lastmod>` dates, pages are skipped entirely if the date hasn't changed — no HEAD request, no Puppeteer load, no chunking. One sitemap fetch replaces hundreds of individual HEAD requests.
+- **`lastmod` inheritance:** Child URLs without their own `<lastmod>` inherit from the most specific parent directory URL in the sitemap (e.g., `/docs/2.10.x/reference/cli/` inherits from `/docs/2.10.x/`).
+- **ETag-based change detection:** For URLs not in the sitemap, a HEAD request compares the ETag header against the stored value. Pages with unchanged ETags are skipped without a full page load.
+- **Adaptive HEAD request backoff:** Starts with no delay between HEAD requests. On 429 (rate limit), backs off starting at 200ms and doubles up to 5s. On success, the delay halves back toward zero. Prevents burst rate limiting while maximizing throughput.
+- **Processing success gating:** ETag and lastmod values are only stored in metadata when chunking and embedding succeed. If processing fails, the next run will retry the page instead of incorrectly skipping it.
+- **`parseSitemap` now returns a `Map<string, string | undefined>`** (URL → lastmod) instead of `string[]`, enabling lastmod data to flow through the pipeline.
+- **`processPageContent` callback returns `boolean`** (true = success, false = failure) to signal whether metadata should be persisted.
+
+### Puppeteer Resilience Improvements
+- Browser restart escalation when protocol errors persist after page recreation
+- Periodic browser restart every 50 pages to prevent memory accumulation
+- Added `--disable-dev-shm-usage` Chrome flag (critical in Docker where `/dev/shm` defaults to 64MB)
+- Added `--disable-gpu` and `--disable-extensions` flags
+
+### HTTP 429 Retry for Full Page Processing
+- Added `Retry-After` header parsing (supports seconds and HTTP-date formats)
+- Per-URL retry tracking (max 3 attempts) with configurable delay (30s default, 120s cap)
+- Queue re-insertion on retry to allow other URLs to be processed while waiting
+
+### Qdrant Filter Fix
+- Fixed `removeChunksByUrlQdrant` to use `match: { value: url }` (exact match) instead of `match: { text: url }` (full-text tokenized search), which was causing cross-URL chunk deletion
+
+### URL Processing Fix
+- Fixed `shouldProcessUrl` to return `true` for paths ending with `/`, preventing version-like URLs (e.g., `/app/2.1.x/`) from being incorrectly rejected by `path.extname`
+
+### Tabbed Content Support
+- Automatically detects tabbed UI components using the WAI-ARIA tabs pattern (`role="tab"` + `role="tabpanel"`)
+- Injects tab labels (e.g., "Anthropic v1/messages", "OpenAI-compatible") as bold headings into each panel's content
+- Makes hidden tab panels visible so all tab content is captured, not just the selected tab
+- Handles pages with multiple tab groups that share the same panel IDs
+- Falls back to positional matching when `aria-controls` attributes are missing
+- Works in both the Puppeteer crawl pipeline and the standalone `convertHtmlToMarkdown` method
+
+### URL-Level Change Detection
+- Replaced per-chunk hash comparison with URL-level change detection across all source types (website, local directory, code, Zendesk)
+- Computes content hashes for all chunks of a URL and compares them against stored hashes in a single DB query
+- Unchanged URLs are skipped entirely (no embedding API calls, no DB writes)
+- Changed URLs get all old chunks deleted and fresh chunks inserted with correct `chunk_index` and `total_chunks`
+- Eliminates orphaned chunks and inconsistent metadata that occurred when content shifted (e.g., a paragraph added in the middle)
+- Consolidated four duplicated chunk processing loops into a single shared `processChunksForUrl` method
+
+### Puppeteer Resilience
+- Added `protocolTimeout: 60000` to browser launch to fail faster on stuck protocol calls (down from default 180s)
+- Added `evaluateWithTimeout` helper that wraps `page.evaluate` calls with a 30-second timeout to prevent indefinite hangs on pages with heavy/infinite JavaScript
+- Added `about:blank` navigation between pages to clear lingering JavaScript, timers, WebSocket connections, and event listeners
+- Added automatic page recreation after errors: when a page times out or errors, the next URL gets a fresh tab instead of reusing the potentially corrupted page
 
 ### Word Document Support
 - Added support for legacy `.doc` files using the `word-extractor` library

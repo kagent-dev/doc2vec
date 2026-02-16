@@ -452,6 +452,104 @@ describe('DatabaseManager', () => {
         });
     });
 
+    // ─── getChunkHashesByUrlSQLite ──────────────────────────────────
+    describe('getChunkHashesByUrlSQLite', () => {
+        let db: BetterSqlite3.Database;
+
+        beforeEach(() => {
+            db = createTestDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('should return sorted hashes for chunks matching a URL', () => {
+            const embedding = createTestEmbedding();
+
+            const hashes = ['hash-c', 'hash-a', 'hash-b'];
+            for (let i = 0; i < 3; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = `chunk-${i}`;
+                chunk.metadata.url = 'https://example.com/page';
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, hashes[i]);
+            }
+
+            // Add a chunk with a different URL
+            const other = createTestChunk();
+            other.metadata.chunk_id = 'other';
+            other.metadata.url = 'https://example.com/other';
+            DatabaseManager.insertVectorsSQLite(db, other, embedding, testLogger, 'hash-other');
+
+            const result = DatabaseManager.getChunkHashesByUrlSQLite(db, 'https://example.com/page');
+            expect(result).toEqual(['hash-a', 'hash-b', 'hash-c']);
+        });
+
+        it('should return empty array when no chunks match', () => {
+            const result = DatabaseManager.getChunkHashesByUrlSQLite(db, 'https://nonexistent.com/page');
+            expect(result).toEqual([]);
+        });
+
+        it('should return duplicate hashes correctly', () => {
+            const embedding = createTestEmbedding();
+
+            // Two chunks with the same hash (identical content under different headings)
+            for (let i = 0; i < 2; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = `chunk-${i}`;
+                chunk.metadata.url = 'https://example.com/page';
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, 'same-hash');
+            }
+
+            const result = DatabaseManager.getChunkHashesByUrlSQLite(db, 'https://example.com/page');
+            expect(result).toEqual(['same-hash', 'same-hash']);
+        });
+    });
+
+    // ─── getStoredUrlsByPrefixSQLite ────────────────────────────────
+    describe('getStoredUrlsByPrefixSQLite', () => {
+        let db: BetterSqlite3.Database;
+
+        beforeEach(() => {
+            db = createTestDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('should return distinct URLs matching the prefix', () => {
+            const embedding = createTestEmbedding();
+            const urls = ['https://example.com/page1', 'https://example.com/page1', 'https://example.com/page2', 'https://other.com/page'];
+            const ids = ['c1', 'c2', 'c3', 'c4'];
+            for (let i = 0; i < urls.length; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = ids[i];
+                chunk.metadata.url = urls[i];
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, `hash-${ids[i]}`);
+            }
+
+            const result = DatabaseManager.getStoredUrlsByPrefixSQLite(db, 'https://example.com/');
+            expect(result.sort()).toEqual(['https://example.com/page1', 'https://example.com/page2']);
+        });
+
+        it('should return empty array when no URLs match', () => {
+            const embedding = createTestEmbedding();
+            const chunk = createTestChunk();
+            chunk.metadata.chunk_id = 'c1';
+            chunk.metadata.url = 'https://other.com/page';
+            DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger, 'h1');
+
+            const result = DatabaseManager.getStoredUrlsByPrefixSQLite(db, 'https://example.com/');
+            expect(result).toEqual([]);
+        });
+
+        it('should return empty array for empty database', () => {
+            const result = DatabaseManager.getStoredUrlsByPrefixSQLite(db, 'https://example.com/');
+            expect(result).toEqual([]);
+        });
+    });
+
     // ─── removeObsoleteFilesSQLite ───────────────────────────────────
     describe('removeObsoleteFilesSQLite', () => {
         let db: BetterSqlite3.Database;
@@ -693,7 +791,7 @@ describe('DatabaseManager', () => {
 
             expect(mockClient.delete).toHaveBeenCalledOnce();
             const deleteCall = mockClient.delete.mock.calls[0];
-            expect(deleteCall[1].filter.must[0].match.text).toBe('https://example.com/page');
+            expect(deleteCall[1].filter.must[0].match.value).toBe('https://example.com/page');
         });
 
         it('should set metadata value in Qdrant', async () => {

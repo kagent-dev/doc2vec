@@ -746,6 +746,100 @@ describe('ContentProcessor', () => {
         });
     });
 
+    // ─── isProtocolError (browser-level degradation detection) ─────
+    describe('protocol error detection', () => {
+        const isProtocolError = (ContentProcessor.prototype as any).isProtocolError;
+
+        it('should detect ProtocolError messages', () => {
+            expect(isProtocolError({ message: 'ProtocolError: something failed' })).toBe(true);
+        });
+
+        it('should detect Protocol error messages (lowercase)', () => {
+            expect(isProtocolError({ message: 'Protocol error (Runtime.callFunctionOn): Session closed.' })).toBe(true);
+        });
+
+        it('should detect Network.enable timed out', () => {
+            const error = { message: 'Network.enable timed out. Increase the \'protocolTimeout\' setting in launch/connect calls for a higher timeout if needed.' };
+            expect(isProtocolError(error)).toBe(true);
+        });
+
+        it('should detect Target closed', () => {
+            expect(isProtocolError({ message: 'Target closed' })).toBe(true);
+        });
+
+        it('should detect Session closed', () => {
+            expect(isProtocolError({ message: 'Session closed' })).toBe(true);
+        });
+
+        it('should detect Connection closed', () => {
+            expect(isProtocolError({ message: 'Connection closed' })).toBe(true);
+        });
+
+        it('should detect protocolTimeout messages', () => {
+            expect(isProtocolError({ message: 'Something timed out. Increase the protocolTimeout' })).toBe(true);
+        });
+
+        it('should NOT detect regular navigation errors', () => {
+            expect(isProtocolError({ message: 'Navigation timeout of 60000ms exceeded' })).toBe(false);
+        });
+
+        it('should NOT detect network errors', () => {
+            expect(isProtocolError({ message: 'getaddrinfo ENOTFOUND example.com' })).toBe(false);
+        });
+
+        it('should NOT detect HTTP errors', () => {
+            expect(isProtocolError({ message: 'Failed to load page: HTTP 404' })).toBe(false);
+        });
+
+        it('should handle null/undefined error', () => {
+            expect(isProtocolError(null)).toBe(false);
+            expect(isProtocolError(undefined)).toBe(false);
+        });
+    });
+
+    // ─── parseRetryAfter ────────────────────────────────────────────
+    describe('parseRetryAfter', () => {
+        const parseRetryAfter = (value: string | undefined) =>
+            (processor as any).parseRetryAfter(value);
+
+        it('should parse numeric seconds', () => {
+            expect(parseRetryAfter('60')).toBe(60000);
+        });
+
+        it('should parse zero seconds to minimum 1000ms', () => {
+            expect(parseRetryAfter('0')).toBe(1000);
+        });
+
+        it('should parse fractional seconds', () => {
+            expect(parseRetryAfter('1.5')).toBe(1500);
+        });
+
+        it('should parse HTTP-date format', () => {
+            const futureDate = new Date(Date.now() + 45000);
+            const result = parseRetryAfter(futureDate.toUTCString());
+            // Should be approximately 45000ms (allow 2s tolerance for test execution time)
+            expect(result).toBeGreaterThanOrEqual(43000);
+            expect(result).toBeLessThanOrEqual(46000);
+        });
+
+        it('should return minimum 1000ms for past HTTP-date', () => {
+            const pastDate = new Date(Date.now() - 10000);
+            expect(parseRetryAfter(pastDate.toUTCString())).toBe(1000);
+        });
+
+        it('should return undefined for empty string', () => {
+            expect(parseRetryAfter('')).toBeUndefined();
+        });
+
+        it('should return undefined for undefined', () => {
+            expect(parseRetryAfter(undefined)).toBeUndefined();
+        });
+
+        it('should return undefined for unparseable value', () => {
+            expect(parseRetryAfter('not-a-number-or-date')).toBeUndefined();
+        });
+    });
+
     // ─── parseSitemap ────────────────────────────────────────────────
     describe('parseSitemap', () => {
         afterEach(() => {
@@ -762,12 +856,31 @@ describe('ContentProcessor', () => {
 
             vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
-            expect(urls).toEqual([
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result).toBeInstanceOf(Map);
+            expect([...result.keys()]).toEqual([
                 'https://example.com/page1',
                 'https://example.com/page2',
                 'https://example.com/page3'
             ]);
+            // No lastmod in sitemap → all values undefined
+            expect(result.get('https://example.com/page1')).toBeUndefined();
+        });
+
+        it('should extract lastmod dates from sitemap entries', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com/page1</loc><lastmod>2026-02-02</lastmod></url>
+                    <url><loc>https://example.com/page2</loc><lastmod>2026-01-15</lastmod></url>
+                    <url><loc>https://example.com/page3</loc></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result.get('https://example.com/page1')).toBe('2026-02-02');
+            expect(result.get('https://example.com/page2')).toBe('2026-01-15');
+            expect(result.get('https://example.com/page3')).toBeUndefined();
         });
 
         it('should handle nested sitemaps (<sitemap><loc> entries)', async () => {
@@ -778,7 +891,7 @@ describe('ContentProcessor', () => {
 
             const nestedXml = `<?xml version="1.0" encoding="UTF-8"?>
                 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-                    <url><loc>https://example.com/nested-page1</loc></url>
+                    <url><loc>https://example.com/nested-page1</loc><lastmod>2026-02-02</lastmod></url>
                     <url><loc>https://example.com/nested-page2</loc></url>
                 </urlset>`;
 
@@ -786,29 +899,33 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ data: indexXml } as any)
                 .mockResolvedValueOnce({ data: nestedXml } as any);
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap-index.xml', testLogger);
-            expect(urls).toEqual([
+            const result = await processor.parseSitemap('https://example.com/sitemap-index.xml', testLogger);
+            expect([...result.keys()]).toEqual([
                 'https://example.com/nested-page1',
                 'https://example.com/nested-page2'
             ]);
+            expect(result.get('https://example.com/nested-page1')).toBe('2026-02-02');
+            expect(result.get('https://example.com/nested-page2')).toBeUndefined();
         });
 
-        it('should return empty array on axios error', async () => {
+        it('should return empty map on axios error', async () => {
             vi.spyOn(axios, 'get').mockRejectedValueOnce(new Error('Network error'));
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
-            expect(urls).toEqual([]);
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result).toBeInstanceOf(Map);
+            expect(result.size).toBe(0);
         });
 
-        it('should return empty array for empty sitemap', async () => {
+        it('should return empty map for empty sitemap', async () => {
             const emptyXml = `<?xml version="1.0" encoding="UTF-8"?>
                 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
                 </urlset>`;
 
             vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: emptyXml } as any);
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
-            expect(urls).toEqual([]);
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result).toBeInstanceOf(Map);
+            expect(result.size).toBe(0);
         });
     });
 
@@ -833,7 +950,7 @@ describe('ContentProcessor', () => {
             const visited = new Set<string>();
             visited.add('https://example.com/');
 
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             expect(processContent).not.toHaveBeenCalled();
@@ -843,7 +960,7 @@ describe('ContentProcessor', () => {
             const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com/image.jpg' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             // Start with a URL that has an unsupported extension
             await processor.crawlWebsite('https://example.com/image.jpg', websiteConfig, processContent, testLogger, visited);
@@ -859,7 +976,7 @@ describe('ContentProcessor', () => {
             });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             expect(result.hasNetworkErrors).toBe(true);
@@ -876,7 +993,7 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ data: sitemapXml } as any); // parseSitemap call only
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             const configWithSitemap: WebsiteSourceConfig = {
                 ...websiteConfig,
@@ -896,11 +1013,822 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ content: '# Content', links: [], finalUrl: 'https://example.com/page2' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             // Should process both the base URL and the discovered link
             expect(processPageSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(2);
+        });
+
+        it('should retry on 429 with retryAfterMs and succeed on second attempt', async () => {
+            const error429 = new Error('Failed to load page: HTTP 429');
+            (error429 as any).status = 429;
+            (error429 as any).retryAfterMs = 50; // 50ms for fast test
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ content: '# Content', links: [], finalUrl: 'https://example.com' });
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+
+            // processPage called twice: first 429, then success
+            expect(processPageSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // 429 retry should NOT count as a network error
+            expect(result.hasNetworkErrors).toBe(false);
+        });
+
+        it('should retry on 429 without retryAfterMs using default delay', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), close: vi.fn(), evaluate: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                isConnected: vi.fn().mockReturnValue(true),
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+
+            const error429 = new Error('Failed to load page: HTTP 429');
+            (error429 as any).status = 429;
+            // No retryAfterMs — should use the default delay (DEFAULT_RETRY_DELAY_MS = 30s)
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ content: '# Retried Content', links: [], finalUrl: 'https://example.com' });
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Use fake timers to avoid waiting the real 30s default delay.
+            // Must mock puppeteer.launch too since fake timers freeze its internals.
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            for (let i = 0; i < 35; i++) {
+                await vi.advanceTimersByTimeAsync(1000);
+            }
+            await crawlPromise;
+            vi.useRealTimers();
+
+            expect(processPageSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(1);
+        }, 30000);
+
+        it('should give up after MAX_RETRIES_PER_URL (3) attempts on 429', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), close: vi.fn(), evaluate: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                isConnected: vi.fn().mockReturnValue(true),
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+
+            const make429 = () => {
+                const e = new Error('Failed to load page: HTTP 429');
+                (e as any).status = 429;
+                (e as any).retryAfterMs = 10; // minimal delay for fast test
+                return e;
+            };
+
+            // Return a fresh 429 error for each call (4 total: 1 initial + 3 retries)
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(make429())
+                .mockRejectedValueOnce(make429())
+                .mockRejectedValueOnce(make429())
+                .mockRejectedValueOnce(make429());
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            for (let i = 0; i < 10; i++) {
+                await vi.advanceTimersByTimeAsync(1000);
+            }
+            const result = await crawlPromise;
+            vi.useRealTimers();
+
+            // 1 initial + 3 retries = 4 total calls
+            expect(processPageSpy).toHaveBeenCalledTimes(4);
+            expect(processContent).not.toHaveBeenCalled();
+            // After exhausting retries, it should count as an error (not network error)
+            expect(result.hasNetworkErrors).toBe(false);
+        }, 30000);
+
+        it('should not set pageNeedsRecreation on 429 retry', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), close: vi.fn(), evaluate: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                isConnected: vi.fn().mockReturnValue(true),
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+
+            const error429 = new Error('Failed to load page: HTTP 429');
+            (error429 as any).status = 429;
+            (error429 as any).retryAfterMs = 10; // minimal delay for fast test
+
+            // First call: 429, second call: success with links to /page2, third call: success
+            const processPageSpy = vi.spyOn(processor as any, 'processPage')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ content: '# Content', links: ['/page2'], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            for (let i = 0; i < 5; i++) {
+                await vi.advanceTimersByTimeAsync(1000);
+            }
+            await crawlPromise;
+            vi.useRealTimers();
+
+            // All three calls should happen — the 429 didn't corrupt the page,
+            // so page2 should also be processed without browser recreation
+            expect(processPageSpy).toHaveBeenCalledTimes(3);
+            expect(processContent).toHaveBeenCalledTimes(2);
+        }, 30000);
+
+        it('should skip page when ETag matches stored value', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
+                headers: { etag: '"abc123"' },
+            });
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"abc123"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // processPage should NOT be called — the page was skipped via ETag
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            // URL should still be marked as visited (so cleanup doesn't delete it)
+            expect(visited.has('https://example.com')).toBe(true);
+        });
+
+        it('should process page when ETag differs from stored value', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
+                headers: { etag: '"new-etag"' },
+            });
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"new-etag"',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"old-etag"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // ETag should be stored after successful processing
+            expect(etagStore.set).toHaveBeenCalledWith('https://example.com', '"new-etag"');
+        });
+
+        it('should process page when HEAD request fails', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(new Error('Network error'));
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"etag"',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Should fall through to full processing
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should skip URL when HEAD returns 404', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 404'), {
+                    response: { status: 404 },
+                })
+            );
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Should skip — no processPage, no processContent
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+        });
+
+        it('should skip URL when HEAD returns 403', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 403'), {
+                    response: { status: 403 },
+                })
+            );
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+        });
+
+        it('should fall through to full processing when HEAD returns 405', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 405'), {
+                    response: { status: 405 },
+                })
+            );
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // 405 means server doesn't support HEAD but page may exist — should process
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should fall through to full processing when HEAD returns 500', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 500'), {
+                    response: { status: 500 },
+                })
+            );
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // 500 is a server error — should fall through and try full processing
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should process page when no ETag in HEAD response', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockResolvedValue({
+                headers: {},  // no etag header
+            });
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Should process since there's no ETag to compare
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // etagStore.get should NOT be called since there's no ETag in the response
+            expect(etagStore.get).not.toHaveBeenCalled();
+        });
+
+        it('should retry HEAD request once on 429 then skip if ETag matches', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: { 'retry-after': '1' } },
+            });
+            vi.spyOn(axiosModule.default, 'head')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ headers: { etag: '"abc123"' } });
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"abc123"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // HEAD was called twice (initial 429 + retry)
+            expect(axiosModule.default.head).toHaveBeenCalledTimes(2);
+            // processPage should NOT be called — ETag matched on retry
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            expect(visited.has('https://example.com')).toBe(true);
+        });
+
+        it('should fall through to full processing when HEAD 429 retry also fails', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: {} },
+            });
+            vi.spyOn(axiosModule.default, 'head')
+                .mockRejectedValueOnce(error429)
+                .mockRejectedValueOnce(error429);
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"abc123"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Both HEAD attempts failed, should fall through to full processing
+            expect(axiosModule.default.head).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should increase HEAD backoff delay after 429 and decay on success', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: { 'retry-after': '0' } },
+            });
+
+            // We'll use 3 known URLs plus the base URL (4 total).
+            // URL 1 (base): HEAD returns 429 → retry succeeds → backoff starts at 200ms
+            // URL 2: HEAD succeeds (backoff decays 200 → 100)
+            // URL 3: HEAD succeeds (backoff decays 100 → 50)
+            // URL 4: HEAD succeeds (backoff decays 50 → 25)
+            const headSpy = vi.spyOn(axiosModule.default, 'head')
+                // URL 1: 429, then retry succeeds with matching ETag (skip)
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ headers: { etag: '"etag1"' } })
+                // URL 2: success with matching ETag (skip)
+                .mockResolvedValueOnce({ headers: { etag: '"etag2"' } })
+                // URL 3: success with matching ETag (skip)
+                .mockResolvedValueOnce({ headers: { etag: '"etag3"' } })
+                // URL 4: success with matching ETag (skip)
+                .mockResolvedValueOnce({ headers: { etag: '"etag4"' } });
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+
+            const etagStore = {
+                get: vi.fn()
+                    .mockResolvedValueOnce('"etag1"')   // URL 1 retry: match
+                    .mockResolvedValueOnce('"etag2"')   // URL 2: match
+                    .mockResolvedValueOnce('"etag3"')   // URL 3: match
+                    .mockResolvedValueOnce('"etag4"'),  // URL 4: match
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const knownUrls = new Set([
+                'https://example.com/page2',
+                'https://example.com/page3',
+                'https://example.com/page4',
+            ]);
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Track real elapsed time — backoff adds 200 + 100 + 50 = 350ms minimum
+            const startTime = Date.now();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore, knownUrls });
+            const elapsedMs = Date.now() - startTime;
+
+            // All URLs should be skipped (ETag matches)
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+
+            // HEAD was called 5 times: 1 (429) + 1 (retry) + 3 (URLs 2-4)
+            expect(headSpy).toHaveBeenCalledTimes(5);
+
+            // Backoff delays: URL 2 waits 200ms, URL 3 waits 100ms, URL 4 waits 50ms = 350ms
+            // Allow margin for test overhead
+            expect(elapsedMs).toBeGreaterThanOrEqual(300);
+        });
+
+        it('should double backoff on consecutive 429s up to max', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: { 'retry-after': '0' } },
+            });
+
+            // 3 known URLs, all HEAD requests return 429 (initial + retry).
+            // Backoff should increase: 0 → 200 → 400 → 800
+            vi.spyOn(axiosModule.default, 'head')
+                .mockRejectedValue(error429); // All HEAD requests return 429
+
+            vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Page 1', links: [], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' })
+                .mockResolvedValueOnce({ content: '# Page 3', links: [], finalUrl: 'https://example.com/page3' });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"etag"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const knownUrls = new Set([
+                'https://example.com/page2',
+                'https://example.com/page3',
+            ]);
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Track actual time to verify backoff introduces delays
+            const startTime = Date.now();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore, knownUrls });
+            const elapsedMs = Date.now() - startTime;
+
+            // All 3 pages should be fully processed (HEAD failed, fell through)
+            expect(processContent).toHaveBeenCalledTimes(3);
+
+            // HEAD was called 6 times (2 per URL: initial 429 + retry 429)
+            expect(axiosModule.default.head).toHaveBeenCalledTimes(6);
+
+            // Backoff adds real delays: URL 2 waits 200ms, URL 3 waits 400ms = 600ms minimum
+            // from backoff alone (the 429 retry-after is 0).
+            // Allow some margin for test overhead.
+            expect(elapsedMs).toBeGreaterThanOrEqual(500);
+        });
+
+        it('should skip URL when sitemap lastmod matches stored value', async () => {
+            // Sitemap with lastmod for the base URL
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-02</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const headSpy = vi.spyOn(axios, 'head');
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // stored matches sitemap
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // Page should be skipped — no processPage, no HEAD, no processContent
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(headSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            expect(lastmodStore.get).toHaveBeenCalledWith('https://example.com');
+        });
+
+        it('should process URL when sitemap lastmod differs from stored value', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // stored is older
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // Page should be processed and lastmod stored
+            expect(processContent).toHaveBeenCalledTimes(1);
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com', '2026-02-10');
+        });
+
+        it('should process URL when no stored lastmod exists', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-02</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue(undefined), // first run — nothing stored
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // Page should be processed and lastmod stored
+            expect(processContent).toHaveBeenCalledTimes(1);
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com', '2026-02-02');
+        });
+
+        it('should skip ETag HEAD request when URL has lastmod from sitemap', async () => {
+            // URL has lastmod but it differs → will be processed.
+            // The key assertion: no HEAD request should be made (lastmod takes priority).
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const headSpy = vi.spyOn(axios, 'head');
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"some-etag"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // older → will process
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Page should be processed but HEAD should NOT be called
+            expect(processContent).toHaveBeenCalledTimes(1);
+            expect(headSpy).not.toHaveBeenCalled();
+        });
+
+        it('should fall back to ETag for URLs not in sitemap', async () => {
+            // Sitemap only has base URL, but crawling discovers /page2 via links.
+            // /page2 has no lastmod → should use ETag check.
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const headSpy = vi.spyOn(axios, 'head')
+                .mockResolvedValue({ headers: { etag: '"abc123"' } });
+
+            vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Page 1', links: ['https://example.com/page2'], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue(undefined), // no stored etag
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // older → base URL will process
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Both pages processed
+            expect(processContent).toHaveBeenCalledTimes(2);
+            // HEAD should be called for /page2 (not in sitemap) but NOT for base URL (has lastmod)
+            expect(headSpy).toHaveBeenCalledTimes(1);
+            expect(headSpy).toHaveBeenCalledWith('https://example.com/page2', expect.anything());
+        });
+
+        it('should inherit lastmod from parent directory URL for child URLs without lastmod', async () => {
+            // Mimics the solo.io pattern: parent directory has lastmod, child pages don't
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com/docs/2.10.x/</loc><lastmod>2026-01-30</lastmod></url>
+                    <url><loc>https://example.com/docs/2.10.x/guide/</loc></url>
+                    <url><loc>https://example.com/docs/2.10.x/reference/cli/</loc></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const headSpy = vi.spyOn(axios, 'head');
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-01-30'), // all match parent's lastmod
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                url: 'https://example.com/docs/2.10.x/',
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com/docs/2.10.x/', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // All 3 URLs should be skipped — parent's lastmod inherited to children
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(headSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            // lastmodStore.get called for all 3 URLs
+            expect(lastmodStore.get).toHaveBeenCalledTimes(3);
+        });
+
+        it('should use most specific parent lastmod when multiple parents match', async () => {
+            // Nested directories with different lastmods
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com/</loc><lastmod>2026-01-01</lastmod></url>
+                    <url><loc>https://example.com/docs/</loc><lastmod>2026-02-01</lastmod></url>
+                    <url><loc>https://example.com/docs/page1</loc></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com/docs/page1',
+            });
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-01-15'), // doesn't match either parent
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // /docs/page1 should inherit from /docs/ (more specific) not / (less specific)
+            // Since stored lastmod (2026-01-15) != inherited (2026-02-01), it should be processed
+            // The key check: lastmodStore.set should store the inherited value 2026-02-01
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com/docs/page1', '2026-02-01');
+        });
+
+        it('should not store etag or lastmod when processPageContent returns false', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"etag123"',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue(undefined),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue(undefined), // first run
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            // processContent returns false — simulates chunking/embedding failure
+            const processContent = vi.fn().mockResolvedValue(false);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Page was processed (processContent was called)
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // But neither etag nor lastmod should be stored since processing failed
+            expect(etagStore.set).not.toHaveBeenCalled();
+            expect(lastmodStore.set).not.toHaveBeenCalled();
+        });
+
+        it('should store etag and lastmod when processPageContent returns true', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"etag123"',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue(undefined),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue(undefined),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Page was processed successfully
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // Both etag and lastmod should be stored
+            expect(etagStore.set).toHaveBeenCalledWith('https://example.com', '"etag123"');
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com', '2026-02-10');
+        });
+
+        it('should pre-seed queue with known URLs', async () => {
+            vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Page 1', links: [], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
+
+            const knownUrls = new Set(['https://example.com/page2']);
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { knownUrls });
+
+            // Both the base URL and the known URL should be processed
             expect(processContent).toHaveBeenCalledTimes(2);
         });
     });
@@ -1574,6 +2502,352 @@ describe('ContentProcessor', () => {
             } catch (error: any) {
                 expect(error.message).toContain('Invalid DOCX');
             }
+        });
+    });
+
+    // ─── preprocessTabs ──────────────────────────────────────────────
+    describe('preprocessTabs', () => {
+        const preprocessTabs = (html: string) => {
+            const { JSDOM } = require('jsdom');
+            const dom = new JSDOM(html);
+            (processor as any).preprocessTabs(dom.window.document, testLogger);
+            return dom.window.document.body.innerHTML;
+        };
+
+        it('should inject tab labels into panels matched by aria-controls', () => {
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="panel-0">Tab One</button>
+                    <button role="tab" aria-controls="panel-1">Tab Two</button>
+                </div>
+                <div role="tabpanel" id="panel-0"><p>Content A</p></div>
+                <div role="tabpanel" id="panel-1"><p>Content B</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).toContain('<strong>Tab One:</strong>');
+            expect(result).toContain('<strong>Tab Two:</strong>');
+            expect(result).toContain('Content A');
+            expect(result).toContain('Content B');
+        });
+
+        it('should use positional fallback when aria-controls is missing', () => {
+            const html = `
+                <div>
+                    <button role="tab">First</button>
+                    <button role="tab">Second</button>
+                </div>
+                <div role="tabpanel"><p>Panel 1</p></div>
+                <div role="tabpanel"><p>Panel 2</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).toContain('<strong>First:</strong>');
+            expect(result).toContain('<strong>Second:</strong>');
+        });
+
+        it('should remove tab buttons after processing', () => {
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="p0">My Tab</button>
+                </div>
+                <div role="tabpanel" id="p0"><p>Panel content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            // Tab button itself should be removed
+            expect(result).not.toContain('role="tab"');
+            // But label should be injected into panel
+            expect(result).toContain('<strong>My Tab:</strong>');
+        });
+
+        it('should make hidden panels visible by removing data-state', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Visible</button>
+                <button role="tab" aria-controls="p1">Hidden</button>
+                <div role="tabpanel" id="p0" data-state="selected"><p>A</p></div>
+                <div role="tabpanel" id="p1" data-state=""><p>B</p></div>
+            `;
+            const result = preprocessTabs(html);
+            // Both panels should have data-state="selected"
+            expect(result).not.toContain('data-state=""');
+        });
+
+        it('should remove common hiding CSS classes from panels', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Tab</button>
+                <div role="tabpanel" id="p0" class="hx-hidden hidden d-none"><p>Content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).not.toContain('hx-hidden');
+            expect(result).not.toContain('"hidden"');
+            expect(result).not.toContain('d-none');
+        });
+
+        it('should handle inline display:none style', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Tab</button>
+                <div role="tabpanel" id="p0" style="display: none;"><p>Content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).not.toContain('display: none');
+        });
+
+        it('should do nothing when no role="tab" elements exist', () => {
+            const html = '<div><p>No tabs here</p></div>';
+            const result = preprocessTabs(html);
+            expect(result).toContain('No tabs here');
+        });
+
+        it('should skip tabs with empty labels', () => {
+            const html = `
+                <button role="tab" aria-controls="p0"></button>
+                <button role="tab" aria-controls="p1">Real Tab</button>
+                <div role="tabpanel" id="p0"><p>Panel 0</p></div>
+                <div role="tabpanel" id="p1"><p>Panel 1</p></div>
+            `;
+            const result = preprocessTabs(html);
+            // Only the non-empty tab should be injected
+            expect(result).toContain('<strong>Real Tab:</strong>');
+            // Panel 0 should not have a label injected
+            const panel0Match = result.match(/Panel 0/);
+            expect(panel0Match).toBeTruthy();
+        });
+
+        it('should work with Hextra-style tab HTML structure', () => {
+            // Simulated Hextra tabs like the user's example
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="tabs-panel-0" data-state="selected">Anthropic v1/messages</button>
+                    <button role="tab" aria-controls="tabs-panel-1" data-state="">OpenAI-compatible v1/chat/completions</button>
+                    <button role="tab" aria-controls="tabs-panel-2" data-state="">Custom route</button>
+                </div>
+                <div>
+                    <div role="tabpanel" id="tabs-panel-0" data-state="selected" class="hextra-tabs-panel">
+                        <pre><code>kubectl apply anthropic...</code></pre>
+                    </div>
+                    <div role="tabpanel" id="tabs-panel-1" data-state="" class="hextra-tabs-panel hx-hidden">
+                        <pre><code>kubectl apply openai...</code></pre>
+                    </div>
+                    <div role="tabpanel" id="tabs-panel-2" data-state="" class="hextra-tabs-panel hx-hidden">
+                        <pre><code>kubectl apply custom...</code></pre>
+                    </div>
+                </div>
+            `;
+            const result = preprocessTabs(html);
+
+            // All three panels should have their tab labels injected
+            expect(result).toContain('<strong>Anthropic v1/messages:</strong>');
+            expect(result).toContain('<strong>OpenAI-compatible v1/chat/completions:</strong>');
+            expect(result).toContain('<strong>Custom route:</strong>');
+
+            // Hidden panels should be made visible
+            expect(result).not.toContain('hx-hidden');
+
+            // Tab buttons should be removed
+            expect(result).not.toContain('role="tab"');
+
+            // All code content should be present
+            expect(result).toContain('kubectl apply anthropic');
+            expect(result).toContain('kubectl apply openai');
+            expect(result).toContain('kubectl apply custom');
+        });
+
+        it('should mark panels with article-content class for Readability', () => {
+            const html = `
+                <button role="tab" aria-controls="p0">Tab</button>
+                <div role="tabpanel" id="p0"><p>Content</p></div>
+            `;
+            const result = preprocessTabs(html);
+            expect(result).toContain('article-content');
+            expect(result).toContain('data-readable-content-score="100"');
+        });
+
+        it('should NOT duplicate labels when multiple tab groups share the same panel IDs', () => {
+            // This reproduces the real-world Hextra bug: two separate tab groups
+            // on the same page both use aria-controls pointing to tabs-panel-0,
+            // tabs-panel-1, etc. Since getElementById returns the first match,
+            // both tab groups try to inject into the same panel.
+            const html = `
+                <div>
+                    <!-- First tab group -->
+                    <button role="tab" aria-controls="tabs-panel-0" data-state="selected">Tab A</button>
+                    <button role="tab" aria-controls="tabs-panel-1" data-state="">Tab B</button>
+                    <button role="tab" aria-controls="tabs-panel-2" data-state="">Tab C</button>
+                </div>
+                <div>
+                    <div role="tabpanel" id="tabs-panel-0" data-state="selected"><p>Content A</p></div>
+                    <div role="tabpanel" id="tabs-panel-1" data-state="" class="hx-hidden"><p>Content B</p></div>
+                    <div role="tabpanel" id="tabs-panel-2" data-state="" class="hx-hidden"><p>Content C</p></div>
+                </div>
+                <div>
+                    <!-- Second tab group (reuses same panel IDs!) -->
+                    <button role="tab" aria-controls="tabs-panel-0" data-state="selected">Tab A duplicate</button>
+                    <button role="tab" aria-controls="tabs-panel-1" data-state="">Tab B duplicate</button>
+                    <button role="tab" aria-controls="tabs-panel-2" data-state="">Tab C duplicate</button>
+                </div>
+                <div>
+                    <div role="tabpanel" id="tabs-panel-0" data-state="selected"><p>Content A2</p></div>
+                    <div role="tabpanel" id="tabs-panel-1" data-state="" class="hx-hidden"><p>Content B2</p></div>
+                    <div role="tabpanel" id="tabs-panel-2" data-state="" class="hx-hidden"><p>Content C2</p></div>
+                </div>
+            `;
+            const result = preprocessTabs(html);
+
+            // Each panel should have exactly ONE label injected, not two
+            const tabACount = (result.match(/<strong>Tab A:<\/strong>/g) || []).length;
+            const tabBCount = (result.match(/<strong>Tab B:<\/strong>/g) || []).length;
+            const tabCCount = (result.match(/<strong>Tab C:<\/strong>/g) || []).length;
+
+            expect(tabACount).toBe(1);
+            expect(tabBCount).toBe(1);
+            expect(tabCCount).toBe(1);
+
+            // The duplicate tab labels should NOT appear
+            expect(result).not.toContain('Tab A duplicate');
+            expect(result).not.toContain('Tab B duplicate');
+            expect(result).not.toContain('Tab C duplicate');
+        });
+    });
+
+    // ─── convertHtmlToMarkdown with tabs ─────────────────────────────
+    describe('convertHtmlToMarkdown with tabs', () => {
+        it('should convert tabbed HTML to markdown with tab labels', () => {
+            const html = `
+                <div>
+                    <button role="tab" aria-controls="p0">Tab A</button>
+                    <button role="tab" aria-controls="p1">Tab B</button>
+                </div>
+                <div role="tabpanel" id="p0"><p>Content for A</p></div>
+                <div role="tabpanel" id="p1" class="hidden"><p>Content for B</p></div>
+            `;
+            const md = processor.convertHtmlToMarkdown(html);
+            expect(md).toContain('**Tab A:**');
+            expect(md).toContain('**Tab B:**');
+            expect(md).toContain('Content for A');
+            expect(md).toContain('Content for B');
+        });
+
+        it('should not affect HTML without tabs', () => {
+            const html = '<h1>Title</h1><p>No tabs here</p>';
+            const md = processor.convertHtmlToMarkdown(html);
+            expect(md).toContain('# Title');
+            expect(md).toContain('No tabs here');
+        });
+    });
+
+    // ─── Full pipeline tab test (simulates processPage without Puppeteer) ─
+    describe('tabs through full processPage pipeline', () => {
+        it('should NOT duplicate tab labels through full processPage pipeline', () => {
+            const { JSDOM } = require('jsdom');
+            const { Readability } = require('@mozilla/readability');
+            const sanitizeHtml = require('sanitize-html');
+
+            // Simulate the ORIGINAL page HTML as extracted by Puppeteer (no preprocessing).
+            // Tab buttons are present, hidden panels have hx-hidden and data-state="".
+            // This tests the full pipeline: JSDOM -> preprocessTabs -> Readability -> sanitize -> Turndown.
+            const rawPageHtml = `
+                <html><head><title>Route Config</title></head><body>
+                <article>
+                    <h1>Route Configuration</h1>
+                    <p>Configure routes below.</p>
+                    <div class="hx-mt-4 hx-flex">
+                        <button role="tab" aria-controls="tabs-panel-0" aria-selected="true" data-state="selected">Anthropic v1/messages</button>
+                        <button role="tab" aria-controls="tabs-panel-1" data-state="">OpenAI-compatible v1/chat/completions</button>
+                        <button role="tab" aria-controls="tabs-panel-2" data-state="">Custom route</button>
+                    </div>
+                    <div>
+                        <div class="hextra-tabs-panel hx-rounded hx-pt-6" id="tabs-panel-0" role="tabpanel" tabindex="0" data-state="selected">
+                            <div class="hextra-code-block hx-relative hx-mt-6 first:hx-mt-0 hx-group/code">
+                                <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-yaml" data-lang="yaml"><span class="line"><span class="cl"><span class="l">kubectl apply -f- &lt;&lt;EOF</span>
+</span></span><span class="line"><span class="cl"><span class="nt">apiVersion</span><span class="p">:</span> <span class="l">gateway.networking.k8s.io/v1</span>
+</span></span><span class="line"><span class="cl"><span class="nt">kind</span><span class="p">:</span> <span class="l">HTTPRoute</span>
+</span></span><span class="line"><span class="cl"><span class="nt">metadata</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl">  <span class="nt">name</span><span class="p">:</span> <span class="l">anthropic</span>
+</span></span><span class="line"><span class="cl"><span class="l">EOF</span></span></span></code></pre></div></div>
+                                <div class="hextra-code-copy-btn-container hx-opacity-0">
+                                    <button class="hextra-code-copy-btn" title="Copy code">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hextra-tabs-panel hx-rounded hx-pt-6 hx-hidden" id="tabs-panel-1" role="tabpanel" data-state="">
+                            <div class="hextra-code-block hx-relative hx-mt-6 first:hx-mt-0 hx-group/code">
+                                <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-yaml" data-lang="yaml"><span class="line"><span class="cl"><span class="l">kubectl apply -f- &lt;&lt;EOF</span>
+</span></span><span class="line"><span class="cl"><span class="nt">apiVersion</span><span class="p">:</span> <span class="l">gateway.networking.k8s.io/v1</span>
+</span></span><span class="line"><span class="cl"><span class="nt">kind</span><span class="p">:</span> <span class="l">HTTPRoute</span>
+</span></span><span class="line"><span class="cl"><span class="nt">metadata</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl">  <span class="nt">name</span><span class="p">:</span> <span class="l">openai</span>
+</span></span><span class="line"><span class="cl"><span class="l">EOF</span></span></span></code></pre></div></div>
+                                <div class="hextra-code-copy-btn-container hx-opacity-0">
+                                    <button class="hextra-code-copy-btn" title="Copy code">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hextra-tabs-panel hx-rounded hx-pt-6 hx-hidden" id="tabs-panel-2" role="tabpanel" data-state="">
+                            <div class="hextra-code-block hx-relative hx-mt-6 first:hx-mt-0 hx-group/code">
+                                <div><div class="highlight"><pre tabindex="0" class="chroma"><code class="language-yaml" data-lang="yaml"><span class="line"><span class="cl"><span class="l">kubectl apply -f- &lt;&lt;EOF</span>
+</span></span><span class="line"><span class="cl"><span class="nt">apiVersion</span><span class="p">:</span> <span class="l">gateway.networking.k8s.io/v1</span>
+</span></span><span class="line"><span class="cl"><span class="nt">kind</span><span class="p">:</span> <span class="l">HTTPRoute</span>
+</span></span><span class="line"><span class="cl"><span class="nt">metadata</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl">  <span class="nt">name</span><span class="p">:</span> <span class="l">custom</span>
+</span></span><span class="line"><span class="cl"><span class="l">EOF</span></span></span></code></pre></div></div>
+                                <div class="hextra-code-copy-btn-container hx-opacity-0">
+                                    <button class="hextra-code-copy-btn" title="Copy code">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </article>
+                </body></html>
+            `;
+
+            // Step 1: JSDOM — simulates what processPage does with the raw HTML
+            const dom = new JSDOM(rawPageHtml);
+            const document = dom.window.document;
+
+            // Mark pre tags (same as processPage)
+            document.querySelectorAll('pre').forEach((pre: any) => {
+                pre.classList.add('article-content');
+                pre.setAttribute('data-readable-content-score', '100');
+                (processor as any).markCodeParents(pre.parentElement);
+            });
+
+            // Tab preprocessing in JSDOM (simulating what page.evaluate would do,
+            // since in test we don't have Puppeteer)
+            (processor as any).preprocessTabs(document, testLogger);
+
+            // Step 2: Readability (same as processPage)
+            const reader = new Readability(document, {
+                charThreshold: 20,
+                classesToPreserve: ['article-content'],
+            });
+            const article = reader.parse();
+            expect(article).not.toBeNull();
+
+            // Step 3: sanitize-html (same as processPage)
+            const cleanHtml = sanitizeHtml(article!.content, {
+                allowedTags: [
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                ],
+                allowedAttributes: {
+                    'a': ['href'],
+                    'pre': ['class', 'data-language'],
+                    'code': ['class', 'data-language'],
+                    'div': ['class'],
+                    'span': ['class']
+                }
+            });
+
+            // Step 4: Turndown (same as processPage)
+            const markdown = (processor as any).turndownService.turndown(cleanHtml);
+
+            // Verify: each label should appear EXACTLY once
+            const anthropicMatches = markdown.match(/Anthropic v1\/messages/g) || [];
+            const openaiMatches = markdown.match(/OpenAI-compatible v1\/chat\/completions/g) || [];
+            const customMatches = markdown.match(/Custom route/g) || [];
+
+            expect(anthropicMatches.length).toBe(1);
+            expect(openaiMatches.length).toBe(1);
+            expect(customMatches.length).toBe(1);
         });
     });
 

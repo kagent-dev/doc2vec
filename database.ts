@@ -580,7 +580,7 @@ export class DatabaseManager {
                         {
                             key: 'url',
                             match: {
-                                text: url
+                                value: url  // Exact match — must match getChunkHashesByUrlQdrant's filter
                             }
                         }
                     ],
@@ -597,6 +597,98 @@ export class DatabaseManager {
             logger.info(`Deleted chunks from Qdrant for URL ${url}`);
         } catch (error) {
             logger.error(`Error deleting chunks from Qdrant for URL ${url}:`, error);
+        }
+    }
+
+    /**
+     * Fetch all distinct URLs stored under a given URL prefix.
+     * Used to pre-seed the crawl queue on re-runs so link discovery isn't lost
+     * when pages are skipped via ETag matching.
+     */
+    static getStoredUrlsByPrefixSQLite(db: Database, urlPrefix: string): string[] {
+        const stmt = db.prepare('SELECT DISTINCT url FROM vec_items WHERE url LIKE ? || \'%\'');
+        const rows = stmt.all(urlPrefix) as { url: string }[];
+        return rows.map(r => r.url);
+    }
+
+    static async getStoredUrlsByPrefixQdrant(db: QdrantDB, urlPrefix: string): Promise<string[]> {
+        const { client, collectionName } = db;
+        try {
+            const response = await client.scroll(collectionName, {
+                limit: 10000,
+                with_payload: { include: ['url'] },
+                with_vector: false,
+                filter: {
+                    must: [
+                        {
+                            key: 'url',
+                            match: { text: urlPrefix }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: 'is_metadata',
+                            match: { value: true }
+                        }
+                    ]
+                }
+            });
+            const urls = new Set<string>();
+            for (const point of response.points) {
+                const url = (point as any).payload?.url as string;
+                if (url && url.startsWith(urlPrefix)) {
+                    urls.add(url);
+                }
+            }
+            return Array.from(urls);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    /**
+     * Fetch all stored chunk content hashes for a given URL.
+     * Returns a sorted array of hash strings for comparison.
+     */
+    static getChunkHashesByUrlSQLite(db: Database, url: string): string[] {
+        const stmt = db.prepare('SELECT hash FROM vec_items WHERE url = ?');
+        const rows = stmt.all(url) as { hash: string }[];
+        return rows.map(r => r.hash).sort();
+    }
+
+    /**
+     * Fetch all stored chunk content hashes for a given URL from Qdrant.
+     * Returns a sorted array of hash strings for comparison.
+     */
+    static async getChunkHashesByUrlQdrant(db: QdrantDB, url: string): Promise<string[]> {
+        const { client, collectionName } = db;
+        try {
+            const response = await client.scroll(collectionName, {
+                limit: 10000,
+                with_payload: { include: ['hash'] },
+                with_vector: false,
+                filter: {
+                    must: [
+                        {
+                            key: 'url',
+                            match: { value: url }
+                        }
+                    ],
+                    must_not: [
+                        {
+                            key: 'is_metadata',
+                            match: { value: true }
+                        }
+                    ]
+                }
+            });
+            return response.points
+                .map((point: any) => point.payload?.hash as string)
+                .filter(Boolean)
+                .sort();
+        } catch (error) {
+            // On error, return empty array so the caller treats it as "changed" (safe default)
+            return [];
         }
     }
 
