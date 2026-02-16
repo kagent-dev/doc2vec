@@ -25,7 +25,8 @@ import {
     ZendeskSourceConfig,
     DatabaseConnection,
     DocumentChunk,
-    BrokenLink
+    BrokenLink,
+    EmbeddingConfig
 } from './types';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
@@ -59,6 +60,7 @@ export class Doc2Vec {
         // Check environment variable if not specified in config
         const embeddingProvider = this.config.embedding?.provider || (process.env.EMBEDDING_PROVIDER as 'openai' | 'azure') || 'openai';
         const embeddingConfig = this.config.embedding || { provider: embeddingProvider };
+        this.embeddingDimension = this.resolveEmbeddingDimension(embeddingConfig);
         
         if (embeddingProvider === 'azure') {
             const azureApiKey = embeddingConfig.azure?.api_key || process.env.AZURE_OPENAI_KEY;
@@ -78,7 +80,6 @@ export class Doc2Vec {
                 apiVersion: azureApiVersion,
             });
             this.embeddingModel = azureDeploymentName;
-            this.embeddingDimension = Utils.getEmbeddingDimension(azureDeploymentName);
             this.logger.info(`Using Azure OpenAI with deployment: ${azureDeploymentName} (${this.embeddingDimension} dimensions)`);
         } else {
             const openaiApiKey = embeddingConfig.openai?.api_key || process.env.OPENAI_API_KEY;
@@ -91,7 +92,6 @@ export class Doc2Vec {
             
             this.openai = new OpenAI({ apiKey: openaiApiKey });
             this.embeddingModel = openaiModel;
-            this.embeddingDimension = Utils.getEmbeddingDimension(openaiModel);
             this.logger.info(`Using OpenAI with model: ${openaiModel} (${this.embeddingDimension} dimensions)`);
         }
         
@@ -139,6 +139,25 @@ export class Doc2Vec {
             this.logger.error(`Failed to load or parse config file at ${configPath}:`, error);
             process.exit(1);
         }
+    }
+
+    private resolveEmbeddingDimension(embeddingConfig: EmbeddingConfig | undefined): number {
+        const defaultDimension = 3072;
+        const rawConfigValue = embeddingConfig?.dimension;
+        const rawEnvValue = process.env.EMBEDDING_DIMENSION;
+
+        const candidate = rawConfigValue ?? (rawEnvValue ? Number(rawEnvValue) : undefined);
+        if (candidate === undefined) {
+            return defaultDimension;
+        }
+
+        const parsedValue = typeof candidate === 'string' ? Number(candidate) : candidate;
+        if (!Number.isFinite(parsedValue) || parsedValue <= 0 || !Number.isInteger(parsedValue)) {
+            this.logger.warn(`Invalid embedding dimension provided (${candidate}), falling back to ${defaultDimension}`);
+            return defaultDimension;
+        }
+
+        return parsedValue;
     }
 
     public async run(): Promise<void> {
@@ -391,7 +410,7 @@ export class Doc2Vec {
         }
 
         // Update the last run date in the database after processing all issues
-        await DatabaseManager.updateLastRunDate(dbConnection, repo, logger);
+        await DatabaseManager.updateLastRunDate(dbConnection, repo, logger, this.embeddingDimension);
         
         logger.info(`Successfully processed ${issues.length} issues`);
     }
@@ -1183,7 +1202,7 @@ export class Doc2Vec {
         }
 
         // Update the last run date in the database
-        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger);
+        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger, this.embeddingDimension);
         
         logger.info(`Successfully processed ${totalTickets} tickets`);
     }

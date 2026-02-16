@@ -19,7 +19,7 @@ import {
 export class DatabaseManager {
     private static columnCache: WeakMap<Database, { hasBranch: boolean; hasRepo: boolean }> = new WeakMap();
 
-    static async initDatabase(config: SourceConfig, parentLogger: Logger, embeddingDimension: number = 3072): Promise<DatabaseConnection> {
+    static async initDatabase(config: SourceConfig, parentLogger: Logger, embeddingDimension: number): Promise<DatabaseConnection> {
         const logger = parentLogger.child('database');
         const dbConfig = config.database_config;
         
@@ -71,7 +71,7 @@ export class DatabaseManager {
         }
     }
 
-    static async createCollectionQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger, embeddingDimension: number = 3072) {
+    static async createCollectionQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger, embeddingDimension: number) {
         try {
             logger.debug(`Checking if collection ${collectionName} exists`);
             const collections = await qdrantClient.getCollections();
@@ -178,7 +178,7 @@ export class DatabaseManager {
         key: string,
         value: string,
         logger: Logger,
-        embeddingDimension: number = 3072
+        embeddingDimension: number
     ): Promise<void> {
         try {
             if (dbConnection.type === 'sqlite') {
@@ -259,7 +259,12 @@ export class DatabaseManager {
         return defaultDate;
     }
 
-    static async updateLastRunDate(dbConnection: DatabaseConnection, repo: string, logger: Logger): Promise<void> {
+    static async updateLastRunDate(
+        dbConnection: DatabaseConnection,
+        repo: string,
+        logger: Logger,
+        embeddingDimension: number
+    ): Promise<void> {
         const now = new Date().toISOString();
         
         try {
@@ -277,17 +282,6 @@ export class DatabaseManager {
                 const metadataKey = `last_run_${repo.replace('/', '_')}`;
                 
                 logger.debug(`Using UUID: ${metadataUUID} for metadata`);
-                
-                // Get the embedding dimension from the collection info
-                let embeddingDimension = 3072; // Default
-                try {
-                    const collectionInfo = await dbConnection.client.getCollection(dbConnection.collectionName);
-                    if (collectionInfo.config?.params?.vectors && 'size' in collectionInfo.config.params.vectors) {
-                        embeddingDimension = collectionInfo.config.params.vectors.size;
-                    }
-                } catch (error) {
-                    logger.warn('Could not get collection info, using default dimension');
-                }
                 
                 // Generate a dummy embedding (all zeros)
                 const dummyEmbedding = new Array(embeddingDimension).fill(0);

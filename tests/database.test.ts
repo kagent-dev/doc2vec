@@ -152,7 +152,7 @@ describe('DatabaseManager', () => {
         });
 
         it('should update and retrieve last run date', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
             const date = await DatabaseManager.getLastRunDate(conn, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
             // Should be an ISO date string, not the default
             expect(date).not.toBe('2025-01-01T00:00:00Z');
@@ -160,7 +160,7 @@ describe('DatabaseManager', () => {
         });
 
         it('should normalize repo names in metadata keys', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
             // Check directly in db that the key uses underscore
             const result = db.prepare('SELECT key FROM vec_metadata WHERE key LIKE ?').get('last_run_%') as { key: string };
             expect(result.key).toBe('last_run_owner_repo');
@@ -1085,7 +1085,7 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
 
             expect(mockClient.upsert).toHaveBeenCalledOnce();
             const call = mockClient.upsert.mock.calls[0];
@@ -1108,7 +1108,7 @@ describe('DatabaseManager', () => {
             };
 
             // Should not throw
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
         });
     });
 

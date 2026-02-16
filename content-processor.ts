@@ -619,7 +619,7 @@ export class ContentProcessor {
                         let newLinksFound = 0;
 
                         for (const href of result.links) {
-                            const fullUrl = Utils.buildUrl(href, pageUrlForLinks);
+                            const fullUrl = Utils.buildUrl(href, pageUrlForLinks, logger);
                             if (fullUrl.startsWith(sourceConfig.url)) {
                                 addReferrer(fullUrl, pageUrlForLinks);
                                 if (!visitedUrls.has(Utils.normalizeUrl(fullUrl))) {

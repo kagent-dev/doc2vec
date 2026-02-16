@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import * as path from 'path';
+import { Logger } from './logger';
 
 export class Utils {
     static generateHash(content: string): string {
@@ -33,11 +34,13 @@ export class Utils {
         }
     }
 
-    static buildUrl(href: string, currentUrl: string): string {
+    static buildUrl(href: string, currentUrl: string, logger?: Logger): string {
         try {
             return new URL(href, currentUrl).toString();
         } catch (error) {
-            console.warn(`Invalid URL found: ${href}`);
+            if (logger) {
+                logger.warn(`Invalid URL found: ${href}`);
+            }
             return '';
         }
     }
@@ -86,35 +89,4 @@ export class Utils {
         return text.split(/(\s+)/).filter(token => token.length > 0);
     }
 
-    /**
-     * Get the embedding dimension for a given model name
-     * @param modelName The embedding model name (e.g., 'text-embedding-3-small', 'text-embedding-3-large')
-     * @returns The dimension size for the model
-     */
-    static getEmbeddingDimension(modelName: string): number {
-        const modelLower = modelName.toLowerCase();
-        
-        // OpenAI text-embedding-3-small produces 1536 dimensions
-        if (modelLower.includes('text-embedding-3-small')) {
-            return 1536;
-        }
-        
-        // OpenAI text-embedding-3-large and text-embedding-ada-002 produce 3072 and 1536 respectively
-        if (modelLower.includes('text-embedding-3-large')) {
-            return 3072;
-        }
-        
-        if (modelLower.includes('text-embedding-ada-002')) {
-            return 1536;
-        }
-        
-        // Gemini embedding models default to 3072 dimensions
-        if (modelLower.includes('gemini')) {
-            return 3072;
-        }
-        
-        // Default to 1536 for unknown models (most common)
-        console.warn(`Unknown embedding model: ${modelName}, defaulting to 1536 dimensions`);
-        return 1536;
-    }
 } 
