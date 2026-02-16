@@ -1390,13 +1390,38 @@ export class Doc2Vec {
         return embeddedCount;
     }
 
+    // Embedding model token limit and character-based estimate.
+    // OpenAI's text-embedding-3-large has an 8,191-token context limit.
+    // Using ~4 chars per BPE token as a conservative estimate (actual average
+    // is ~3.5 for English, lower for code/URLs/config paths).
+    private static readonly MAX_EMBEDDING_TOKENS = 8191;
+    private static readonly CHARS_PER_TOKEN = 4;
+    private static readonly MAX_EMBEDDING_CHARS = Doc2Vec.MAX_EMBEDDING_TOKENS * Doc2Vec.CHARS_PER_TOKEN;
+
     private async createEmbeddings(texts: string[]): Promise<number[][]> {
         const logger = this.logger.child('embeddings');
         try {
-            logger.debug(`Creating embeddings for ${texts.length} texts`);
+            // Truncate any texts that exceed the embedding model's token limit.
+            // This is a safety net for pages with dense content (e.g., large API
+            // reference pages with deeply nested config paths) where the chunker's
+            // whitespace-based token count drastically underestimates BPE tokens.
+            const safeTexts = texts.map(text => {
+                if (text.length > Doc2Vec.MAX_EMBEDDING_CHARS) {
+                    const estimatedTokens = Math.ceil(text.length / Doc2Vec.CHARS_PER_TOKEN);
+                    logger.warn(
+                        `Truncating oversized chunk (${text.length} chars, ~${estimatedTokens} tokens) ` +
+                        `to ${Doc2Vec.MAX_EMBEDDING_CHARS} chars (~${Doc2Vec.MAX_EMBEDDING_TOKENS} tokens) ` +
+                        `to fit embedding model limit`
+                    );
+                    return text.substring(0, Doc2Vec.MAX_EMBEDDING_CHARS);
+                }
+                return text;
+            });
+
+            logger.debug(`Creating embeddings for ${safeTexts.length} texts`);
             const response = await this.openai.embeddings.create({
                 model: this.embeddingModel,
-                input: texts,
+                input: safeTexts,
             });
             logger.debug(`Successfully created ${response.data.length} embeddings`);
             return response.data.map(d => d.embedding);
