@@ -234,12 +234,22 @@ export class ContentProcessor {
                 get: (url: string) => Promise<string | undefined>;
                 set: (url: string, lastmod: string) => Promise<void>;
             };
+            // When the Postgres markdown store is enabled, this set contains
+            // URLs that already have markdown stored.  URLs NOT in this set
+            // bypass lastmod/ETag skip logic so that the store is fully
+            // populated on the first sync.
+            markdownStoreUrls?: Set<string>;
+            // When true, bypass all lastmod/ETag skip logic. Used when a
+            // previous sync was interrupted or never completed successfully,
+            // ensuring every page is processed at least once.
+            forceFullSync?: boolean;
         }
-    ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[] }> {
+    ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[]; notFoundUrls: Set<string> }> {
         const logger = parentLogger.child('crawler');
         const queue: string[] = [baseUrl];
         const brokenLinks: BrokenLink[] = [];
         const brokenLinkKeys: Set<string> = new Set();
+        const notFoundUrls: Set<string> = new Set();
         const referrers: Map<string, Set<string>> = new Map();
 
         const addReferrer = (targetUrl: string, sourceUrl: string) => {
@@ -260,7 +270,7 @@ export class ContentProcessor {
 
         addReferrer(baseUrl, baseUrl);
 
-        const { knownUrls, etagStore, lastmodStore } = options ?? {};
+        const { knownUrls, etagStore, lastmodStore, markdownStoreUrls, forceFullSync } = options ?? {};
 
         // Pre-seed queue with previously-known URLs so link discovery isn't lost
         // when pages are skipped via ETag/lastmod matching on re-runs
@@ -455,14 +465,24 @@ export class ContentProcessor {
                 // this URL and it matches the stored value, skip entirely. This avoids
                 // both HEAD requests and full page loads — the sitemap is fetched once
                 // for the entire crawl.
+                // Bypass this skip when:
+                //   - forceFullSync is true (previous sync never completed)
+                //   - markdownStoreUrls is set and the URL is not in it (markdown store gap)
                 const urlLastmod = sitemapLastmod.get(url);
+                const urlInMarkdownStore = !markdownStoreUrls || markdownStoreUrls.has(url);
                 if (urlLastmod && lastmodStore) {
                     const storedLastmod = await lastmodStore.get(url);
                     if (storedLastmod && storedLastmod === urlLastmod) {
-                        logger.info(`Lastmod unchanged (${urlLastmod}), skipping: ${url}`);
-                        visitedUrls.add(url);
-                        lastmodSkippedCount++;
-                        continue;
+                        if (forceFullSync) {
+                            logger.info(`Lastmod unchanged but full sync not yet completed, forcing processing: ${url}`);
+                        } else if (!urlInMarkdownStore) {
+                            logger.info(`Lastmod unchanged but URL not in markdown store, forcing processing: ${url}`);
+                        } else {
+                            logger.info(`Lastmod unchanged (${urlLastmod}), skipping: ${url}`);
+                            visitedUrls.add(url);
+                            lastmodSkippedCount++;
+                            continue;
+                        }
                     } else if (storedLastmod) {
                         logger.debug(`Lastmod changed (stored: ${storedLastmod}, sitemap: ${urlLastmod}), processing: ${url}`);
                     } else {
@@ -528,10 +548,19 @@ export class ContentProcessor {
                         decayBackoff();
                         const result = await checkEtag(headResponse.headers['etag']);
                         if (result === 'skip') {
-                            logger.info(`ETag unchanged, skipping: ${url}`);
-                            visitedUrls.add(url);
-                            etagSkippedCount++;
-                            continue;
+                            // Bypass ETag skip when:
+                            //   - forceFullSync is true (previous sync never completed)
+                            //   - markdownStoreUrls is set and URL is not in it
+                            if (forceFullSync) {
+                                logger.info(`ETag unchanged but full sync not yet completed, forcing processing: ${url}`);
+                            } else if (!urlInMarkdownStore) {
+                                logger.info(`ETag unchanged but URL not in markdown store, forcing processing: ${url}`);
+                            } else {
+                                logger.info(`ETag unchanged, skipping: ${url}`);
+                                visitedUrls.add(url);
+                                etagSkippedCount++;
+                                continue;
+                            }
                         } else if (result === 'no-etag') {
                             consecutiveMissingEtag++;
                             logger.debug(`No ETag in HEAD response for ${url} (${consecutiveMissingEtag}/${MISSING_ETAG_THRESHOLD})`);
@@ -556,10 +585,16 @@ export class ContentProcessor {
                                 decayBackoff();
                                 const result = await checkEtag(retryResponse.headers['etag']);
                                 if (result === 'skip') {
-                                    logger.info(`ETag unchanged, skipping: ${url}`);
-                                    visitedUrls.add(url);
-                                    etagSkippedCount++;
-                                    continue;
+                                    if (forceFullSync) {
+                                        logger.info(`ETag unchanged but full sync not yet completed, forcing processing: ${url}`);
+                                    } else if (!urlInMarkdownStore) {
+                                        logger.info(`ETag unchanged but URL not in markdown store, forcing processing: ${url}`);
+                                    } else {
+                                        logger.info(`ETag unchanged, skipping: ${url}`);
+                                        visitedUrls.add(url);
+                                        etagSkippedCount++;
+                                        continue;
+                                    }
                                 }
                                 // 'process' or 'no-etag' — fall through to full processing
                             } catch {
@@ -572,6 +607,9 @@ export class ContentProcessor {
                             // 405 (Method Not Allowed) is excluded because the server
                             // may not support HEAD but the page may still exist via GET.
                             logger.debug(`HEAD returned ${headStatus} for ${url}, skipping`);
+                            if (headStatus === 404) {
+                                notFoundUrls.add(url);
+                            }
                             skippedCount++;
                             continue;
                         } else {
@@ -758,7 +796,7 @@ export class ContentProcessor {
             logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');
         }
         
-        return { hasNetworkErrors, brokenLinks };
+        return { hasNetworkErrors, brokenLinks, notFoundUrls };
     }
 
     /**

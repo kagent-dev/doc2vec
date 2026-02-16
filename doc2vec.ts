@@ -26,8 +26,10 @@ import {
     DatabaseConnection,
     DocumentChunk,
     BrokenLink,
-    EmbeddingConfig
+    EmbeddingConfig,
+    MarkdownStoreConfig
 } from './types';
+import { MarkdownStore } from './markdown-store';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
 const execAsync = promisify(exec);
@@ -43,6 +45,7 @@ export class Doc2Vec {
     private logger: Logger;
     private configDir: string;
     private brokenLinksByWebsite: Record<string, BrokenLink[]> = {};
+    private markdownStore: MarkdownStore | undefined;
 
     constructor(configPath: string) {
         this.logger = new Logger('Doc2Vec', {
@@ -96,6 +99,11 @@ export class Doc2Vec {
         }
         
         this.contentProcessor = new ContentProcessor(this.logger);
+
+        // Initialize Postgres markdown store if configured
+        if (this.config.markdown_store) {
+            this.markdownStore = new MarkdownStore(this.config.markdown_store, this.logger);
+        }
     }
 
     private loadConfig(configPath: string): Config {
@@ -161,6 +169,11 @@ export class Doc2Vec {
     }
 
     public async run(): Promise<void> {
+        // Initialize Postgres markdown store table if configured
+        if (this.markdownStore) {
+            await this.markdownStore.init();
+        }
+
         this.logger.section('PROCESSING SOURCES');
         
         for (const sourceConfig of this.config.sources) {
@@ -181,6 +194,11 @@ export class Doc2Vec {
             } else {
                 sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
             }
+        }
+
+        // Close the Postgres markdown store connection pool
+        if (this.markdownStore) {
+            await this.markdownStore.close();
         }
 
         this.logger.section('PROCESSING COMPLETE');
@@ -481,6 +499,30 @@ export class Doc2Vec {
             },
         };
 
+        // If Postgres markdown store is enabled for this source, load URLs that
+        // already have markdown stored.  URLs NOT in this set will bypass
+        // lastmod/ETag skip logic so that the store is fully populated on the
+        // first sync.
+        const useMarkdownStore = config.markdown_store === true && this.markdownStore != null;
+        let markdownStoreUrls: Set<string> | undefined;
+        if (useMarkdownStore) {
+            markdownStoreUrls = await this.markdownStore!.getUrlsWithMarkdown(urlPrefix);
+            logger.info(`Markdown store: ${markdownStoreUrls.size} URLs already stored for prefix ${urlPrefix}`);
+        }
+
+        // Check whether a full sync has ever completed successfully for this
+        // source.  If not, bypass all lastmod/ETag skip logic so that every
+        // page is processed at least once.  This handles the case where a
+        // previous sync was interrupted (killed mid-crawl) — the stored
+        // ETags/lastmods from the partial run would otherwise cause the
+        // remaining pages to be skipped indefinitely.
+        const syncCompleteKey = `sync_complete:${urlPrefix}`;
+        const syncCompleteValue = await DatabaseManager.getMetadataValue(dbConnection, syncCompleteKey, undefined, logger);
+        const forceFullSync = syncCompleteValue !== 'true';
+        if (forceFullSync) {
+            logger.info('Full sync has not yet completed for this source — forcing processing of all pages (bypassing lastmod/ETag skip)');
+        }
+
         const crawlResult = await this.contentProcessor.crawlWebsite(config.url, config, async (url, content) => {
             visitedUrls.add(url);
 
@@ -494,13 +536,23 @@ export class Doc2Vec {
                 }
 
                 await this.processChunksForUrl(chunks, url, dbConnection, logger);
+
+                // Store the generated markdown in Postgres
+                if (useMarkdownStore) {
+                    try {
+                        await this.markdownStore!.upsertMarkdown(url, config.product_name, content);
+                    } catch (pgError) {
+                        logger.error(`Failed to store markdown in Postgres for ${url}:`, pgError);
+                    }
+                }
+
                 return true;
             } catch (error) {
                 logger.error(`Error during chunking or embedding for ${url}:`, error);
                 return false;
             }
 
-        }, logger, visitedUrls, { knownUrls, etagStore, lastmodStore });
+        }, logger, visitedUrls, { knownUrls, etagStore, lastmodStore, markdownStoreUrls, forceFullSync });
 
         this.recordBrokenLinks(config.url, crawlResult.brokenLinks);
         this.writeBrokenLinksReport();
@@ -508,10 +560,30 @@ export class Doc2Vec {
         logger.info(`Found ${validChunkIds.size} valid chunks across processed pages for ${config.url}`);
 
         logger.section('CLEANUP');
+
+        // Remove 404 URLs from the Postgres markdown store
+        if (useMarkdownStore && crawlResult.notFoundUrls && crawlResult.notFoundUrls.size > 0) {
+            logger.info(`Removing ${crawlResult.notFoundUrls.size} not-found URLs from markdown store`);
+            for (const url of crawlResult.notFoundUrls) {
+                try {
+                    await this.markdownStore!.deleteMarkdown(url);
+                } catch (pgError) {
+                    logger.error(`Failed to delete markdown from Postgres for ${url}:`, pgError);
+                }
+            }
+        }
         
         if (crawlResult.hasNetworkErrors) {
             logger.warn('Skipping cleanup due to network errors encountered during crawling. This prevents removal of valid chunks when the site is temporarily unreachable.');
         } else {
+            // Mark this source as having completed a full sync.  On subsequent
+            // runs, lastmod/ETag skip logic will function normally.  If the
+            // process is killed before reaching this point, the flag stays
+            // unset and the next run will force-process all pages again.
+            if (forceFullSync) {
+                await DatabaseManager.setMetadataValue(dbConnection, syncCompleteKey, 'true', logger, this.embeddingDimension);
+                logger.info('Full sync completed successfully — subsequent runs will use normal caching');
+            }
             if (dbConnection.type === 'sqlite') {
                 logger.info(`Running SQLite cleanup for ${urlPrefix}`);
                 DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);

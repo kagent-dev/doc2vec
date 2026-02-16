@@ -5,7 +5,7 @@
 | Metric | Value |
 |--------|-------|
 | **Framework** | [Vitest](https://vitest.dev/) v4 |
-| **Total tests** | 519 |
+| **Total tests** | 524 |
 | **Test files** | 8 |
 | **Total lines** | ~10,000 |
 | **Execution time** | ~40s |
@@ -34,7 +34,7 @@ npm run test:coverage
 | `tests/code-chunker.test.ts` | 62 | `code-chunker.ts` | AST-based code chunking, language support, merge behavior, function boundary integrity |
 | `tests/doc2vec.test.ts` | 58 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings |
 | `tests/mcp-server.test.ts` | 12 | `mcp/src/server.ts` | MCP server helpers, query handlers, SQLite/Qdrant providers, end-to-end |
-| `tests/e2e.test.ts` | 6 (+2 conditional) | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, website source, and multi-sync change detection (SQLite + Qdrant) |
+| `tests/e2e.test.ts` | 11 (+2 conditional) | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, website source, multi-sync change detection, incomplete sync recovery, and markdown store integration (SQLite + Qdrant) |
 
 ---
 
@@ -646,6 +646,35 @@ Exercises all 4 change detection layers across 6 consecutive sync runs against a
 
 Additional assertions per run: no orphaned chunks, correct HEAD request counts, chunks byte-identical for unmodified pages.
 
+#### `E2E: Website Incomplete Sync Recovery` (120s timeout, 2 tests)
+
+Tests the `forceFullSync` option that bypasses all lastmod/ETag skip logic when a previous sync was interrupted.
+
+| Test | Runs | Skip layer tested | Key assertions |
+|------|------|-------------------|----------------|
+| **with sitemap lastmod** | 3 | Lastmod skip bypass | Run 1: all 4 pages processed normally. Run 2: forceFullSync=true, all 4 pages force-processed despite unchanged lastmod, zero HEAD requests, zero re-embeddings (content hashes match). Run 3: forceFullSync=false, normal skip — zero pages processed. |
+| **with ETag (no sitemap)** | 3 | ETag skip bypass | Run 1: all 4 pages processed normally. Run 2: forceFullSync=true, all 4 pages force-processed despite matching ETags, HEAD requests still made but skip overridden, zero re-embeddings. Run 3: forceFullSync=false, normal skip — zero pages processed. |
+
+Additional details:
+- **Force-processing vs re-embedding:** `forceFullSync` causes pages to be fetched and processed, but the content hash comparison (layer 3) still applies — if the content hasn't changed, no re-embedding occurs
+- **Simulates the `sync_complete` metadata key:** In production, `Doc2Vec.processWebsite()` checks a `sync_complete:<url_prefix>` metadata key and sets `forceFullSync=true` when it's absent. These tests pass `forceFullSync` directly to `crawlWebsite()` to test the skip-bypass behavior in isolation.
+
+#### `E2E: Website Markdown Store Multi-Sync` (120s timeout, 3 tests)
+
+Tests the Postgres markdown store integration using an in-memory mock that implements the same interface. Uses the full `crawlWebsite` pipeline with `markdownStoreUrls` option.
+
+| Test | Runs | Scenario | Key assertions |
+|------|------|----------|----------------|
+| **force-process then skip** | 3 | First sync populates store, second skips, third updates on change | Run 1: all 4 pages processed and stored; Run 2: zero pages processed, zero upserts; Run 3: only changed page re-processed and markdown updated |
+| **force-process missing URLs** | 3 | Populate store, then clear 2 entries, re-sync | Run 3: page1 and page3 force-processed (not in store) despite unchanged lastmod; home and page2 skipped (in store); no re-embedding (content hashes match) |
+| **404 cleanup** | 2 | Populate store, then page2 returns 404 on HEAD | page2 removed from markdown store; other pages unaffected; `notFoundUrls` set contains the 404 URL |
+
+Additional details:
+- **Force-processing bypass:** When `markdownStoreUrls` is provided and a URL is NOT in the set, lastmod and ETag skip logic is bypassed — the page is fetched and processed even though caching signals say it's unchanged
+- **No unnecessary re-embedding:** Force-processing only means the page is fetched; if content hashes match the stored chunks, embedding is still skipped (layer 3 change detection)
+- **Upsert tracking:** The in-memory store tracks upsert and delete counts per sync to verify exactly which pages were stored/removed
+- **404 via HEAD:** Uses `notFoundPages` set to make the test HTTP server return 404 on HEAD requests for specific paths
+
 #### `E2E: Qdrant Website Source` (60s timeout, conditional)
 - Same as "E2E: Website Source" but uses real Qdrant instead of SQLite
 - Conditional on env vars: `QDRANT_API_KEY`, `QDRANT_URL`, `QDRANT_PORT`, `QDRANT_TEST_COLLECTION`
@@ -682,6 +711,7 @@ Additional assertions per run: no orphaned chunks, correct HEAD request counts, 
 - Local HTTP server with configurable content, ETags, and sitemap XML (E2E multi-sync tests)
 - `DatabaseManager` metadata operations (E2E multi-sync tests use real metadata store for ETag/lastmod)
 - `crawlWebsite` full pipeline (E2E multi-sync tests exercise the complete crawl loop with all change detection layers)
+- In-memory markdown store (`InMemoryMarkdownStore`) for testing the `markdownStoreUrls` skip-bypass and 404 cleanup without Postgres
 - Filesystem operations (temp directories created/cleaned per test)
 
 ### Private method access:

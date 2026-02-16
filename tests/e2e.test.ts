@@ -660,7 +660,7 @@ async function runWebsiteSync(
     config: WebsiteSourceConfig,
     dbConnection: SqliteDB,
     tracker: ReturnType<typeof createEmbeddingTracker>,
-    options?: { failUrls?: Set<string> }
+    options?: { failUrls?: Set<string>; forceFullSync?: boolean }
 ): Promise<{
     visitedUrls: Set<string>;
     processedUrls: Set<string>;
@@ -679,13 +679,13 @@ async function runWebsiteSync(
     // ETag store
     const etagStore = {
         get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, testLogger),
-        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger),
+        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger, 3072),
     };
 
     // Lastmod store
     const lastmodStore = {
         get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, testLogger),
-        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger),
+        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger, 3072),
     };
 
     tracker.reset();
@@ -730,7 +730,7 @@ async function runWebsiteSync(
         },
         testLogger,
         visitedUrls,
-        { knownUrls, etagStore, lastmodStore }
+        { knownUrls, etagStore, lastmodStore, forceFullSync: options?.forceFullSync }
     );
 
     return {
@@ -1079,6 +1079,736 @@ describe('E2E: Website Multi-Sync Change Detection', () => {
     }, 120000); // 2 min timeout for 6 Puppeteer-based sync runs
 });
 
+// ─── Incomplete Sync Recovery E2E ───────────────────────────────────────────
+
+describe('E2E: Website Incomplete Sync Recovery', () => {
+    let server: http.Server;
+    let baseUrl: string;
+    let db: BetterSqlite3.Database;
+    let dbConnection: SqliteDB;
+    let tracker: ReturnType<typeof createEmbeddingTracker>;
+    let processor: ContentProcessor;
+
+    // Mutable server state
+    const pageContent: Record<string, string> = {};
+    const pageEtags: Record<string, string> = {};
+    let sitemapXml = '';
+    let headRequestCount = 0;
+
+    beforeEach(async () => {
+        headRequestCount = 0;
+
+        pageContent['/'] = `
+            <html><head><title>Home</title></head><body>
+            <article>
+                <h1>Home Page</h1>
+                <p>Welcome to the documentation site.</p>
+                <a href="/page1">Page 1</a>
+                <a href="/page2">Page 2</a>
+                <a href="/page3">Page 3</a>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two</h1>
+                <p>This is the second page about monitoring and observability best practices.</p>
+                <p>Learn how to set up dashboards and configure alerting rules.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three</h1>
+                <p>This is the third page describing security hardening procedures.</p>
+                <p>Covers TLS configuration, network policies, and access control.</p>
+            </article>
+            </body></html>
+        `;
+
+        pageEtags['/'] = '"etag-home-v1"';
+        pageEtags['/page1'] = '"etag-page1-v1"';
+        pageEtags['/page2'] = '"etag-page2-v1"';
+        pageEtags['/page3'] = '"etag-page3-v1"';
+
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        server = http.createServer((req, res) => {
+            const urlPath = req.url || '';
+            if (urlPath === '/sitemap.xml') {
+                res.writeHead(200, { 'Content-Type': 'application/xml' });
+                res.end(sitemapXml.replace(/BASE_URL/g, baseUrl));
+                return;
+            }
+            const content = pageContent[urlPath];
+            if (content) {
+                const etag = pageEtags[urlPath];
+                const headers: Record<string, string> = { 'Content-Type': 'text/html' };
+                if (etag) headers['ETag'] = etag;
+                if (req.method === 'HEAD') {
+                    headRequestCount++;
+                    res.writeHead(200, headers);
+                    res.end();
+                } else {
+                    res.writeHead(200, headers);
+                    res.end(content);
+                }
+            } else {
+                res.writeHead(404);
+                res.end('Not found');
+            }
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Failed to start test server');
+        baseUrl = `http://127.0.0.1:${(address as any).port}`;
+
+        const created = createE2EDatabase();
+        db = created.db;
+        dbConnection = created.dbConnection;
+        await DatabaseManager.initDatabaseMetadata(dbConnection, testLogger);
+        tracker = createEmbeddingTracker();
+        processor = new ContentProcessor(testLogger);
+    });
+
+    afterEach(() => {
+        db.close();
+        server.close();
+    });
+
+    it('should force-process all pages when forceFullSync is true (with sitemap lastmod)', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-incomplete',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            sitemap_url: baseUrl + '/sitemap.xml',
+            database_config: { type: 'sqlite', params: {} },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: Normal first sync with forceFullSync=true — all pages
+        // are processed. This simulates the initial sync.
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            forceFullSync: true,
+        });
+
+        expect(run1.processedUrls.size).toBe(4);
+        expect(run1.embeddedUrls.size).toBe(4);
+        expect(run1.totalChunks).toBeGreaterThan(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: Simulate an interrupted sync recovery.
+        // All pages now have stored lastmod values from Run 1, but
+        // sync_complete was never set (process was killed).
+        // With forceFullSync=true, ALL pages should be force-processed
+        // despite having unchanged lastmod.
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run2 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            forceFullSync: true,
+        });
+
+        // All 4 pages should be processed (force-processing bypasses lastmod skip)
+        expect(run2.processedUrls.size).toBe(4);
+        // No HEAD requests (pages have lastmod from sitemap, so ETag path is not used)
+        expect(headRequestCount).toBe(0);
+        // Content hasn't changed, so no re-embedding
+        expect(run2.embedCallCount).toBe(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 3: Sync completed successfully, forceFullSync=false.
+        // Normal skip behavior should apply — all pages skipped via lastmod.
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run3 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            forceFullSync: false,
+        });
+
+        expect(run3.processedUrls.size).toBe(0);
+        expect(headRequestCount).toBe(0);
+        expect(run3.embedCallCount).toBe(0);
+    }, 120000);
+
+    it('should force-process all pages when forceFullSync is true (with ETag, no sitemap)', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-incomplete-etag',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            // No sitemap — pages use ETag-based change detection
+            database_config: { type: 'sqlite', params: {} },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: Normal first sync — all pages processed, ETags stored.
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            forceFullSync: true,
+        });
+
+        expect(run1.processedUrls.size).toBe(4);
+        expect(run1.embeddedUrls.size).toBe(4);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: Simulate interrupted sync recovery. ETags are stored
+        // from Run 1 but sync_complete was never set.
+        // With forceFullSync=true, pages should be force-processed
+        // despite ETag matching.
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run2 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            forceFullSync: true,
+        });
+
+        // All 4 pages should be processed (force-processing bypasses ETag skip)
+        expect(run2.processedUrls.size).toBe(4);
+        // HEAD requests still happen (needed to get the ETag), but the
+        // skip decision is overridden by forceFullSync
+        expect(headRequestCount).toBeGreaterThan(0);
+        // Content hasn't changed, so no re-embedding
+        expect(run2.embedCallCount).toBe(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 3: Sync completed successfully, forceFullSync=false.
+        // Normal ETag skip should apply — all pages skipped.
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run3 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            forceFullSync: false,
+        });
+
+        expect(run3.processedUrls.size).toBe(0);
+        expect(run3.embedCallCount).toBe(0);
+    }, 120000);
+});
+
+// ─── In-memory Markdown Store (simulates Postgres MarkdownStore) ────────────
+
+/**
+ * In-memory implementation of the MarkdownStore interface for testing.
+ * Tracks all operations (upserts and deletes) so tests can assert on behavior.
+ */
+class InMemoryMarkdownStore {
+    private data = new Map<string, { productName: string; markdown: string }>();
+    upsertCount = 0;
+    deleteCount = 0;
+    deletedUrls = new Set<string>();
+
+    async getUrlsWithMarkdown(urlPrefix: string): Promise<Set<string>> {
+        const urls = new Set<string>();
+        for (const url of this.data.keys()) {
+            if (url.startsWith(urlPrefix)) {
+                urls.add(url);
+            }
+        }
+        return urls;
+    }
+
+    async upsertMarkdown(url: string, productName: string, markdown: string): Promise<void> {
+        this.data.set(url, { productName, markdown });
+        this.upsertCount++;
+    }
+
+    async deleteMarkdown(url: string): Promise<void> {
+        this.data.delete(url);
+        this.deletedUrls.add(url);
+        this.deleteCount++;
+    }
+
+    has(url: string): boolean {
+        return this.data.has(url);
+    }
+
+    getMarkdown(url: string): string | undefined {
+        return this.data.get(url)?.markdown;
+    }
+
+    get size(): number {
+        return this.data.size;
+    }
+
+    resetCounters(): void {
+        this.upsertCount = 0;
+        this.deleteCount = 0;
+        this.deletedUrls.clear();
+    }
+}
+
+// ─── Markdown Store Multi-Sync E2E ──────────────────────────────────────────
+
+/**
+ * Helper: run one website sync with markdown store integration.
+ * Mirrors runWebsiteSync but adds markdownStoreUrls to crawlWebsite options
+ * and calls markdownStore.upsertMarkdown on successful page processing.
+ */
+async function runWebsiteSyncWithMarkdownStore(
+    processor: ContentProcessor,
+    config: WebsiteSourceConfig,
+    dbConnection: SqliteDB,
+    tracker: ReturnType<typeof createEmbeddingTracker>,
+    markdownStore: InMemoryMarkdownStore,
+    options?: { failUrls?: Set<string> }
+): Promise<{
+    visitedUrls: Set<string>;
+    processedUrls: Set<string>;
+    embeddedUrls: Set<string>;
+    embedCallCount: number;
+    totalChunks: number;
+    notFoundUrls: Set<string>;
+}> {
+    const visitedUrls = new Set<string>();
+    const processedUrls = new Set<string>();
+    const urlPrefix = Utils.getUrlPrefix(config.url);
+
+    // Pre-load known URLs from DB
+    const storedUrls = DatabaseManager.getStoredUrlsByPrefixSQLite(dbConnection.db, urlPrefix);
+    const knownUrls = storedUrls.length > 0 ? new Set(storedUrls) : undefined;
+
+    // ETag store
+    const etagStore = {
+        get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, testLogger),
+        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger, 3072),
+    };
+
+    // Lastmod store
+    const lastmodStore = {
+        get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, testLogger),
+        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger, 3072),
+    };
+
+    // Markdown store URLs — load from the in-memory store
+    const markdownStoreUrls = await markdownStore.getUrlsWithMarkdown(urlPrefix);
+
+    tracker.reset();
+    markdownStore.resetCounters();
+
+    const crawlResult = await processor.crawlWebsite(
+        config.url,
+        config,
+        async (url, content) => {
+            processedUrls.add(url);
+
+            // Simulate processing failure for specific URLs
+            if (options?.failUrls?.has(url)) {
+                return false;
+            }
+
+            const chunks = await processor.chunkMarkdown(content, config, url);
+            const newHashes = chunks.map(c => Utils.generateHash(c.content));
+            const newHashesSorted = newHashes.slice().sort();
+            const existingHashesSorted = DatabaseManager.getChunkHashesByUrlSQLite(dbConnection.db, url);
+
+            const unchanged = newHashesSorted.length === existingHashesSorted.length &&
+                newHashesSorted.every((h, i) => h === existingHashesSorted[i]);
+
+            if (!unchanged) {
+                // Changed — delete old, insert new
+                if (existingHashesSorted.length > 0) {
+                    DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, testLogger);
+                }
+
+                for (let i = 0; i < chunks.length; i++) {
+                    const chunk = chunks[i];
+                    chunk.metadata.branch = chunk.metadata.branch || '';
+                    chunk.metadata.repo = chunk.metadata.repo || '';
+                    const embedding = tracker.embed(url);
+                    DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, testLogger, newHashes[i]);
+                }
+            }
+
+            // Store markdown in the markdown store (mirrors Doc2Vec.processWebsite behavior)
+            await markdownStore.upsertMarkdown(url, config.product_name, content);
+
+            return true;
+        },
+        testLogger,
+        visitedUrls,
+        { knownUrls, etagStore, lastmodStore, markdownStoreUrls }
+    );
+
+    // Clean up 404 URLs from the markdown store
+    for (const url of crawlResult.notFoundUrls) {
+        await markdownStore.deleteMarkdown(url);
+    }
+
+    return {
+        visitedUrls,
+        processedUrls,
+        embeddedUrls: new Set(tracker.embeddedUrls),
+        embedCallCount: tracker.embedCallCount,
+        totalChunks: countAllChunks(dbConnection.db),
+        notFoundUrls: crawlResult.notFoundUrls,
+    };
+}
+
+describe('E2E: Website Markdown Store Multi-Sync', () => {
+    let server: http.Server;
+    let baseUrl: string;
+    let db: BetterSqlite3.Database;
+    let dbConnection: SqliteDB;
+    let tracker: ReturnType<typeof createEmbeddingTracker>;
+    let processor: ContentProcessor;
+    let markdownStore: InMemoryMarkdownStore;
+
+    // Mutable server state
+    const pageContent: Record<string, string> = {};
+    const pageEtags: Record<string, string> = {};
+    // Track which pages should return 404 on HEAD
+    const notFoundPages: Set<string> = new Set();
+    let sitemapXml = '';
+    let headRequestCount = 0;
+
+    beforeEach(async () => {
+        headRequestCount = 0;
+        notFoundPages.clear();
+
+        // Initial page content
+        pageContent['/'] = `
+            <html><head><title>Home</title></head><body>
+            <article>
+                <h1>Home Page</h1>
+                <p>Welcome to the documentation site.</p>
+                <a href="/page1">Page 1</a>
+                <a href="/page2">Page 2</a>
+                <a href="/page3">Page 3</a>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two</h1>
+                <p>This is the second page about monitoring and observability best practices.</p>
+                <p>Learn how to set up dashboards and configure alerting rules.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three</h1>
+                <p>This is the third page describing security hardening procedures.</p>
+                <p>Covers TLS configuration, network policies, and access control.</p>
+            </article>
+            </body></html>
+        `;
+
+        // ETags per page
+        pageEtags['/'] = '"etag-home-v1"';
+        pageEtags['/page1'] = '"etag-page1-v1"';
+        pageEtags['/page2'] = '"etag-page2-v1"';
+        pageEtags['/page3'] = '"etag-page3-v1"';
+
+        // Sitemap with lastmod for all pages
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        // Start HTTP server
+        server = http.createServer((req, res) => {
+            const urlPath = req.url || '';
+
+            if (urlPath === '/sitemap.xml') {
+                res.writeHead(200, { 'Content-Type': 'application/xml' });
+                res.end(sitemapXml.replace(/BASE_URL/g, baseUrl));
+                return;
+            }
+
+            // Handle 404 for specific pages on HEAD requests
+            if (req.method === 'HEAD' && notFoundPages.has(urlPath)) {
+                headRequestCount++;
+                res.writeHead(404);
+                res.end();
+                return;
+            }
+
+            const content = pageContent[urlPath];
+            if (content) {
+                const etag = pageEtags[urlPath];
+                const headers: Record<string, string> = { 'Content-Type': 'text/html' };
+                if (etag) headers['ETag'] = etag;
+
+                if (req.method === 'HEAD') {
+                    headRequestCount++;
+                    res.writeHead(200, headers);
+                    res.end();
+                } else {
+                    res.writeHead(200, headers);
+                    res.end(content);
+                }
+            } else {
+                if (req.method === 'HEAD') headRequestCount++;
+                res.writeHead(404);
+                res.end('Not found');
+            }
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Failed to start test server');
+        baseUrl = `http://127.0.0.1:${(address as any).port}`;
+
+        const created = createE2EDatabase();
+        db = created.db;
+        dbConnection = created.dbConnection;
+        await DatabaseManager.initDatabaseMetadata(dbConnection, testLogger);
+        tracker = createEmbeddingTracker();
+        processor = new ContentProcessor(testLogger);
+        markdownStore = new InMemoryMarkdownStore();
+    });
+
+    afterEach(() => {
+        db.close();
+        server.close();
+    });
+
+    it('should force-process pages not in markdown store, then skip on subsequent syncs', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-mdstore',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            sitemap_url: baseUrl + '/sitemap.xml',
+            markdown_store: true,
+            database_config: { type: 'sqlite', params: {} },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: First sync — markdown store is empty, all pages should
+        // be force-processed even though lastmod would normally skip them
+        // on a second run (they're "new" to both the vector DB and the
+        // markdown store, so no skip logic applies anyway).
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+
+        // All 4 pages should be processed and embedded
+        expect(run1.processedUrls.size).toBe(4);
+        expect(run1.embeddedUrls.size).toBe(4);
+        expect(run1.totalChunks).toBeGreaterThan(0);
+
+        // All 4 pages should have markdown stored
+        expect(markdownStore.size).toBe(4);
+        expect(markdownStore.has(`${baseUrl}/`)).toBe(true);
+        expect(markdownStore.has(`${baseUrl}/page1`)).toBe(true);
+        expect(markdownStore.has(`${baseUrl}/page2`)).toBe(true);
+        expect(markdownStore.has(`${baseUrl}/page3`)).toBe(true);
+        expect(markdownStore.upsertCount).toBe(4);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: No changes — all pages now in markdown store AND lastmod
+        // unchanged → normal skip behavior applies, no pages processed
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run2 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+
+        // No pages should be processed (all skipped via lastmod, all in markdown store)
+        expect(run2.processedUrls.size).toBe(0);
+        expect(headRequestCount).toBe(0);
+        expect(run2.embedCallCount).toBe(0);
+        // Markdown store should have zero new upserts
+        expect(markdownStore.upsertCount).toBe(0);
+        // Store still has all 4 pages
+        expect(markdownStore.size).toBe(4);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 3: page2 content + lastmod changes → re-processed, markdown updated
+        // Other pages skipped normally
+        // ═══════════════════════════════════════════════════════════════
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two — Updated</h1>
+                <p>This page has been updated with new monitoring practices.</p>
+                <p>Includes Prometheus, Grafana, and OpenTelemetry integration guides.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page2'] = '"etag-page2-v2"';
+
+        const page1MarkdownBefore = markdownStore.getMarkdown(`${baseUrl}/page1`);
+
+        const run3 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+
+        // Only page2 (and possibly home via lastmod change) should be processed
+        expect(run3.processedUrls.has(`${baseUrl}/page2`)).toBe(true);
+        expect(run3.processedUrls.has(`${baseUrl}/page1`)).toBe(false);
+        expect(run3.processedUrls.has(`${baseUrl}/page3`)).toBe(false);
+
+        // page2 markdown should be updated in the store
+        expect(markdownStore.has(`${baseUrl}/page2`)).toBe(true);
+        const page2MarkdownAfter = markdownStore.getMarkdown(`${baseUrl}/page2`);
+        expect(page2MarkdownAfter).toContain('Updated');
+
+        // page1 markdown should be unchanged
+        expect(markdownStore.getMarkdown(`${baseUrl}/page1`)).toBe(page1MarkdownBefore);
+
+        // Store still has all 4 pages
+        expect(markdownStore.size).toBe(4);
+    }, 120000);
+
+    it('should force-process pages missing from markdown store even when lastmod is unchanged', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-mdstore-force',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            sitemap_url: baseUrl + '/sitemap.xml',
+            markdown_store: true,
+            database_config: { type: 'sqlite', params: {} },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: Normal first sync — populate everything
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+        expect(run1.processedUrls.size).toBe(4);
+        expect(markdownStore.size).toBe(4);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: Verify normal skip — no changes, nothing processed
+        // ═══════════════════════════════════════════════════════════════
+        const run2 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+        expect(run2.processedUrls.size).toBe(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // SIMULATE: Remove page1 and page3 from the markdown store
+        // (as if the Postgres table was partially cleared or this is a
+        // new table being populated from an existing vector DB)
+        // ═══════════════════════════════════════════════════════════════
+        await markdownStore.deleteMarkdown(`${baseUrl}/page1`);
+        await markdownStore.deleteMarkdown(`${baseUrl}/page3`);
+        expect(markdownStore.size).toBe(2); // Only home and page2 remain
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 3: page1 and page3 are NOT in the markdown store, so they
+        // should be force-processed even though lastmod is unchanged.
+        // Home and page2 are in the store, so they should be skipped.
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run3 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+
+        // page1 and page3 should be force-processed (not in markdown store)
+        expect(run3.processedUrls.has(`${baseUrl}/page1`)).toBe(true);
+        expect(run3.processedUrls.has(`${baseUrl}/page3`)).toBe(true);
+
+        // Home and page2 should be skipped (in markdown store + lastmod unchanged)
+        expect(run3.processedUrls.has(`${baseUrl}/`)).toBe(false);
+        expect(run3.processedUrls.has(`${baseUrl}/page2`)).toBe(false);
+
+        // page1 and page3 should now be back in the markdown store
+        expect(markdownStore.has(`${baseUrl}/page1`)).toBe(true);
+        expect(markdownStore.has(`${baseUrl}/page3`)).toBe(true);
+        expect(markdownStore.size).toBe(4);
+
+        // Content hashes haven't changed, so no re-embedding should occur
+        // (force-processing means fetching the page, but processChunksForUrl
+        // will detect unchanged content hashes and skip embedding)
+        expect(run3.embedCallCount).toBe(0);
+    }, 120000);
+
+    it('should remove 404 pages from markdown store', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-mdstore-404',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            // No sitemap — use ETag-based change detection so HEAD requests
+            // happen and we can test the 404 cleanup path
+            database_config: { type: 'sqlite', params: {} },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: Initial sync — all 4 pages processed
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+        expect(run1.processedUrls.size).toBe(4);
+        expect(markdownStore.size).toBe(4);
+        expect(markdownStore.has(`${baseUrl}/page2`)).toBe(true);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: page2 returns 404 on HEAD → should be removed from store
+        // ═══════════════════════════════════════════════════════════════
+        notFoundPages.add('/page2');
+
+        const run2 = await runWebsiteSyncWithMarkdownStore(
+            processor, config, dbConnection, tracker, markdownStore
+        );
+
+        // page2 should be in notFoundUrls
+        expect(run2.notFoundUrls.has(`${baseUrl}/page2`)).toBe(true);
+
+        // page2 should be removed from the markdown store
+        expect(markdownStore.has(`${baseUrl}/page2`)).toBe(false);
+        expect(markdownStore.deletedUrls.has(`${baseUrl}/page2`)).toBe(true);
+
+        // Other pages should still be in the store
+        expect(markdownStore.has(`${baseUrl}/`)).toBe(true);
+        expect(markdownStore.has(`${baseUrl}/page1`)).toBe(true);
+        expect(markdownStore.has(`${baseUrl}/page3`)).toBe(true);
+        expect(markdownStore.size).toBe(3);
+    }, 120000);
+});
+
 // ─── Qdrant Website Source E2E (conditional) ────────────────────────────────
 
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
@@ -1401,11 +2131,11 @@ async function runWebsiteSyncQdrant(
     const dbConnection: QdrantDB = qdrantDb;
     const etagStore = {
         get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, testLogger),
-        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger),
+        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger, 3072),
     };
     const lastmodStore = {
         get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, testLogger),
-        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger),
+        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger, 3072),
     };
 
     tracker.reset();

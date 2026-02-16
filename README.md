@@ -36,6 +36,10 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
     *   **SQLite:** Using `better-sqlite3` and the `sqlite-vec` extension for efficient vector search.
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
+*   **[Postgres Markdown Store](MARKDOWN_STORE.md):** Optionally stores the generated markdown for each crawled URL in a Postgres table. Useful for maintaining a searchable, raw-text copy of all documentation pages alongside the vector embeddings.
+    *   **Automatic population:** On the first sync, all pages are force-processed (bypassing lastmod/ETag caching) to fully populate the store. Subsequent syncs only update rows when a change is detected.
+    *   **404 cleanup:** Pages that return 404 are automatically removed from the store.
+    *   **Shared table:** A single table (configurable name, default `markdown_pages`) is shared across all sources, with a `product_name` column to distinguish them.
 *   **Multi-Layer Change Detection:** Four layers of change detection minimize unnecessary re-processing:
     1. **Sitemap `lastmod`:** When available, compares the sitemap's `<lastmod>` date against the stored value — skips without any HTTP request. Child URLs inherit `lastmod` from their most specific parent directory.
     2. **ETag via HEAD request:** For URLs without `lastmod`, sends a lightweight HEAD request and compares the ETag header against the stored value. Adaptive backoff prevents rate limiting (starts at 0ms delay, increases on 429 responses, decays on success).
@@ -43,6 +47,8 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
     4. **Embedding:** Only re-embeds chunks when content has actually changed.
     
     ETag and lastmod values are only stored when chunking and embedding succeed, ensuring failed pages are retried on the next run.
+    
+    A `sync_complete` metadata flag tracks whether a full sync has ever completed successfully. If a sync is interrupted (process killed), the next run force-processes all pages regardless of lastmod/ETag values, ensuring no pages are permanently skipped.
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
@@ -175,6 +181,7 @@ Configuration is managed through two files:
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
         *   `sitemap_url`: (Optional) URL to the site's XML sitemap for discovering additional pages not linked in navigation.
+        *   `markdown_store`: (Optional) Set to `true` to store generated markdown in the Postgres markdown store (requires top-level `markdown_store` config). Defaults to `false`.
         
         For GitHub repositories (`type: 'github'`):
         *   `repo`: Repository name in the format `'owner/repo'` (e.g., `'istio/istio'`).
@@ -230,6 +237,17 @@ Configuration is managed through two files:
         *   `embedding.provider`: Provider for embeddings (`openai` or `azure`).
         *   `embedding.dimension`: Embedding vector size. Defaults to `3072` when not set.
 
+        Optional Postgres markdown store (top-level):
+        *   `markdown_store.connection_string`: (Optional) Full Postgres connection string (e.g., `'postgres://user:pass@host:5432/db'`). Takes priority over individual fields.
+        *   `markdown_store.host`: (Optional) Postgres host.
+        *   `markdown_store.port`: (Optional) Postgres port.
+        *   `markdown_store.database`: (Optional) Postgres database name.
+        *   `markdown_store.user`: (Optional) Postgres user.
+        *   `markdown_store.password`: (Optional) Postgres password. Supports `${PG_PASSWORD}` env var substitution.
+        *   `markdown_store.table_name`: (Optional) Table name. Defaults to `'markdown_pages'`.
+        
+        When configured, website sources with `markdown_store: true` will store the generated markdown for each URL in this Postgres table. On the first sync, all pages are force-processed (bypassing lastmod/ETag skip logic) to populate the table. On subsequent syncs, only pages with detected changes get their rows updated.
+
     **Example (`config.yaml`):**
     ```yaml
     # Optional: Configure embedding provider
@@ -248,13 +266,25 @@ Configuration is managed through two files:
       #   deployment_name: 'text-embedding-3-large'
       #   api_version: '2024-10-21'  # Optional
 
+    # Optional: Store generated markdown in Postgres
+    # markdown_store:
+    #   connection_string: 'postgres://user:pass@host:5432/db'
+    #   # OR use individual fields:
+    #   # host: 'localhost'
+    #   # port: 5432
+    #   # database: 'doc2vec'
+    #   # user: 'myuser'
+    #   # password: '${PG_PASSWORD}'
+    #   # table_name: 'markdown_pages'  # Optional, defaults to 'markdown_pages'
+
     sources:
-      # Website source example
+      # Website source example (with markdown store enabled)
       - type: 'website'
         product_name: 'argo'
         version: 'stable'
         url: 'https://argo-cd.readthedocs.io/en/stable/'
         sitemap_url: 'https://argo-cd.readthedocs.io/en/stable/sitemap.xml'
+        markdown_store: true  # Store generated markdown in Postgres
         max_size: 1048576
         database_config:
           type: 'sqlite'
@@ -547,6 +577,20 @@ If you don't specify a config path, it will look for config.yaml in the current 
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Postgres Markdown Store
+- **New feature:** Optionally store the generated markdown for each crawled website URL in a Postgres table (`url`, `product_name`, `markdown`, `updated_at`)
+- **Top-level configuration:** Configure Postgres connection once at the top level via `connection_string` or individual `host`/`port`/`database`/`user`/`password` fields, with environment variable substitution support
+- **Per-source opt-in:** Enable per website source with `markdown_store: true` (disabled by default)
+- **First-sync force-processing:** When the markdown store is enabled, pages that aren't yet in the Postgres table bypass lastmod and ETag skip logic, ensuring all pages are stored on the first sync
+- **Change-only updates:** On subsequent syncs, only pages with detected content changes (via lastmod/ETag) have their Postgres rows updated
+- **404 cleanup:** Pages that return 404 during HEAD checks are automatically removed from the Postgres store
+
+### Incomplete Sync Recovery
+- **New feature:** Tracks whether a full sync has ever completed successfully for each website source via a `sync_complete:<url_prefix>` metadata key
+- **Interrupted sync handling:** If a sync is killed mid-crawl (process terminated, crash, etc.), the stored ETags/lastmods from the partial run would otherwise cause remaining pages to be skipped permanently. The `sync_complete` flag prevents this — when absent, all pages are force-processed regardless of caching signals
+- **Gated on clean completion:** The flag is only set when the crawl completes without network errors (DNS failures, connection refused, timeouts). If the site is unreachable, the next run will force a full sync again
+- **Scoped per source:** Each website source has its own `sync_complete` key based on its URL prefix. Changing the source URL naturally triggers a new full sync
 
 ### Multi-Layer Change Detection for Websites
 - **Sitemap `lastmod` support:** When a sitemap includes `<lastmod>` dates, pages are skipped entirely if the date hasn't changed — no HEAD request, no Puppeteer load, no chunking. One sitemap fetch replaces hundreds of individual HEAD requests.
