@@ -468,7 +468,7 @@ export class Doc2Vec {
                 return DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, logger);
             },
             set: async (url: string, etag: string): Promise<void> => {
-                await DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, logger);
+                await DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, logger, this.embeddingDimension);
             },
         };
 
@@ -477,7 +477,7 @@ export class Doc2Vec {
                 return DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, logger);
             },
             set: async (url: string, lastmod: string): Promise<void> => {
-                await DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, logger);
+                await DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, logger, this.embeddingDimension);
             },
         };
 
