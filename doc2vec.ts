@@ -450,6 +450,15 @@ export class Doc2Vec {
             },
         };
 
+        const lastmodStore = {
+            get: async (url: string): Promise<string | undefined> => {
+                return DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, logger);
+            },
+            set: async (url: string, lastmod: string): Promise<void> => {
+                await DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, logger);
+            },
+        };
+
         const crawlResult = await this.contentProcessor.crawlWebsite(config.url, config, async (url, content) => {
             visitedUrls.add(url);
 
@@ -463,11 +472,13 @@ export class Doc2Vec {
                 }
 
                 await this.processChunksForUrl(chunks, url, dbConnection, logger);
+                return true;
             } catch (error) {
                 logger.error(`Error during chunking or embedding for ${url}:`, error);
+                return false;
             }
 
-        }, logger, visitedUrls, { knownUrls, etagStore });
+        }, logger, visitedUrls, { knownUrls, etagStore, lastmodStore });
 
         this.recordBrokenLinks(config.url, crawlResult.brokenLinks);
         this.writeBrokenLinksReport();

@@ -174,19 +174,20 @@ export class ContentProcessor {
         return this.turndownService.turndown(cleanHtml).trim();
     }
 
-    async parseSitemap(sitemapUrl: string, logger: Logger): Promise<string[]> {
+    async parseSitemap(sitemapUrl: string, logger: Logger): Promise<Map<string, string | undefined>> {
         logger.info(`Parsing sitemap from ${sitemapUrl}`);
         try {
             const response = await axios.get(sitemapUrl);
             const $ = load(response.data, { xmlMode: true });
             
-            const urls: string[] = [];
+            const urlMap = new Map<string, string | undefined>();
             
-            // Handle standard sitemaps
-            $('url > loc').each((_, element) => {
-                const url = $(element).text().trim();
-                if (url) {
-                    urls.push(url);
+            // Handle standard sitemaps — extract <loc> and optional <lastmod>
+            $('url').each((_, element) => {
+                const loc = $(element).find('loc').text().trim();
+                const lastmod = $(element).find('lastmod').text().trim() || undefined;
+                if (loc) {
+                    urlMap.set(loc, lastmod);
                 }
             });
             
@@ -202,22 +203,25 @@ export class ContentProcessor {
             // Recursively process nested sitemaps
             for (const nestedSitemapUrl of sitemapLinks) {
                 logger.debug(`Found nested sitemap: ${nestedSitemapUrl}`);
-                const nestedUrls = await this.parseSitemap(nestedSitemapUrl, logger);
-                urls.push(...nestedUrls);
+                const nestedMap = await this.parseSitemap(nestedSitemapUrl, logger);
+                for (const [url, lastmod] of nestedMap) {
+                    urlMap.set(url, lastmod);
+                }
             }
             
-            logger.info(`Found ${urls.length} URLs in sitemap ${sitemapUrl}`);
-            return urls;
+            const withLastmod = [...urlMap.values()].filter(v => v !== undefined).length;
+            logger.info(`Found ${urlMap.size} URLs in sitemap ${sitemapUrl} (${withLastmod} with lastmod)`);
+            return urlMap;
         } catch (error) {
             logger.error(`Error parsing sitemap at ${sitemapUrl}:`, error);
-            return [];
+            return new Map();
         }
     }
 
     async crawlWebsite(
         baseUrl: string,
         sourceConfig: WebsiteSourceConfig,
-        processPageContent: (url: string, content: string) => Promise<void>,
+        processPageContent: (url: string, content: string) => Promise<boolean>,
         parentLogger: Logger,
         visitedUrls: Set<string>,
         options?: {
@@ -225,6 +229,10 @@ export class ContentProcessor {
             etagStore?: {
                 get: (url: string) => Promise<string | undefined>;
                 set: (url: string, etag: string) => Promise<void>;
+            };
+            lastmodStore?: {
+                get: (url: string) => Promise<string | undefined>;
+                set: (url: string, lastmod: string) => Promise<void>;
             };
         }
     ): Promise<{ hasNetworkErrors: boolean; brokenLinks: BrokenLink[] }> {
@@ -252,10 +260,10 @@ export class ContentProcessor {
 
         addReferrer(baseUrl, baseUrl);
 
-        const { knownUrls, etagStore } = options ?? {};
+        const { knownUrls, etagStore, lastmodStore } = options ?? {};
 
         // Pre-seed queue with previously-known URLs so link discovery isn't lost
-        // when pages are skipped via ETag matching on re-runs
+        // when pages are skipped via ETag/lastmod matching on re-runs
         if (knownUrls && knownUrls.size > 0) {
             for (const url of knownUrls) {
                 if (url.startsWith(sourceConfig.url) && !queue.includes(url)) {
@@ -265,15 +273,29 @@ export class ContentProcessor {
             logger.info(`Pre-seeded ${knownUrls.size} known URLs from database into crawl queue`);
         }
 
-        // Process sitemap if provided
+        // Process sitemap if provided — extract URLs and lastmod dates
+        // The lastmod map is used later in the crawl loop for change detection
+        const sitemapLastmod = new Map<string, string>();
         if (sourceConfig.sitemap_url) {
             logger.section('SITEMAP PROCESSING');
-            const sitemapUrls = await this.parseSitemap(sourceConfig.sitemap_url, logger);
+            const sitemapData = await this.parseSitemap(sourceConfig.sitemap_url, logger);
             
-            // Add sitemap URLs to the queue if they're within the website scope
-            for (const url of sitemapUrls) {
+            // Collect parent URLs that have lastmod (directories ending with /)
+            // so we can inherit lastmod for child URLs that lack their own.
+            // Example: /gloo-mesh/2.10.x/ has lastmod but /gloo-mesh/2.10.x/reference/... doesn't.
+            const parentLastmods: Array<{ prefix: string; lastmod: string }> = [];
+            
+            // First pass: add URLs to queue and collect explicit lastmod values
+            for (const [url, lastmod] of sitemapData) {
                 if (url.startsWith(sourceConfig.url)) {
                     addReferrer(url, sourceConfig.sitemap_url);
+                    if (lastmod) {
+                        sitemapLastmod.set(url, lastmod);
+                        // Track as a potential parent for child URL inheritance
+                        if (url.endsWith('/')) {
+                            parentLastmods.push({ prefix: url, lastmod });
+                        }
+                    }
                     if (!queue.includes(url)) {
                         logger.debug(`Adding URL from sitemap to queue: ${url}`);
                         queue.push(url);
@@ -281,7 +303,27 @@ export class ContentProcessor {
                 }
             }
             
-            logger.info(`Added ${queue.length - 1} URLs from sitemap to the crawl queue`);
+            // Second pass: inherit lastmod from the most specific parent for URLs
+            // that don't have their own lastmod
+            if (parentLastmods.length > 0) {
+                // Sort by prefix length descending so longest (most specific) match wins
+                parentLastmods.sort((a, b) => b.prefix.length - a.prefix.length);
+                let inheritedCount = 0;
+                for (const [url] of sitemapData) {
+                    if (url.startsWith(sourceConfig.url) && !sitemapLastmod.has(url)) {
+                        const parent = parentLastmods.find(p => url.startsWith(p.prefix));
+                        if (parent) {
+                            sitemapLastmod.set(url, parent.lastmod);
+                            inheritedCount++;
+                        }
+                    }
+                }
+                if (inheritedCount > 0) {
+                    logger.info(`Inherited lastmod from parent URLs for ${inheritedCount} child URLs without their own lastmod`);
+                }
+            }
+            
+            logger.info(`Added ${queue.length - 1} URLs from sitemap to the crawl queue (${sitemapLastmod.size} with lastmod)`);
         }
 
         logger.info(`Starting crawl from ${baseUrl} with ${queue.length} URLs in initial queue`);
@@ -289,20 +331,32 @@ export class ContentProcessor {
         let skippedCount = 0;
         let skippedSizeCount = 0;
         let etagSkippedCount = 0;
+        let lastmodSkippedCount = 0;
         let pdfProcessedCount = 0;
         let errorCount = 0;
         let hasNetworkErrors = false;
         // Tracks whether the server supports ETags. Starts true and is set to false
-        // after a few consecutive pages return no ETag, avoiding wasted HEAD requests.
+        // after a few consecutive successful HEAD responses return no ETag header,
+        // avoiding wasted HEAD requests for servers that don't support ETags.
+        // HEAD request failures (network errors, timeouts) do NOT count toward
+        // this threshold — they're transient issues, not evidence of missing ETag support.
         let serverSupportsEtags = true;
-        let consecutiveNoEtag = 0;
-        const NO_ETAG_THRESHOLD = 3; // Disable after 3 consecutive pages without ETag
+        let consecutiveMissingEtag = 0;
+        const MISSING_ETAG_THRESHOLD = 3;
 
         // Track per-URL retry counts for rate limiting (429) responses
         const retryCounts: Map<string, number> = new Map();
         const MAX_RETRIES_PER_URL = 3;
         const DEFAULT_RETRY_DELAY_MS = 30000; // 30s default when no Retry-After header
         const MAX_RETRY_DELAY_MS = 120000;    // Cap at 2 minutes
+
+        // Adaptive backoff for HEAD requests: starts at 0 (no delay), increases
+        // on 429 responses, and decays back toward 0 on successful responses.
+        let headBackoffMs = 0;
+        const HEAD_BACKOFF_INITIAL_MS = 200;  // First backoff step after a 429
+        const HEAD_BACKOFF_MAX_MS = 5000;     // Cap at 5 seconds
+        const HEAD_BACKOFF_DECAY_FACTOR = 0.5; // Halve delay on each success
+        const HEAD_BACKOFF_FLOOR_MS = 10;     // Below this, snap to 0
 
         // Launch a single browser instance and reuse one page (tab) for all URLs
         let browser: Browser | null = null;
@@ -397,41 +451,124 @@ export class ContentProcessor {
                     continue;
                 }
 
+                // Sitemap lastmod-based skip: if the sitemap provides a lastmod date for
+                // this URL and it matches the stored value, skip entirely. This avoids
+                // both HEAD requests and full page loads — the sitemap is fetched once
+                // for the entire crawl.
+                const urlLastmod = sitemapLastmod.get(url);
+                if (urlLastmod && lastmodStore) {
+                    const storedLastmod = await lastmodStore.get(url);
+                    if (storedLastmod && storedLastmod === urlLastmod) {
+                        logger.info(`Lastmod unchanged (${urlLastmod}), skipping: ${url}`);
+                        visitedUrls.add(url);
+                        lastmodSkippedCount++;
+                        continue;
+                    } else if (storedLastmod) {
+                        logger.debug(`Lastmod changed (stored: ${storedLastmod}, sitemap: ${urlLastmod}), processing: ${url}`);
+                    } else {
+                        logger.debug(`No stored lastmod for ${url}, processing`);
+                    }
+                }
+
                 // ETag-based skip: send a lightweight HEAD request and compare the ETag
                 // to the stored value. If unchanged, skip the entire page (no Puppeteer,
                 // no content extraction, no chunking, no embedding).
-                if (!Utils.isPdfUrl(url) && etagStore && serverSupportsEtags) {
-                    try {
-                        const headResponse = await axios.head(url, {
-                            timeout: 10000,
-                            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; doc2vec crawler)' },
-                            // Follow redirects to get the ETag of the final page
-                            maxRedirects: 5,
-                        });
-                        const headEtag = headResponse.headers['etag'];
-                        if (headEtag) {
-                            consecutiveNoEtag = 0; // Reset counter on success
-                            const storedEtag = await etagStore.get(url);
-                            if (storedEtag && storedEtag === headEtag) {
-                                logger.info(`ETag unchanged, skipping: ${url}`);
-                                visitedUrls.add(url);
-                                etagSkippedCount++;
-                                continue;
-                            }
+                // Skip ETag check if the URL has a lastmod from the sitemap — we trust
+                // lastmod as the primary change-detection signal when available.
+                if (!urlLastmod && !Utils.isPdfUrl(url) && etagStore && serverSupportsEtags) {
+                    // Adaptive backoff: wait before HEAD if we've been rate-limited recently
+                    if (headBackoffMs > 0) {
+                        await new Promise(resolve => setTimeout(resolve, headBackoffMs));
+                    }
+
+                    const headConfig = {
+                        timeout: 10000,
+                        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; doc2vec crawler)' },
+                        maxRedirects: 5,
+                    };
+
+                    // Checks an ETag from a HEAD response against the stored value.
+                    // Returns 'skip' if unchanged, 'process' if changed/missing, 'no-etag' if header absent.
+                    const checkEtag = async (etag: string | undefined): Promise<'skip' | 'process' | 'no-etag'> => {
+                        if (!etag) return 'no-etag';
+                        consecutiveMissingEtag = 0;
+                        const storedEtag = await etagStore.get(url);
+                        if (storedEtag && storedEtag === etag) {
+                            return 'skip';
+                        } else if (storedEtag) {
+                            logger.debug(`ETag changed (stored: ${storedEtag}, received: ${etag}), processing: ${url}`);
                         } else {
-                            consecutiveNoEtag++;
-                            if (consecutiveNoEtag >= NO_ETAG_THRESHOLD) {
-                                serverSupportsEtags = false;
-                                logger.info(`Server does not return ETag headers (${NO_ETAG_THRESHOLD} consecutive pages without ETag). Disabling ETag-based skip for this crawl.`);
+                            logger.debug(`No stored ETag for ${url}, processing`);
+                        }
+                        return 'process';
+                    };
+
+                    // Decay backoff on successful HEAD (non-429)
+                    const decayBackoff = () => {
+                        if (headBackoffMs > 0) {
+                            headBackoffMs = headBackoffMs * HEAD_BACKOFF_DECAY_FACTOR;
+                            if (headBackoffMs < HEAD_BACKOFF_FLOOR_MS) {
+                                headBackoffMs = 0;
+                                logger.debug('HEAD backoff decayed to 0ms');
                             }
                         }
-                    } catch {
-                        // HEAD request failed (network error, server doesn't support HEAD, WAF blocks it, etc.)
-                        // Disable ETag checks to avoid repeated failed requests.
-                        consecutiveNoEtag++;
-                        if (consecutiveNoEtag >= NO_ETAG_THRESHOLD) {
-                            serverSupportsEtags = false;
-                            logger.info(`HEAD requests failing (${NO_ETAG_THRESHOLD} consecutive failures). Disabling ETag-based skip for this crawl.`);
+                    };
+
+                    // Increase backoff on 429
+                    const increaseBackoff = () => {
+                        const previousMs = headBackoffMs;
+                        headBackoffMs = headBackoffMs === 0
+                            ? HEAD_BACKOFF_INITIAL_MS
+                            : Math.min(headBackoffMs * 2, HEAD_BACKOFF_MAX_MS);
+                        logger.debug(`HEAD backoff increased: ${previousMs}ms → ${headBackoffMs}ms`);
+                    };
+
+                    try {
+                        const headResponse = await axios.head(url, headConfig);
+                        decayBackoff();
+                        const result = await checkEtag(headResponse.headers['etag']);
+                        if (result === 'skip') {
+                            logger.info(`ETag unchanged, skipping: ${url}`);
+                            visitedUrls.add(url);
+                            etagSkippedCount++;
+                            continue;
+                        } else if (result === 'no-etag') {
+                            consecutiveMissingEtag++;
+                            logger.debug(`No ETag in HEAD response for ${url} (${consecutiveMissingEtag}/${MISSING_ETAG_THRESHOLD})`);
+                            if (consecutiveMissingEtag >= MISSING_ETAG_THRESHOLD) {
+                                serverSupportsEtags = false;
+                                logger.warn(`Server does not return ETag headers (${MISSING_ETAG_THRESHOLD} consecutive pages without ETag). Disabling ETag-based skip for this crawl.`);
+                            }
+                        }
+                    } catch (headError: any) {
+                        // If the HEAD request was rate-limited (429), increase backoff,
+                        // wait, and retry once. The backoff ensures subsequent HEAD
+                        // requests are spaced out to avoid further 429s.
+                        const headStatus = headError?.response?.status;
+                        if (headStatus === 429) {
+                            increaseBackoff();
+                            const retryAfterMs = this.parseRetryAfter(headError.response?.headers?.['retry-after']);
+                            const delayMs = Math.min(retryAfterMs ?? 5000, 30000);
+                            logger.debug(`HEAD rate-limited (429) for ${url}, waiting ${Math.round(delayMs / 1000)}s before retry`);
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+                            try {
+                                const retryResponse = await axios.head(url, headConfig);
+                                decayBackoff();
+                                const result = await checkEtag(retryResponse.headers['etag']);
+                                if (result === 'skip') {
+                                    logger.info(`ETag unchanged, skipping: ${url}`);
+                                    visitedUrls.add(url);
+                                    etagSkippedCount++;
+                                    continue;
+                                }
+                                // 'process' or 'no-etag' — fall through to full processing
+                            } catch {
+                                logger.debug(`HEAD retry also failed for ${url}, falling through to full processing`);
+                            }
+                        } else {
+                            // Non-429 failure — transient network issue, etc.
+                            // Do NOT count toward the missing-ETag threshold.
+                            logger.debug(`HEAD request failed for ${url}: ${headError?.message || headError}. Falling through to full processing.`);
                         }
                     }
                 }
@@ -452,8 +589,9 @@ export class ContentProcessor {
                         }
                     }, currentPage);
 
+                    let contentProcessedSuccessfully = false;
                     if (result.content !== null) {
-                        await processPageContent(url, result.content);
+                        contentProcessedSuccessfully = await processPageContent(url, result.content);
                         if (Utils.isPdfUrl(url)) {
                             pdfProcessedCount++;
                         } else {
@@ -486,12 +624,27 @@ export class ContentProcessor {
                         logger.debug(`Found ${newLinksFound} new links on ${url}`);
                     }
 
-                    // Store the ETag for this URL so subsequent runs can skip it
-                    if (result.etag && etagStore) {
-                        try {
-                            await etagStore.set(url, result.etag);
-                        } catch {
-                            // ETag storage failure is non-critical
+                    // Only store ETag/lastmod when content was processed successfully.
+                    // If chunking or embedding failed, we want the next run to retry
+                    // this page rather than skipping it based on stale metadata.
+                    if (contentProcessedSuccessfully) {
+                        // Store the ETag for this URL so subsequent runs can skip it
+                        if (result.etag && etagStore) {
+                            try {
+                                await etagStore.set(url, result.etag);
+                            } catch {
+                                // ETag storage failure is non-critical
+                            }
+                        }
+
+                        // Store the sitemap lastmod for this URL so subsequent runs can
+                        // skip it without any HTTP requests when the lastmod hasn't changed
+                        if (urlLastmod && lastmodStore) {
+                            try {
+                                await lastmodStore.set(url, urlLastmod);
+                            } catch {
+                                // Lastmod storage failure is non-critical
+                            }
                         }
                     }
 
@@ -589,7 +742,7 @@ export class ContentProcessor {
             }
         }
 
-        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (ETag): ${etagSkippedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
+        logger.info(`Crawl completed. HTML Pages: ${processedCount}, PDFs: ${pdfProcessedCount}, Skipped (Lastmod): ${lastmodSkippedCount}, Skipped (ETag): ${etagSkippedCount}, Skipped (Extension): ${skippedCount}, Skipped (Size): ${skippedSizeCount}, Errors: ${errorCount}`);
         
         if (hasNetworkErrors) {
             logger.warn('Network errors were encountered during crawling. Cleanup may be skipped to avoid removing valid chunks.');

@@ -856,12 +856,31 @@ describe('ContentProcessor', () => {
 
             vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
-            expect(urls).toEqual([
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result).toBeInstanceOf(Map);
+            expect([...result.keys()]).toEqual([
                 'https://example.com/page1',
                 'https://example.com/page2',
                 'https://example.com/page3'
             ]);
+            // No lastmod in sitemap → all values undefined
+            expect(result.get('https://example.com/page1')).toBeUndefined();
+        });
+
+        it('should extract lastmod dates from sitemap entries', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com/page1</loc><lastmod>2026-02-02</lastmod></url>
+                    <url><loc>https://example.com/page2</loc><lastmod>2026-01-15</lastmod></url>
+                    <url><loc>https://example.com/page3</loc></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result.get('https://example.com/page1')).toBe('2026-02-02');
+            expect(result.get('https://example.com/page2')).toBe('2026-01-15');
+            expect(result.get('https://example.com/page3')).toBeUndefined();
         });
 
         it('should handle nested sitemaps (<sitemap><loc> entries)', async () => {
@@ -872,7 +891,7 @@ describe('ContentProcessor', () => {
 
             const nestedXml = `<?xml version="1.0" encoding="UTF-8"?>
                 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-                    <url><loc>https://example.com/nested-page1</loc></url>
+                    <url><loc>https://example.com/nested-page1</loc><lastmod>2026-02-02</lastmod></url>
                     <url><loc>https://example.com/nested-page2</loc></url>
                 </urlset>`;
 
@@ -880,29 +899,33 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ data: indexXml } as any)
                 .mockResolvedValueOnce({ data: nestedXml } as any);
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap-index.xml', testLogger);
-            expect(urls).toEqual([
+            const result = await processor.parseSitemap('https://example.com/sitemap-index.xml', testLogger);
+            expect([...result.keys()]).toEqual([
                 'https://example.com/nested-page1',
                 'https://example.com/nested-page2'
             ]);
+            expect(result.get('https://example.com/nested-page1')).toBe('2026-02-02');
+            expect(result.get('https://example.com/nested-page2')).toBeUndefined();
         });
 
-        it('should return empty array on axios error', async () => {
+        it('should return empty map on axios error', async () => {
             vi.spyOn(axios, 'get').mockRejectedValueOnce(new Error('Network error'));
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
-            expect(urls).toEqual([]);
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result).toBeInstanceOf(Map);
+            expect(result.size).toBe(0);
         });
 
-        it('should return empty array for empty sitemap', async () => {
+        it('should return empty map for empty sitemap', async () => {
             const emptyXml = `<?xml version="1.0" encoding="UTF-8"?>
                 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
                 </urlset>`;
 
             vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: emptyXml } as any);
 
-            const urls = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
-            expect(urls).toEqual([]);
+            const result = await processor.parseSitemap('https://example.com/sitemap.xml', testLogger);
+            expect(result).toBeInstanceOf(Map);
+            expect(result.size).toBe(0);
         });
     });
 
@@ -927,7 +950,7 @@ describe('ContentProcessor', () => {
             const visited = new Set<string>();
             visited.add('https://example.com/');
 
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             expect(processContent).not.toHaveBeenCalled();
@@ -937,7 +960,7 @@ describe('ContentProcessor', () => {
             const processPageSpy = vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com/image.jpg' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             // Start with a URL that has an unsupported extension
             await processor.crawlWebsite('https://example.com/image.jpg', websiteConfig, processContent, testLogger, visited);
@@ -953,7 +976,7 @@ describe('ContentProcessor', () => {
             });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             expect(result.hasNetworkErrors).toBe(true);
@@ -970,7 +993,7 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ data: sitemapXml } as any); // parseSitemap call only
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             const configWithSitemap: WebsiteSourceConfig = {
                 ...websiteConfig,
@@ -990,7 +1013,7 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ content: '# Content', links: [], finalUrl: 'https://example.com/page2' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             // Should process both the base URL and the discovered link
@@ -1008,7 +1031,7 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ content: '# Content', links: [], finalUrl: 'https://example.com' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
 
             // processPage called twice: first 429, then success
@@ -1037,7 +1060,7 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ content: '# Retried Content', links: [], finalUrl: 'https://example.com' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             // Use fake timers to avoid waiting the real 30s default delay.
             // Must mock puppeteer.launch too since fake timers freeze its internals.
@@ -1078,7 +1101,7 @@ describe('ContentProcessor', () => {
                 .mockRejectedValueOnce(make429());
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             vi.useFakeTimers();
             const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
@@ -1116,7 +1139,7 @@ describe('ContentProcessor', () => {
                 .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
 
             vi.useFakeTimers();
             const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
@@ -1146,7 +1169,7 @@ describe('ContentProcessor', () => {
             };
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
 
             // processPage should NOT be called — the page was skipped via ETag
@@ -1172,7 +1195,7 @@ describe('ContentProcessor', () => {
             };
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
 
             expect(processContent).toHaveBeenCalledTimes(1);
@@ -1194,7 +1217,7 @@ describe('ContentProcessor', () => {
             };
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
 
             // Should fall through to full processing
@@ -1217,13 +1240,486 @@ describe('ContentProcessor', () => {
             };
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
 
             // Should process since there's no ETag to compare
             expect(processContent).toHaveBeenCalledTimes(1);
             // etagStore.get should NOT be called since there's no ETag in the response
             expect(etagStore.get).not.toHaveBeenCalled();
+        });
+
+        it('should retry HEAD request once on 429 then skip if ETag matches', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: { 'retry-after': '1' } },
+            });
+            vi.spyOn(axiosModule.default, 'head')
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ headers: { etag: '"abc123"' } });
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"abc123"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // HEAD was called twice (initial 429 + retry)
+            expect(axiosModule.default.head).toHaveBeenCalledTimes(2);
+            // processPage should NOT be called — ETag matched on retry
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            expect(visited.has('https://example.com')).toBe(true);
+        });
+
+        it('should fall through to full processing when HEAD 429 retry also fails', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: {} },
+            });
+            vi.spyOn(axiosModule.default, 'head')
+                .mockRejectedValueOnce(error429)
+                .mockRejectedValueOnce(error429);
+
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"abc123"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // Both HEAD attempts failed, should fall through to full processing
+            expect(axiosModule.default.head).toHaveBeenCalledTimes(2);
+            expect(processContent).toHaveBeenCalledTimes(1);
+        });
+
+        it('should increase HEAD backoff delay after 429 and decay on success', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: { 'retry-after': '0' } },
+            });
+
+            // We'll use 3 known URLs plus the base URL (4 total).
+            // URL 1 (base): HEAD returns 429 → retry succeeds → backoff starts at 200ms
+            // URL 2: HEAD succeeds (backoff decays 200 → 100)
+            // URL 3: HEAD succeeds (backoff decays 100 → 50)
+            // URL 4: HEAD succeeds (backoff decays 50 → 25)
+            const headSpy = vi.spyOn(axiosModule.default, 'head')
+                // URL 1: 429, then retry succeeds with matching ETag (skip)
+                .mockRejectedValueOnce(error429)
+                .mockResolvedValueOnce({ headers: { etag: '"etag1"' } })
+                // URL 2: success with matching ETag (skip)
+                .mockResolvedValueOnce({ headers: { etag: '"etag2"' } })
+                // URL 3: success with matching ETag (skip)
+                .mockResolvedValueOnce({ headers: { etag: '"etag3"' } })
+                // URL 4: success with matching ETag (skip)
+                .mockResolvedValueOnce({ headers: { etag: '"etag4"' } });
+
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+
+            const etagStore = {
+                get: vi.fn()
+                    .mockResolvedValueOnce('"etag1"')   // URL 1 retry: match
+                    .mockResolvedValueOnce('"etag2"')   // URL 2: match
+                    .mockResolvedValueOnce('"etag3"')   // URL 3: match
+                    .mockResolvedValueOnce('"etag4"'),  // URL 4: match
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const knownUrls = new Set([
+                'https://example.com/page2',
+                'https://example.com/page3',
+                'https://example.com/page4',
+            ]);
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Track real elapsed time — backoff adds 200 + 100 + 50 = 350ms minimum
+            const startTime = Date.now();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore, knownUrls });
+            const elapsedMs = Date.now() - startTime;
+
+            // All URLs should be skipped (ETag matches)
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+
+            // HEAD was called 5 times: 1 (429) + 1 (retry) + 3 (URLs 2-4)
+            expect(headSpy).toHaveBeenCalledTimes(5);
+
+            // Backoff delays: URL 2 waits 200ms, URL 3 waits 100ms, URL 4 waits 50ms = 350ms
+            // Allow margin for test overhead
+            expect(elapsedMs).toBeGreaterThanOrEqual(300);
+        });
+
+        it('should double backoff on consecutive 429s up to max', async () => {
+            const axiosModule = await import('axios');
+            const error429 = Object.assign(new Error('Request failed with status code 429'), {
+                response: { status: 429, headers: { 'retry-after': '0' } },
+            });
+
+            // 3 known URLs, all HEAD requests return 429 (initial + retry).
+            // Backoff should increase: 0 → 200 → 400 → 800
+            vi.spyOn(axiosModule.default, 'head')
+                .mockRejectedValue(error429); // All HEAD requests return 429
+
+            vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Page 1', links: [], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' })
+                .mockResolvedValueOnce({ content: '# Page 3', links: [], finalUrl: 'https://example.com/page3' });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"etag"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const knownUrls = new Set([
+                'https://example.com/page2',
+                'https://example.com/page3',
+            ]);
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Track actual time to verify backoff introduces delays
+            const startTime = Date.now();
+            await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore, knownUrls });
+            const elapsedMs = Date.now() - startTime;
+
+            // All 3 pages should be fully processed (HEAD failed, fell through)
+            expect(processContent).toHaveBeenCalledTimes(3);
+
+            // HEAD was called 6 times (2 per URL: initial 429 + retry 429)
+            expect(axiosModule.default.head).toHaveBeenCalledTimes(6);
+
+            // Backoff adds real delays: URL 2 waits 200ms, URL 3 waits 400ms = 600ms minimum
+            // from backoff alone (the 429 retry-after is 0).
+            // Allow some margin for test overhead.
+            expect(elapsedMs).toBeGreaterThanOrEqual(500);
+        });
+
+        it('should skip URL when sitemap lastmod matches stored value', async () => {
+            // Sitemap with lastmod for the base URL
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-02</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const headSpy = vi.spyOn(axios, 'head');
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // stored matches sitemap
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // Page should be skipped — no processPage, no HEAD, no processContent
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(headSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            expect(lastmodStore.get).toHaveBeenCalledWith('https://example.com');
+        });
+
+        it('should process URL when sitemap lastmod differs from stored value', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // stored is older
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // Page should be processed and lastmod stored
+            expect(processContent).toHaveBeenCalledTimes(1);
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com', '2026-02-10');
+        });
+
+        it('should process URL when no stored lastmod exists', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-02</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue(undefined), // first run — nothing stored
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // Page should be processed and lastmod stored
+            expect(processContent).toHaveBeenCalledTimes(1);
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com', '2026-02-02');
+        });
+
+        it('should skip ETag HEAD request when URL has lastmod from sitemap', async () => {
+            // URL has lastmod but it differs → will be processed.
+            // The key assertion: no HEAD request should be made (lastmod takes priority).
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const headSpy = vi.spyOn(axios, 'head');
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue('"some-etag"'),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // older → will process
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Page should be processed but HEAD should NOT be called
+            expect(processContent).toHaveBeenCalledTimes(1);
+            expect(headSpy).not.toHaveBeenCalled();
+        });
+
+        it('should fall back to ETag for URLs not in sitemap', async () => {
+            // Sitemap only has base URL, but crawling discovers /page2 via links.
+            // /page2 has no lastmod → should use ETag check.
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const headSpy = vi.spyOn(axios, 'head')
+                .mockResolvedValue({ headers: { etag: '"abc123"' } });
+
+            vi.spyOn(processor as any, 'processPage')
+                .mockResolvedValueOnce({ content: '# Page 1', links: ['https://example.com/page2'], finalUrl: 'https://example.com' })
+                .mockResolvedValueOnce({ content: '# Page 2', links: [], finalUrl: 'https://example.com/page2' });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue(undefined), // no stored etag
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-02-02'), // older → base URL will process
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Both pages processed
+            expect(processContent).toHaveBeenCalledTimes(2);
+            // HEAD should be called for /page2 (not in sitemap) but NOT for base URL (has lastmod)
+            expect(headSpy).toHaveBeenCalledTimes(1);
+            expect(headSpy).toHaveBeenCalledWith('https://example.com/page2', expect.anything());
+        });
+
+        it('should inherit lastmod from parent directory URL for child URLs without lastmod', async () => {
+            // Mimics the solo.io pattern: parent directory has lastmod, child pages don't
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com/docs/2.10.x/</loc><lastmod>2026-01-30</lastmod></url>
+                    <url><loc>https://example.com/docs/2.10.x/guide/</loc></url>
+                    <url><loc>https://example.com/docs/2.10.x/reference/cli/</loc></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            const processPageSpy = vi.spyOn(processor as any, 'processPage');
+            const headSpy = vi.spyOn(axios, 'head');
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-01-30'), // all match parent's lastmod
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                url: 'https://example.com/docs/2.10.x/',
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com/docs/2.10.x/', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // All 3 URLs should be skipped — parent's lastmod inherited to children
+            expect(processPageSpy).not.toHaveBeenCalled();
+            expect(headSpy).not.toHaveBeenCalled();
+            expect(processContent).not.toHaveBeenCalled();
+            // lastmodStore.get called for all 3 URLs
+            expect(lastmodStore.get).toHaveBeenCalledTimes(3);
+        });
+
+        it('should use most specific parent lastmod when multiple parents match', async () => {
+            // Nested directories with different lastmods
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com/</loc><lastmod>2026-01-01</lastmod></url>
+                    <url><loc>https://example.com/docs/</loc><lastmod>2026-02-01</lastmod></url>
+                    <url><loc>https://example.com/docs/page1</loc></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com/docs/page1',
+            });
+
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue('2026-01-15'), // doesn't match either parent
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { lastmodStore });
+
+            // /docs/page1 should inherit from /docs/ (more specific) not / (less specific)
+            // Since stored lastmod (2026-01-15) != inherited (2026-02-01), it should be processed
+            // The key check: lastmodStore.set should store the inherited value 2026-02-01
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com/docs/page1', '2026-02-01');
+        });
+
+        it('should not store etag or lastmod when processPageContent returns false', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"etag123"',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue(undefined),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue(undefined), // first run
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            // processContent returns false — simulates chunking/embedding failure
+            const processContent = vi.fn().mockResolvedValue(false);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Page was processed (processContent was called)
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // But neither etag nor lastmod should be stored since processing failed
+            expect(etagStore.set).not.toHaveBeenCalled();
+            expect(lastmodStore.set).not.toHaveBeenCalled();
+        });
+
+        it('should store etag and lastmod when processPageContent returns true', async () => {
+            const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+                <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                    <url><loc>https://example.com</loc><lastmod>2026-02-10</lastmod></url>
+                </urlset>`;
+
+            vi.spyOn(axios, 'get').mockResolvedValueOnce({ data: sitemapXml } as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({
+                content: '# Content', links: [], finalUrl: 'https://example.com', etag: '"etag123"',
+            });
+
+            const etagStore = {
+                get: vi.fn().mockResolvedValue(undefined),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+            const lastmodStore = {
+                get: vi.fn().mockResolvedValue(undefined),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const configWithSitemap: WebsiteSourceConfig = {
+                ...websiteConfig,
+                sitemap_url: 'https://example.com/sitemap.xml',
+            };
+
+            await processor.crawlWebsite('https://example.com', configWithSitemap, processContent, testLogger, visited, { etagStore, lastmodStore });
+
+            // Page was processed successfully
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // Both etag and lastmod should be stored
+            expect(etagStore.set).toHaveBeenCalledWith('https://example.com', '"etag123"');
+            expect(lastmodStore.set).toHaveBeenCalledWith('https://example.com', '2026-02-10');
         });
 
         it('should pre-seed queue with known URLs', async () => {
@@ -1234,7 +1730,7 @@ describe('ContentProcessor', () => {
             const knownUrls = new Set(['https://example.com/page2']);
 
             const visited = new Set<string>();
-            const processContent = vi.fn();
+            const processContent = vi.fn().mockResolvedValue(true);
             await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { knownUrls });
 
             // Both the base URL and the known URL should be processed
