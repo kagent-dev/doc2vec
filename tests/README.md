@@ -5,10 +5,10 @@
 | Metric | Value |
 |--------|-------|
 | **Framework** | [Vitest](https://vitest.dev/) v4 |
-| **Total tests** | 470 |
+| **Total tests** | 519 |
 | **Test files** | 8 |
-| **Total lines** | ~8,000 |
-| **Execution time** | ~8s |
+| **Total lines** | ~10,000 |
+| **Execution time** | ~40s |
 
 ## Running Tests
 
@@ -27,20 +27,20 @@ npm run test:coverage
 
 | File | Tests | Source | Description |
 |------|-------|--------|-------------|
-| `tests/utils.test.ts` | 64 | `utils.ts` | Hashing, UUID generation, URL utilities, tokenization |
+| `tests/utils.test.ts` | 65 | `utils.ts` | Hashing, UUID generation, URL utilities, tokenization |
 | `tests/logger.test.ts` | 47 | `logger.ts` | Log levels, formatting, colors, child loggers, progress bars |
-| `tests/content-processor.test.ts` | 153 | `content-processor.ts` | HTML conversion, chunking, crawling, PDF/DOC processing, tab preprocessing |
-| `tests/database.test.ts` | 72 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup, URL-level hash queries |
+| `tests/content-processor.test.ts` | 194 | `content-processor.ts` | HTML conversion, chunking, crawling, ETag/lastmod change detection, adaptive backoff, PDF/DOC processing, tab preprocessing |
+| `tests/database.test.ts` | 75 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup, URL-level hash queries, URL prefix queries |
 | `tests/code-chunker.test.ts` | 62 | `code-chunker.ts` | AST-based code chunking, language support, merge behavior, function boundary integrity |
 | `tests/doc2vec.test.ts` | 58 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings |
-| `tests/mcp-server.test.ts` | 18 | `mcp/src/server.ts` | MCP server helpers, query handlers, SQLite/Qdrant providers, end-to-end |
-| `tests/e2e.test.ts` | 3 | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, and website source |
+| `tests/mcp-server.test.ts` | 12 | `mcp/src/server.ts` | MCP server helpers, query handlers, SQLite/Qdrant providers, end-to-end |
+| `tests/e2e.test.ts` | 6 (+2 conditional) | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, website source, and multi-sync change detection (SQLite + Qdrant) |
 
 ---
 
 ## Test Details
 
-### `tests/utils.test.ts` (64 tests)
+### `tests/utils.test.ts` (65 tests)
 
 #### `generateHash`
 - Returns a valid SHA-256 hex string
@@ -71,6 +71,7 @@ npm run test:coverage
 
 #### `shouldProcessUrl`
 - Returns true for extensionless URLs, `.html`, `.htm`, `.pdf`
+- Returns true for paths ending with `/` (e.g., `/app/2.1.x/`) regardless of version-like segments
 - Returns false for `.jpg`, `.css`, `.js`, `.png`
 - Case-insensitive extension matching
 - Throws on invalid URL (no try/catch in source)
@@ -149,7 +150,7 @@ npm run test:coverage
 
 ---
 
-### `tests/content-processor.test.ts` (153 tests)
+### `tests/content-processor.test.ts` (194 tests)
 
 #### `convertHtmlToMarkdown`
 - Converts headings (H1-H6), bold, italic, links, lists, code blocks, inline code, blockquotes
@@ -178,9 +179,10 @@ npm run test:coverage
 - Falls back to TokenChunker when CodeChunker fails
 
 #### `parseSitemap`
-- Parses standard sitemaps with `<url><loc>` entries
-- Handles nested sitemaps (`<sitemap><loc>` entries with recursive processing)
-- Returns empty array on axios error or empty sitemap
+- Parses standard sitemaps with `<url><loc>` entries, returns `Map<string, string | undefined>` (URL → lastmod)
+- Extracts `<lastmod>` dates alongside URLs
+- Handles nested sitemaps (`<sitemap><loc>` entries with recursive processing, preserving lastmod)
+- Returns empty map on axios error or empty sitemap
 
 #### `crawlWebsite`
 - Skips already-visited URLs (deduplication)
@@ -188,6 +190,32 @@ npm run test:coverage
 - Sets `hasNetworkErrors=true` when a network error occurs
 - Integrates sitemap URLs when `sitemap_url` is configured
 - Discovers links from crawled pages and adds them to the queue
+- Pre-seeds queue with known URLs from the database
+
+#### `crawlWebsite` — ETag-based change detection
+- Skips page when ETag matches stored value (no Puppeteer load)
+- Processes page when ETag differs from stored value
+- Falls through to full processing when HEAD request fails (non-429)
+- Processes page when no ETag in HEAD response
+- Retries HEAD request once on 429, then skips if ETag matches on retry
+- Falls through to full processing when HEAD 429 retry also fails
+
+#### `crawlWebsite` — adaptive HEAD backoff
+- Increases backoff delay after 429 and decays on success (200ms → 100ms → 50ms → 0)
+- Doubles backoff on consecutive 429s up to max (200ms → 400ms → 800ms, capped at 5s)
+
+#### `crawlWebsite` — sitemap lastmod-based change detection
+- Skips URL when sitemap lastmod matches stored value (no HEAD, no Puppeteer)
+- Processes URL when sitemap lastmod differs from stored value
+- Processes URL when no stored lastmod exists (first run)
+- Skips ETag HEAD request when URL has lastmod from sitemap (lastmod takes priority)
+- Falls back to ETag for URLs not in sitemap (discovered via link crawling)
+- Inherits lastmod from parent directory URL for child URLs without lastmod
+- Uses most specific parent lastmod when multiple parents match
+
+#### `crawlWebsite` — processing success gating
+- Does not store etag or lastmod when `processPageContent` returns false (failure)
+- Stores etag and lastmod when `processPageContent` returns true (success)
 
 #### `processPage`
 - Routes PDF URLs to `downloadAndConvertPdfFromUrl`
@@ -239,6 +267,15 @@ npm run test:coverage
 - Recursively marks parent elements
 - Does not mark nodes without `<pre>` or `<code>` elements
 
+#### `isProtocolError`
+- Returns true for `Protocol error`, `ProtocolError`, `Target closed`, `Session closed`
+- Returns false for normal errors, null, and non-Error objects
+
+#### `parseRetryAfter`
+- Returns milliseconds for numeric `Retry-After` values (e.g., `"120"` → 120000)
+- Returns milliseconds for HTTP-date `Retry-After` values
+- Returns undefined for undefined, empty string, or unparseable values
+
 #### `network error detection`
 - Detects ENOTFOUND, ECONNREFUSED, ETIMEDOUT, ECONNRESET, EHOSTUNREACH, ENETUNREACH
 - Detects axios errors without response
@@ -268,7 +305,7 @@ npm run test:coverage
 
 ---
 
-### `tests/database.test.ts` (72 tests)
+### `tests/database.test.ts` (75 tests)
 
 #### `initDatabase`
 - **SQLite**: Generates default `db_path` from product_name and version; uses custom `db_path`; returns `SqliteDB` connection
@@ -328,9 +365,14 @@ npm run test:coverage
 - `storeChunkInQdrant`: Calls upsert with correct payload; converts non-UUID chunk_id; uses `crypto.randomUUID()` fallback; generates hash when not provided; handles upsert errors
 - `createCollectionQdrant`: Creates collection; skips when exists; handles "already exists" error
 - `removeObsoleteChunksQdrant`: Deletes obsolete chunks; skips metadata points; handles scroll/delete errors
-- `removeChunksByUrlQdrant`: Deletes by URL filter; handles delete errors
+- `removeChunksByUrlQdrant`: Deletes by URL filter using `match: { value: url }` (exact match); handles delete errors
 - `removeObsoleteFilesQdrant`: Direct file path mode; URL rewrite mode; no-op when no obsolete files; error handling
 - Metadata: Sets and gets values in Qdrant; returns default when not found
+
+#### `getStoredUrlsByPrefixSQLite`
+- Returns unique URLs matching a prefix
+- Returns empty array when no URLs match
+- Does not return duplicate URLs
 
 #### `hasColumn` (private method)
 - Returns false when PRAGMA fails
@@ -520,7 +562,7 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 
 ---
 
-### `tests/mcp-server.test.ts` (18 tests)
+### `tests/mcp-server.test.ts` (12 tests)
 
 #### `MCP server helpers`
 - `normalizeExtensions` normalizes extensions to lowercase and dot-prefixed
@@ -546,17 +588,18 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 
 ---
 
-### `tests/e2e.test.ts` (3 tests)
+### `tests/e2e.test.ts` (6 tests + 2 conditional Qdrant tests)
 
-End-to-end integration tests that validate the full processing pipeline — from source content through chunking, hashing, embedding, and storage — with URL-level change detection. Each test creates 3 documents, processes them, modifies only the 2nd, re-processes all 3, and verifies that only the modified document is re-embedded while the others are skipped entirely.
+End-to-end integration tests that validate the full processing pipeline — from source content through chunking, hashing, embedding, and storage — with multi-layer change detection.
 
 **Components used (real, not mocked):**
 - SQLite with `better-sqlite3` + `sqlite-vec` (in-memory databases)
-- `ContentProcessor` (real chunking, HTML conversion, Puppeteer rendering)
-- `DatabaseManager` (real `insertVectorsSQLite`, `getChunkHashesByUrlSQLite`, `removeChunksByUrlSQLite`)
+- Qdrant (conditional on `QDRANT_API_KEY`, `QDRANT_URL`, `QDRANT_PORT`, `QDRANT_TEST_COLLECTION` env vars)
+- `ContentProcessor` (real chunking, HTML conversion, Puppeteer rendering, `crawlWebsite` crawl loop)
+- `DatabaseManager` (real insert, query, delete, metadata operations)
 - Chonkie + Tree-sitter (real AST-based code chunking for code source test)
-- Puppeteer (real headless browser for website source test)
-- Local HTTP server (for website source test)
+- Puppeteer (real headless browser for website source tests)
+- Local HTTP server with configurable content, ETags, and sitemap (for website tests)
 
 **Only embeddings are stubbed:** deterministic `Array(3072).fill(0.1)` with call tracking via `createEmbeddingTracker`.
 
@@ -589,6 +632,30 @@ End-to-end integration tests that validate the full processing pipeline — from
 - Verifies page 1 and page 3 chunks are byte-identical across runs
 - Verifies no orphaned chunks
 
+#### `E2E: Website Multi-Sync Change Detection` (120s timeout)
+Exercises all 4 change detection layers across 6 consecutive sync runs against a local HTTP server with sitemap, ETags, and mutable content. Uses the full `crawlWebsite` pipeline (not individual `processPage` calls).
+
+| Run | Scenario | Layers tested | Key assertions |
+|-----|----------|--------------|----------------|
+| **1** | Initial sync — 4 pages, all new | Full pipeline | All 4 pages embedded, chunks stored |
+| **2** | No changes | Layer 1: lastmod | Zero pages processed, zero HEAD requests, zero embeddings |
+| **3** | page2 lastmod + content changed | Layer 1 (skip others) + Layer 3+4 (re-embed page2) | Only page2 processed, page1/3 chunks untouched, zero HEAD requests |
+| **4** | page1 links to new page4 (not in sitemap) | Layer 1 (skip) + Layer 2 (ETag for page4) + Layer 4 | page4 discovered and embedded, page2/3 skipped via lastmod, HEAD used for page4 |
+| **5** | page3 lastmod changed, processing fails | Layer 1 (detect change) + failure gating | page3 processed but failed, lastmod NOT stored, old chunks preserved |
+| **6** | Retry after failure | Layer 1 (retry) + Layer 3+4 | page3 reprocessed (lastmod wasn't stored), new chunks written |
+
+Additional assertions per run: no orphaned chunks, correct HEAD request counts, chunks byte-identical for unmodified pages.
+
+#### `E2E: Qdrant Website Source` (60s timeout, conditional)
+- Same as "E2E: Website Source" but uses real Qdrant instead of SQLite
+- Conditional on env vars: `QDRANT_API_KEY`, `QDRANT_URL`, `QDRANT_PORT`, `QDRANT_TEST_COLLECTION`
+- Creates/deletes test collection before/after each test
+
+#### `E2E: Qdrant Multi-Sync Change Detection` (120s timeout, conditional)
+- Same 6-run scenario as "E2E: Website Multi-Sync Change Detection" but uses Qdrant backend
+- Validates all 4 change detection layers work correctly with Qdrant metadata storage
+- Conditional on same Qdrant env vars
+
 ---
 
 ## Mocking Strategy
@@ -606,12 +673,15 @@ End-to-end integration tests that validate the full processing pipeline — from
 
 ### Real instances used:
 - SQLite with `better-sqlite3` + `sqlite-vec` (in-memory databases)
+- Qdrant (conditional E2E tests with real Qdrant instance)
 - `ContentProcessor` with suppressed logger (`LogLevel.NONE`)
 - `TurndownService` (HTML-to-Markdown conversion)
 - `web-tree-sitter` (AST parsing for code chunking)
-- Puppeteer (E2E website test uses real headless browser)
+- Puppeteer (E2E website tests use real headless browser)
 - Chonkie + Tree-sitter (E2E code test uses real AST-based chunking)
-- Local HTTP server (E2E website test serves pages via `http.createServer`)
+- Local HTTP server with configurable content, ETags, and sitemap XML (E2E multi-sync tests)
+- `DatabaseManager` metadata operations (E2E multi-sync tests use real metadata store for ETag/lastmod)
+- `crawlWebsite` full pipeline (E2E multi-sync tests exercise the complete crawl loop with all change detection layers)
 - Filesystem operations (temp directories created/cleaned per test)
 
 ### Private method access:

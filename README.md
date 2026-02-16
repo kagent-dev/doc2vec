@@ -11,7 +11,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 ## Key Features
 
 *   **Website Crawling:** Recursively crawls websites starting from a given base URL.
-    * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation.
+    * **Sitemap Support:** Extracts URLs from XML sitemaps to discover pages not linked in navigation. When sitemaps include `<lastmod>` dates, pages are skipped without any HTTP requests if the date hasn't changed since the last sync.
     * **PDF Support:** Automatically downloads and processes PDF files linked from websites.
 *   **GitHub Issues Integration:** Retrieves GitHub issues and comments, processing them into searchable chunks.
 *   **Zendesk Integration:** Fetches support tickets and knowledge base articles from Zendesk, converting them to searchable chunks.
@@ -36,7 +36,13 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Vector Storage:** Supports storing chunks, metadata, and embeddings in:
     *   **SQLite:** Using `better-sqlite3` and the `sqlite-vec` extension for efficient vector search.
     *   **Qdrant:** A dedicated vector database, using the `@qdrant/js-client-rest`.
-*   **Change Detection:** Uses URL-level content hashing to detect changes. All chunk hashes for a URL are compared against stored values; unchanged URLs are skipped entirely, while changed URLs are fully re-processed with correct chunk ordering and no orphaned chunks.
+*   **Multi-Layer Change Detection:** Four layers of change detection minimize unnecessary re-processing:
+    1. **Sitemap `lastmod`:** When available, compares the sitemap's `<lastmod>` date against the stored value — skips without any HTTP request. Child URLs inherit `lastmod` from their most specific parent directory.
+    2. **ETag via HEAD request:** For URLs without `lastmod`, sends a lightweight HEAD request and compares the ETag header against the stored value. Adaptive backoff prevents rate limiting (starts at 0ms delay, increases on 429 responses, decays on success).
+    3. **Content hash comparison:** After full page load, compares chunk content hashes against stored values — skips embedding if content is unchanged.
+    4. **Embedding:** Only re-embeds chunks when content has actually changed.
+    
+    ETag and lastmod values are only stored when chunking and embedding succeed, ensuring failed pages are retried on the next run.
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
@@ -497,12 +503,16 @@ If you don't specify a config path, it will look for config.yaml in the current 
     2.  **Process by Source Type:**
         - **For Websites:**
           *   Start at the base `url`.
-          *   If `sitemap_url` is provided, fetch and parse the sitemap to extract additional URLs.
-          *   Use Puppeteer (`processPage`) to fetch and render HTML for web pages.
+          *   If `sitemap_url` is provided, fetch and parse the sitemap to extract URLs and `lastmod` dates.
+          *   Pre-seed the crawl queue with known URLs from the database (ensures link discovery isn't lost when pages are skipped).
+          *   For each URL, apply multi-layer change detection:
+              1.  If `lastmod` is available (from sitemap), compare against stored value — skip if unchanged.
+              2.  Otherwise, send a HEAD request and compare the ETag — skip if unchanged. Adaptive backoff prevents rate limiting.
+              3.  If no skip, use Puppeteer (`processPage`) to fetch and render the full page.
           *   For PDF URLs, download and extract text using Mozilla's PDF.js.
           *   Use Readability to extract main content from HTML pages.
           *   Sanitize HTML and convert to Markdown using Turndown.
-          *   Use `axios`/`cheerio` on HTML pages to find new links to add to the crawl queue.
+          *   Discover links from the rendered DOM to add to the crawl queue.
           *   Keep track of all visited URLs.
         - **For GitHub Repositories:**
           *   Fetch issues and comments using the GitHub API.
@@ -529,6 +539,32 @@ If you don't specify a config path, it will look for config.yaml in the current 
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Multi-Layer Change Detection for Websites
+- **Sitemap `lastmod` support:** When a sitemap includes `<lastmod>` dates, pages are skipped entirely if the date hasn't changed — no HEAD request, no Puppeteer load, no chunking. One sitemap fetch replaces hundreds of individual HEAD requests.
+- **`lastmod` inheritance:** Child URLs without their own `<lastmod>` inherit from the most specific parent directory URL in the sitemap (e.g., `/docs/2.10.x/reference/cli/` inherits from `/docs/2.10.x/`).
+- **ETag-based change detection:** For URLs not in the sitemap, a HEAD request compares the ETag header against the stored value. Pages with unchanged ETags are skipped without a full page load.
+- **Adaptive HEAD request backoff:** Starts with no delay between HEAD requests. On 429 (rate limit), backs off starting at 200ms and doubles up to 5s. On success, the delay halves back toward zero. Prevents burst rate limiting while maximizing throughput.
+- **Processing success gating:** ETag and lastmod values are only stored in metadata when chunking and embedding succeed. If processing fails, the next run will retry the page instead of incorrectly skipping it.
+- **`parseSitemap` now returns a `Map<string, string | undefined>`** (URL → lastmod) instead of `string[]`, enabling lastmod data to flow through the pipeline.
+- **`processPageContent` callback returns `boolean`** (true = success, false = failure) to signal whether metadata should be persisted.
+
+### Puppeteer Resilience Improvements
+- Browser restart escalation when protocol errors persist after page recreation
+- Periodic browser restart every 50 pages to prevent memory accumulation
+- Added `--disable-dev-shm-usage` Chrome flag (critical in Docker where `/dev/shm` defaults to 64MB)
+- Added `--disable-gpu` and `--disable-extensions` flags
+
+### HTTP 429 Retry for Full Page Processing
+- Added `Retry-After` header parsing (supports seconds and HTTP-date formats)
+- Per-URL retry tracking (max 3 attempts) with configurable delay (30s default, 120s cap)
+- Queue re-insertion on retry to allow other URLs to be processed while waiting
+
+### Qdrant Filter Fix
+- Fixed `removeChunksByUrlQdrant` to use `match: { value: url }` (exact match) instead of `match: { text: url }` (full-text tokenized search), which was causing cross-URL chunk deletion
+
+### URL Processing Fix
+- Fixed `shouldProcessUrl` to return `true` for paths ending with `/`, preventing version-like URLs (e.g., `/app/2.1.x/`) from being incorrectly rejected by `path.extname`
 
 ### Tabbed Content Support
 - Automatically detects tabbed UI components using the WAI-ARIA tabs pattern (`role="tab"` + `role="tabpanel"`)
