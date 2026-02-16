@@ -199,6 +199,10 @@ describe('Utils', () => {
         it('should return true for root URL', () => {
             expect(Utils.shouldProcessUrl('https://example.com/')).toBe(true);
         });
+
+        it('should return true for version-like paths with trailing slash', () => {
+            expect(Utils.shouldProcessUrl('https://example.com/app/2.1.x/')).toBe(true);
+        });
     });
 
     // ─── isPdfUrl ───────────────────────────────────────────────────

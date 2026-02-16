@@ -45,8 +45,11 @@ export class Utils {
     static shouldProcessUrl(url: string): boolean {
         const parsedUrl = new URL(url);
         const pathname = parsedUrl.pathname;
-        const ext = path.extname(pathname);
 
+        // Paths ending with / are directory-like URLs (e.g., /app/2.1.x/), always process them
+        if (pathname.endsWith('/')) return true;
+
+        const ext = path.extname(pathname);
         if (!ext) return true;
         return ['.html', '.htm', '.pdf'].includes(ext.toLowerCase());
     }
