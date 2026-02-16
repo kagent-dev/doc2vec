@@ -646,6 +646,439 @@ describe('E2E: Website Source', () => {
     }, 60000); // 60s timeout for Puppeteer-based test
 });
 
+// ─── Website Multi-Sync E2E (full pipeline with all change detection layers) ─
+
+/**
+ * Helper: run one "sync" of the full website pipeline through crawlWebsite.
+ * Mimics Doc2Vec.processWebsite — crawlWebsite drives the crawl, processPage
+ * loads pages via Puppeteer, and the callback does chunking + embedding.
+ *
+ * Returns stats about what happened during this sync.
+ */
+async function runWebsiteSync(
+    processor: ContentProcessor,
+    config: WebsiteSourceConfig,
+    dbConnection: SqliteDB,
+    tracker: ReturnType<typeof createEmbeddingTracker>,
+    options?: { failUrls?: Set<string> }
+): Promise<{
+    visitedUrls: Set<string>;
+    processedUrls: Set<string>;
+    embeddedUrls: Set<string>;
+    embedCallCount: number;
+    totalChunks: number;
+}> {
+    const visitedUrls = new Set<string>();
+    const processedUrls = new Set<string>();
+    const urlPrefix = Utils.getUrlPrefix(config.url);
+
+    // Pre-load known URLs from DB
+    const storedUrls = DatabaseManager.getStoredUrlsByPrefixSQLite(dbConnection.db, urlPrefix);
+    const knownUrls = storedUrls.length > 0 ? new Set(storedUrls) : undefined;
+
+    // ETag store
+    const etagStore = {
+        get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, testLogger),
+        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger),
+    };
+
+    // Lastmod store
+    const lastmodStore = {
+        get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, testLogger),
+        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger),
+    };
+
+    tracker.reset();
+
+    await processor.crawlWebsite(
+        config.url,
+        config,
+        async (url, content) => {
+            processedUrls.add(url);
+
+            // Simulate processing failure for specific URLs
+            if (options?.failUrls?.has(url)) {
+                return false;
+            }
+
+            const chunks = await processor.chunkMarkdown(content, config, url);
+            const newHashes = chunks.map(c => Utils.generateHash(c.content));
+            const newHashesSorted = newHashes.slice().sort();
+            const existingHashesSorted = DatabaseManager.getChunkHashesByUrlSQLite(dbConnection.db, url);
+
+            const unchanged = newHashesSorted.length === existingHashesSorted.length &&
+                newHashesSorted.every((h, i) => h === existingHashesSorted[i]);
+
+            if (unchanged) {
+                return true;
+            }
+
+            // Changed — delete old, insert new
+            if (existingHashesSorted.length > 0) {
+                DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, testLogger);
+            }
+
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
+                chunk.metadata.branch = chunk.metadata.branch || '';
+                chunk.metadata.repo = chunk.metadata.repo || '';
+                const embedding = tracker.embed(url);
+                DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, testLogger, newHashes[i]);
+            }
+
+            return true;
+        },
+        testLogger,
+        visitedUrls,
+        { knownUrls, etagStore, lastmodStore }
+    );
+
+    return {
+        visitedUrls,
+        processedUrls,
+        embeddedUrls: new Set(tracker.embeddedUrls),
+        embedCallCount: tracker.embedCallCount,
+        totalChunks: countAllChunks(dbConnection.db),
+    };
+}
+
+describe('E2E: Website Multi-Sync Change Detection', () => {
+    let server: http.Server;
+    let baseUrl: string;
+    let db: BetterSqlite3.Database;
+    let dbConnection: SqliteDB;
+    let tracker: ReturnType<typeof createEmbeddingTracker>;
+    let processor: ContentProcessor;
+
+    // Mutable server state — controls what the HTTP server returns
+    const pageContent: Record<string, string> = {};
+    const pageEtags: Record<string, string> = {};
+    let sitemapXml = '';
+    let headRequestCount = 0;
+
+    beforeEach(async () => {
+        headRequestCount = 0;
+
+        // Initial page content
+        pageContent['/'] = `
+            <html><head><title>Home</title></head><body>
+            <article>
+                <h1>Home Page</h1>
+                <p>Welcome to the documentation site.</p>
+                <a href="/page1">Page 1</a>
+                <a href="/page2">Page 2</a>
+                <a href="/page3">Page 3</a>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two</h1>
+                <p>This is the second page about monitoring and observability best practices.</p>
+                <p>Learn how to set up dashboards and configure alerting rules.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three</h1>
+                <p>This is the third page describing security hardening procedures.</p>
+                <p>Covers TLS configuration, network policies, and access control.</p>
+            </article>
+            </body></html>
+        `;
+
+        // ETags per page
+        pageEtags['/'] = '"etag-home-v1"';
+        pageEtags['/page1'] = '"etag-page1-v1"';
+        pageEtags['/page2'] = '"etag-page2-v1"';
+        pageEtags['/page3'] = '"etag-page3-v1"';
+
+        // Sitemap with lastmod for all pages
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        // Start HTTP server with ETag and sitemap support
+        server = http.createServer((req, res) => {
+            const urlPath = req.url || '';
+
+            // Serve sitemap
+            if (urlPath === '/sitemap.xml') {
+                res.writeHead(200, { 'Content-Type': 'application/xml' });
+                res.end(sitemapXml.replace(/BASE_URL/g, baseUrl));
+                return;
+            }
+
+            const content = pageContent[urlPath];
+            if (content) {
+                const etag = pageEtags[urlPath];
+                const headers: Record<string, string> = { 'Content-Type': 'text/html' };
+                if (etag) headers['ETag'] = etag;
+
+                if (req.method === 'HEAD') {
+                    headRequestCount++;
+                    res.writeHead(200, headers);
+                    res.end();
+                } else {
+                    res.writeHead(200, headers);
+                    res.end(content);
+                }
+            } else {
+                res.writeHead(404);
+                res.end('Not found');
+            }
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Failed to start test server');
+        baseUrl = `http://127.0.0.1:${(address as any).port}`;
+
+        const created = createE2EDatabase();
+        db = created.db;
+        dbConnection = created.dbConnection;
+        // Initialize metadata table
+        await DatabaseManager.initDatabaseMetadata(dbConnection, testLogger);
+        tracker = createEmbeddingTracker();
+        processor = new ContentProcessor(testLogger);
+    });
+
+    afterEach(() => {
+        db.close();
+        server.close();
+    });
+
+    it('should use all 4 change detection layers across multiple syncs', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-multisync',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            sitemap_url: baseUrl + '/sitemap.xml',
+            database_config: { type: 'sqlite', params: {} },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: Initial sync — all pages are new, everything embedded
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSync(processor, config, dbConnection, tracker);
+
+        // All 4 pages should be processed (home + page1-3)
+        expect(run1.processedUrls.size).toBe(4);
+        // All should be embedded (no prior data)
+        expect(run1.embeddedUrls.size).toBe(4);
+        expect(run1.totalChunks).toBeGreaterThan(0);
+        const run1TotalChunks = run1.totalChunks;
+
+        // Verify chunks exist for each page
+        for (const pagePath of ['/', '/page1', '/page2', '/page3']) {
+            const url = `${baseUrl}${pagePath}`;
+            const chunks = getChunksForUrl(db, url);
+            expect(chunks.length).toBeGreaterThan(0);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: No changes — lastmod unchanged → all skipped at layer 1
+        // No HEAD requests, no Puppeteer, no embedding
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run2 = await runWebsiteSync(processor, config, dbConnection, tracker);
+
+        // No pages should be processed (all skipped via lastmod)
+        expect(run2.processedUrls.size).toBe(0);
+        // No HEAD requests made (lastmod bypasses ETag check)
+        expect(headRequestCount).toBe(0);
+        // No embeddings
+        expect(run2.embedCallCount).toBe(0);
+        // Chunks unchanged
+        expect(run2.totalChunks).toBe(run1TotalChunks);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 3: page2 lastmod changes + content changes → re-embedded
+        // page1 & page3 unchanged via lastmod → skipped
+        // ═══════════════════════════════════════════════════════════════
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two — Updated</h1>
+                <p>This page has been updated with new monitoring practices for cloud-native environments.</p>
+                <p>Includes Prometheus, Grafana, and OpenTelemetry integration guides.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page2'] = '"etag-page2-v2"';
+
+        // Save page1 and page3 chunks for comparison
+        const page1ChunksBefore = getChunksForUrl(db, `${baseUrl}/page1`);
+        const page3ChunksBefore = getChunksForUrl(db, `${baseUrl}/page3`);
+
+        headRequestCount = 0;
+        const run3 = await runWebsiteSync(processor, config, dbConnection, tracker);
+
+        // Only page2 and home should be visited by Puppeteer
+        // (home has unchanged lastmod but page2 has changed)
+        expect(run3.processedUrls.has(`${baseUrl}/page2`)).toBe(true);
+        // page1 and page3 should NOT be processed
+        expect(run3.processedUrls.has(`${baseUrl}/page1`)).toBe(false);
+        expect(run3.processedUrls.has(`${baseUrl}/page3`)).toBe(false);
+        // page2 content changed → re-embedded
+        expect(run3.embeddedUrls.has(`${baseUrl}/page2`)).toBe(true);
+        // page1 and page3 chunks should be completely unchanged
+        expect(getChunksForUrl(db, `${baseUrl}/page1`)).toEqual(page1ChunksBefore);
+        expect(getChunksForUrl(db, `${baseUrl}/page3`)).toEqual(page3ChunksBefore);
+        // No HEAD requests for pages in sitemap (they all have lastmod)
+        expect(headRequestCount).toBe(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 4: New page4 discovered via links (not in sitemap)
+        // page1 updated to link to page4, with new lastmod.
+        // page4 has no sitemap lastmod → falls through to ETag check
+        // ═══════════════════════════════════════════════════════════════
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+                <a href="/page4">See also: Advanced Deployment</a>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page1'] = '"etag-page1-v2"';
+
+        pageContent['/page4'] = `
+            <html><head><title>Page 4</title></head><body>
+            <article>
+                <h1>Page Four — Advanced Deployment</h1>
+                <p>This page covers advanced deployment patterns including canary releases.</p>
+                <p>Learn about traffic splitting and progressive delivery strategies.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page4'] = '"etag-page4-v1"';
+
+        // Update sitemap: page1 has new lastmod, page4 NOT in sitemap
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-02-16</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        headRequestCount = 0;
+        const page2ChunksBeforeRun4 = getChunksForUrl(db, `${baseUrl}/page2`);
+        const page3ChunksBeforeRun4 = getChunksForUrl(db, `${baseUrl}/page3`);
+        const run4 = await runWebsiteSync(processor, config, dbConnection, tracker);
+
+        // page1 should be processed (lastmod changed)
+        expect(run4.processedUrls.has(`${baseUrl}/page1`)).toBe(true);
+        // page4 should be processed (discovered via link, no lastmod → ETag fallback)
+        expect(run4.processedUrls.has(`${baseUrl}/page4`)).toBe(true);
+        // page4 is new → embedded
+        expect(run4.embeddedUrls.has(`${baseUrl}/page4`)).toBe(true);
+        // page2 and page3 should be skipped (lastmod unchanged)
+        expect(run4.processedUrls.has(`${baseUrl}/page2`)).toBe(false);
+        expect(run4.processedUrls.has(`${baseUrl}/page3`)).toBe(false);
+        expect(getChunksForUrl(db, `${baseUrl}/page2`)).toEqual(page2ChunksBeforeRun4);
+        expect(getChunksForUrl(db, `${baseUrl}/page3`)).toEqual(page3ChunksBeforeRun4);
+        // HEAD request should be made for page4 (not in sitemap) but not for others
+        expect(headRequestCount).toBeGreaterThan(0);
+        // page4 chunks should exist now
+        const page4Chunks = getChunksForUrl(db, `${baseUrl}/page4`);
+        expect(page4Chunks.length).toBeGreaterThan(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 5: Processing failure → lastmod/etag should NOT be stored
+        // Change page3 lastmod so it gets processed, but simulate failure.
+        // On run 6 (hypothetical), page3 should be reprocessed.
+        // ═══════════════════════════════════════════════════════════════
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-02-16</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-03-01</lastmod></url>
+            </urlset>`;
+
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three — Updated</h1>
+                <p>Updated security hardening with zero-trust architecture patterns.</p>
+                <p>New section on supply chain security and SBOM requirements.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page3'] = '"etag-page3-v2"';
+
+        const run5 = await runWebsiteSync(processor, config, dbConnection, tracker, {
+            failUrls: new Set([`${baseUrl}/page3`]),
+        });
+
+        // page3 should be processed (lastmod changed) but fail
+        expect(run5.processedUrls.has(`${baseUrl}/page3`)).toBe(true);
+        // page3 should NOT be embedded (processing failed)
+        expect(run5.embeddedUrls.has(`${baseUrl}/page3`)).toBe(false);
+        // page3 chunks should still have the OLD content (from run 1)
+        // because the failure prevented new chunks from being written
+        expect(getChunksForUrl(db, `${baseUrl}/page3`)).toEqual(page3ChunksBefore);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 6: Retry after failure — page3 should be reprocessed
+        // because lastmod was NOT stored on run 5 (processing failed)
+        // ═══════════════════════════════════════════════════════════════
+        const run6 = await runWebsiteSync(processor, config, dbConnection, tracker);
+
+        // page3 should be processed again (lastmod wasn't stored)
+        expect(run6.processedUrls.has(`${baseUrl}/page3`)).toBe(true);
+        // This time it succeeds → new content should be embedded
+        expect(run6.embeddedUrls.has(`${baseUrl}/page3`)).toBe(true);
+        // page3 chunks should now have the UPDATED content
+        const page3ChunksAfterRetry = getChunksForUrl(db, `${baseUrl}/page3`);
+        expect(page3ChunksAfterRetry.length).toBeGreaterThan(0);
+        expect(page3ChunksAfterRetry).not.toEqual(page3ChunksBefore);
+
+        // ═══════════════════════════════════════════════════════════════
+        // Final verification: all chunks accounted for, no orphans
+        // ═══════════════════════════════════════════════════════════════
+        const finalTotal = countAllChunks(db);
+        const expectedTotal =
+            countChunksForUrl(db, `${baseUrl}/`) +
+            countChunksForUrl(db, `${baseUrl}/page1`) +
+            countChunksForUrl(db, `${baseUrl}/page2`) +
+            countChunksForUrl(db, `${baseUrl}/page3`) +
+            countChunksForUrl(db, `${baseUrl}/page4`);
+        expect(finalTotal).toBe(expectedTotal);
+        expect(finalTotal).toBeGreaterThan(0);
+    }, 120000); // 2 min timeout for 6 Puppeteer-based sync runs
+});
+
 // ─── Qdrant Website Source E2E (conditional) ────────────────────────────────
 
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
@@ -937,4 +1370,397 @@ describe.skipIf(!canRunQdrantTests)('E2E: Qdrant Website Source', () => {
         const page3Count = (await getChunksForUrlQdrant(qdrantDb, page3Url)).length;
         expect(totalChunksRun2).toBe(page1Count + page2Count + page3Count);
     }, 60000);
+});
+
+// ─── Qdrant Multi-Sync E2E (conditional) ────────────────────────────────────
+
+/**
+ * Helper: run one "sync" of the full website pipeline through crawlWebsite
+ * using Qdrant as the backend. Mirrors runWebsiteSync for SQLite.
+ */
+async function runWebsiteSyncQdrant(
+    processor: ContentProcessor,
+    config: WebsiteSourceConfig,
+    qdrantDb: QdrantDB,
+    tracker: ReturnType<typeof createEmbeddingTracker>,
+    options?: { failUrls?: Set<string> }
+): Promise<{
+    visitedUrls: Set<string>;
+    processedUrls: Set<string>;
+    embeddedUrls: Set<string>;
+    embedCallCount: number;
+    totalChunks: number;
+}> {
+    const visitedUrls = new Set<string>();
+    const processedUrls = new Set<string>();
+    const urlPrefix = Utils.getUrlPrefix(config.url);
+
+    const storedUrls = await DatabaseManager.getStoredUrlsByPrefixQdrant(qdrantDb, urlPrefix);
+    const knownUrls = storedUrls.length > 0 ? new Set(storedUrls) : undefined;
+
+    const dbConnection: QdrantDB = qdrantDb;
+    const etagStore = {
+        get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `etag:${url}`, undefined, testLogger),
+        set: async (url: string, etag: string) => DatabaseManager.setMetadataValue(dbConnection, `etag:${url}`, etag, testLogger),
+    };
+    const lastmodStore = {
+        get: async (url: string) => DatabaseManager.getMetadataValue(dbConnection, `lastmod:${url}`, undefined, testLogger),
+        set: async (url: string, lastmod: string) => DatabaseManager.setMetadataValue(dbConnection, `lastmod:${url}`, lastmod, testLogger),
+    };
+
+    tracker.reset();
+
+    await processor.crawlWebsite(
+        config.url,
+        config,
+        async (url, content) => {
+            processedUrls.add(url);
+
+            if (options?.failUrls?.has(url)) {
+                return false;
+            }
+
+            const chunks = await processor.chunkMarkdown(content, config, url);
+            const newHashes = chunks.map(c => Utils.generateHash(c.content));
+            const newHashesSorted = newHashes.slice().sort();
+            const existingHashesSorted = await DatabaseManager.getChunkHashesByUrlQdrant(qdrantDb, url);
+
+            const unchanged = newHashesSorted.length === existingHashesSorted.length &&
+                newHashesSorted.every((h, i) => h === existingHashesSorted[i]);
+
+            if (unchanged) {
+                return true;
+            }
+
+            if (existingHashesSorted.length > 0) {
+                await DatabaseManager.removeChunksByUrlQdrant(qdrantDb, url, testLogger);
+            }
+
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
+                chunk.metadata.branch = chunk.metadata.branch || '';
+                chunk.metadata.repo = chunk.metadata.repo || '';
+                const embedding = tracker.embed(url);
+                await DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, embedding, newHashes[i]);
+            }
+
+            return true;
+        },
+        testLogger,
+        visitedUrls,
+        { knownUrls, etagStore, lastmodStore }
+    );
+
+    return {
+        visitedUrls,
+        processedUrls,
+        embeddedUrls: new Set(tracker.embeddedUrls),
+        embedCallCount: tracker.embedCallCount,
+        totalChunks: await countAllChunksQdrant(qdrantDb),
+    };
+}
+
+describe.skipIf(!canRunQdrantTests)('E2E: Qdrant Multi-Sync Change Detection', () => {
+    let server: http.Server;
+    let baseUrl: string;
+    let qdrantClient: QdrantClient;
+    let qdrantDb: QdrantDB;
+    let tracker: ReturnType<typeof createEmbeddingTracker>;
+    let processor: ContentProcessor;
+
+    const pageContent: Record<string, string> = {};
+    const pageEtags: Record<string, string> = {};
+    let sitemapXml = '';
+    let headRequestCount = 0;
+
+    beforeEach(async () => {
+        headRequestCount = 0;
+
+        pageContent['/'] = `
+            <html><head><title>Home</title></head><body>
+            <article>
+                <h1>Home Page</h1>
+                <p>Welcome to the documentation site.</p>
+                <a href="/page1">Page 1</a>
+                <a href="/page2">Page 2</a>
+                <a href="/page3">Page 3</a>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two</h1>
+                <p>This is the second page about monitoring and observability best practices.</p>
+                <p>Learn how to set up dashboards and configure alerting rules.</p>
+            </article>
+            </body></html>
+        `;
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three</h1>
+                <p>This is the third page describing security hardening procedures.</p>
+                <p>Covers TLS configuration, network policies, and access control.</p>
+            </article>
+            </body></html>
+        `;
+
+        pageEtags['/'] = '"etag-home-v1"';
+        pageEtags['/page1'] = '"etag-page1-v1"';
+        pageEtags['/page2'] = '"etag-page2-v1"';
+        pageEtags['/page3'] = '"etag-page3-v1"';
+
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        server = http.createServer((req, res) => {
+            const urlPath = req.url || '';
+            if (urlPath === '/sitemap.xml') {
+                res.writeHead(200, { 'Content-Type': 'application/xml' });
+                res.end(sitemapXml.replace(/BASE_URL/g, baseUrl));
+                return;
+            }
+            const content = pageContent[urlPath];
+            if (content) {
+                const etag = pageEtags[urlPath];
+                const headers: Record<string, string> = { 'Content-Type': 'text/html' };
+                if (etag) headers['ETag'] = etag;
+                if (req.method === 'HEAD') {
+                    headRequestCount++;
+                    res.writeHead(200, headers);
+                    res.end();
+                } else {
+                    res.writeHead(200, headers);
+                    res.end(content);
+                }
+            } else {
+                res.writeHead(404);
+                res.end('Not found');
+            }
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Failed to start test server');
+        baseUrl = `http://127.0.0.1:${(address as any).port}`;
+
+        qdrantClient = new QdrantClient({
+            url: QDRANT_URL!,
+            apiKey: QDRANT_API_KEY!,
+            port: parseInt(QDRANT_PORT!, 10),
+        });
+
+        try { await qdrantClient.deleteCollection(QDRANT_TEST_COLLECTION!); } catch { /* may not exist */ }
+        await qdrantClient.createCollection(QDRANT_TEST_COLLECTION!, {
+            vectors: { size: 3072, distance: 'Cosine' },
+        });
+
+        qdrantDb = {
+            client: qdrantClient,
+            collectionName: QDRANT_TEST_COLLECTION!,
+            type: 'qdrant',
+        };
+
+        tracker = createEmbeddingTracker();
+        processor = new ContentProcessor(testLogger);
+    });
+
+    afterEach(async () => {
+        server.close();
+        try { await qdrantClient.deleteCollection(QDRANT_TEST_COLLECTION!); } catch { /* ignore */ }
+    });
+
+    it('should use all 4 change detection layers across multiple syncs', async () => {
+        const config: WebsiteSourceConfig = {
+            type: 'website',
+            product_name: 'e2e-qdrant-multisync',
+            version: '1.0',
+            url: baseUrl + '/',
+            max_size: 1048576,
+            sitemap_url: baseUrl + '/sitemap.xml',
+            database_config: {
+                type: 'qdrant',
+                params: {
+                    qdrant_url: QDRANT_URL!,
+                    qdrant_port: parseInt(QDRANT_PORT!, 10),
+                    collection_name: QDRANT_TEST_COLLECTION!,
+                },
+            },
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 1: Initial sync — all pages are new, everything embedded
+        // ═══════════════════════════════════════════════════════════════
+        const run1 = await runWebsiteSyncQdrant(processor, config, qdrantDb, tracker);
+
+        expect(run1.processedUrls.size).toBe(4);
+        expect(run1.embeddedUrls.size).toBe(4);
+        expect(run1.totalChunks).toBeGreaterThan(0);
+        const run1TotalChunks = run1.totalChunks;
+
+        for (const pagePath of ['/', '/page1', '/page2', '/page3']) {
+            const chunks = await getChunksForUrlQdrant(qdrantDb, `${baseUrl}${pagePath}`);
+            expect(chunks.length).toBeGreaterThan(0);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 2: No changes — all skipped via lastmod
+        // ═══════════════════════════════════════════════════════════════
+        headRequestCount = 0;
+        const run2 = await runWebsiteSyncQdrant(processor, config, qdrantDb, tracker);
+
+        expect(run2.processedUrls.size).toBe(0);
+        expect(headRequestCount).toBe(0);
+        expect(run2.embedCallCount).toBe(0);
+        expect(run2.totalChunks).toBe(run1TotalChunks);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 3: page2 lastmod + content change → re-embedded
+        // ═══════════════════════════════════════════════════════════════
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        pageContent['/page2'] = `
+            <html><head><title>Page 2</title></head><body>
+            <article>
+                <h1>Page Two — Updated</h1>
+                <p>This page has been updated with new monitoring practices for cloud-native environments.</p>
+                <p>Includes Prometheus, Grafana, and OpenTelemetry integration guides.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page2'] = '"etag-page2-v2"';
+
+        const page1ChunksBefore = await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page1`);
+        const page3ChunksBefore = await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page3`);
+
+        headRequestCount = 0;
+        const run3 = await runWebsiteSyncQdrant(processor, config, qdrantDb, tracker);
+
+        expect(run3.processedUrls.has(`${baseUrl}/page2`)).toBe(true);
+        expect(run3.processedUrls.has(`${baseUrl}/page1`)).toBe(false);
+        expect(run3.processedUrls.has(`${baseUrl}/page3`)).toBe(false);
+        expect(run3.embeddedUrls.has(`${baseUrl}/page2`)).toBe(true);
+        expect(await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page1`)).toEqual(page1ChunksBefore);
+        expect(await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page3`)).toEqual(page3ChunksBefore);
+        expect(headRequestCount).toBe(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 4: page4 via links (ETag fallback), page1 lastmod changed
+        // ═══════════════════════════════════════════════════════════════
+        pageContent['/page1'] = `
+            <html><head><title>Page 1</title></head><body>
+            <article>
+                <h1>Page One</h1>
+                <p>This is the first page covering deployment strategies for production environments.</p>
+                <p>It includes details about rolling updates and blue-green deployments.</p>
+                <a href="/page4">See also: Advanced Deployment</a>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page1'] = '"etag-page1-v2"';
+
+        pageContent['/page4'] = `
+            <html><head><title>Page 4</title></head><body>
+            <article>
+                <h1>Page Four — Advanced Deployment</h1>
+                <p>This page covers advanced deployment patterns including canary releases.</p>
+                <p>Learn about traffic splitting and progressive delivery strategies.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page4'] = '"etag-page4-v1"';
+
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-02-16</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-01-01</lastmod></url>
+            </urlset>`;
+
+        headRequestCount = 0;
+        const run4 = await runWebsiteSyncQdrant(processor, config, qdrantDb, tracker);
+
+        expect(run4.processedUrls.has(`${baseUrl}/page1`)).toBe(true);
+        expect(run4.processedUrls.has(`${baseUrl}/page4`)).toBe(true);
+        expect(run4.embeddedUrls.has(`${baseUrl}/page4`)).toBe(true);
+        expect(run4.processedUrls.has(`${baseUrl}/page2`)).toBe(false);
+        expect(run4.processedUrls.has(`${baseUrl}/page3`)).toBe(false);
+        expect(headRequestCount).toBeGreaterThan(0);
+        const page4Chunks = await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page4`);
+        expect(page4Chunks.length).toBeGreaterThan(0);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 5: Processing failure → lastmod NOT stored
+        // ═══════════════════════════════════════════════════════════════
+        sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <url><loc>BASE_URL/</loc><lastmod>2026-01-01</lastmod></url>
+                <url><loc>BASE_URL/page1</loc><lastmod>2026-02-16</lastmod></url>
+                <url><loc>BASE_URL/page2</loc><lastmod>2026-02-15</lastmod></url>
+                <url><loc>BASE_URL/page3</loc><lastmod>2026-03-01</lastmod></url>
+            </urlset>`;
+
+        pageContent['/page3'] = `
+            <html><head><title>Page 3</title></head><body>
+            <article>
+                <h1>Page Three — Updated</h1>
+                <p>Updated security hardening with zero-trust architecture patterns.</p>
+                <p>New section on supply chain security and SBOM requirements.</p>
+            </article>
+            </body></html>
+        `;
+        pageEtags['/page3'] = '"etag-page3-v2"';
+
+        const run5 = await runWebsiteSyncQdrant(processor, config, qdrantDb, tracker, {
+            failUrls: new Set([`${baseUrl}/page3`]),
+        });
+
+        expect(run5.processedUrls.has(`${baseUrl}/page3`)).toBe(true);
+        expect(run5.embeddedUrls.has(`${baseUrl}/page3`)).toBe(false);
+        // page3 should still have old chunks
+        expect(await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page3`)).toEqual(page3ChunksBefore);
+
+        // ═══════════════════════════════════════════════════════════════
+        // RUN 6: Retry — page3 reprocessed (lastmod wasn't stored)
+        // ═══════════════════════════════════════════════════════════════
+        const run6 = await runWebsiteSyncQdrant(processor, config, qdrantDb, tracker);
+
+        expect(run6.processedUrls.has(`${baseUrl}/page3`)).toBe(true);
+        expect(run6.embeddedUrls.has(`${baseUrl}/page3`)).toBe(true);
+        const page3ChunksAfterRetry = await getChunksForUrlQdrant(qdrantDb, `${baseUrl}/page3`);
+        expect(page3ChunksAfterRetry.length).toBeGreaterThan(0);
+        expect(page3ChunksAfterRetry).not.toEqual(page3ChunksBefore);
+
+        // Final verification
+        const finalTotal = await countAllChunksQdrant(qdrantDb);
+        expect(finalTotal).toBeGreaterThan(0);
+        const allUrls = ['/', '/page1', '/page2', '/page3', '/page4'];
+        let expectedTotal = 0;
+        for (const p of allUrls) {
+            expectedTotal += (await getChunksForUrlQdrant(qdrantDb, `${baseUrl}${p}`)).length;
+        }
+        expect(finalTotal).toBe(expectedTotal);
+    }, 120000);
 });
