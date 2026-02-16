@@ -24,7 +24,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@azure/identity": "^4.10.2",
+    "@azure/identity": "^4.13.0",
     "@azure/openai": "^2.0.0",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.12.1",
