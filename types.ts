@@ -81,6 +81,7 @@ export interface QdrantDatabaseParams {
 
 export interface EmbeddingConfig {
     provider: 'openai' | 'azure';
+    dimension?: number;
     openai?: {
         api_key?: string;  // Can also use OPENAI_API_KEY env var
         model?: string;    // Default: text-embedding-3-large

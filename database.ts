@@ -19,7 +19,7 @@ import {
 export class DatabaseManager {
     private static columnCache: WeakMap<Database, { hasBranch: boolean; hasRepo: boolean }> = new WeakMap();
 
-    static async initDatabase(config: SourceConfig, parentLogger: Logger): Promise<DatabaseConnection> {
+    static async initDatabase(config: SourceConfig, parentLogger: Logger, embeddingDimension: number): Promise<DatabaseConnection> {
         const logger = parentLogger.child('database');
         const dbConfig = config.database_config;
         
@@ -32,10 +32,10 @@ export class DatabaseManager {
             const db = new BetterSqlite3(dbPath, { allowExtension: true } as any);
             sqliteVec.load(db);
 
-            logger.debug(`Creating vec_items table if it doesn't exist`);
+            logger.debug(`Creating vec_items table if it doesn't exist (dimension: ${embeddingDimension})`);
             db.exec(`
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-                    embedding FLOAT[3072],
+                    embedding FLOAT[${embeddingDimension}],
                     product_name TEXT,
                     version TEXT,
                     branch TEXT,
@@ -61,7 +61,7 @@ export class DatabaseManager {
             logger.info(`Connecting to Qdrant at ${qdrantUrl}:${qdrantPort}, collection: ${collectionName}`);
             const qdrantClient = new QdrantClient({ url: qdrantUrl, apiKey: process.env.QDRANT_API_KEY, port: qdrantPort });
 
-            await this.createCollectionQdrant(qdrantClient, collectionName, logger);
+            await this.createCollectionQdrant(qdrantClient, collectionName, logger, embeddingDimension);
             logger.info(`Qdrant connection established successfully`);
             return { client: qdrantClient, collectionName, type: 'qdrant' };
         } else {
@@ -71,7 +71,7 @@ export class DatabaseManager {
         }
     }
 
-    static async createCollectionQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger) {
+    static async createCollectionQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger, embeddingDimension: number) {
         try {
             logger.debug(`Checking if collection ${collectionName} exists`);
             const collections = await qdrantClient.getCollections();
@@ -84,10 +84,10 @@ export class DatabaseManager {
                 return;
             }
             
-            logger.info(`Creating new collection ${collectionName}`);
+            logger.info(`Creating new collection ${collectionName} with dimension ${embeddingDimension}`);
             await qdrantClient.createCollection(collectionName, {
                 vectors: {
-                    size: 3072,
+                    size: embeddingDimension,
                     distance: "Cosine",
                 },
             });
@@ -177,7 +177,8 @@ export class DatabaseManager {
         dbConnection: DatabaseConnection,
         key: string,
         value: string,
-        logger: Logger
+        logger: Logger,
+        embeddingDimension: number
     ): Promise<void> {
         try {
             if (dbConnection.type === 'sqlite') {
@@ -189,8 +190,7 @@ export class DatabaseManager {
                 logger.debug(`Updated metadata value for ${key}`);
             } else if (dbConnection.type === 'qdrant') {
                 const metadataUUID = Utils.generateMetadataUUID(key);
-                const dummyEmbeddingSize = 3072;
-                const dummyEmbedding = new Array(dummyEmbeddingSize).fill(0);
+                const dummyEmbedding = new Array(embeddingDimension).fill(0);
                 const metadataPoint = {
                     id: metadataUUID,
                     vector: dummyEmbedding,
@@ -259,7 +259,12 @@ export class DatabaseManager {
         return defaultDate;
     }
 
-    static async updateLastRunDate(dbConnection: DatabaseConnection, repo: string, logger: Logger): Promise<void> {
+    static async updateLastRunDate(
+        dbConnection: DatabaseConnection,
+        repo: string,
+        logger: Logger,
+        embeddingDimension: number
+    ): Promise<void> {
         const now = new Date().toISOString();
         
         try {
@@ -279,8 +284,7 @@ export class DatabaseManager {
                 logger.debug(`Using UUID: ${metadataUUID} for metadata`);
                 
                 // Generate a dummy embedding (all zeros)
-                const dummyEmbeddingSize = 3072; // Same size as your content embeddings
-                const dummyEmbedding = new Array(dummyEmbeddingSize).fill(0);
+                const dummyEmbedding = new Array(embeddingDimension).fill(0);
                 
                 // Create a point with special metadata payload
                 const metadataPoint = {

@@ -198,6 +198,9 @@ describe('Doc2Vec class', () => {
 
         // Provide a dummy API key so the constructor validation doesn't call process.exit
         process.env.OPENAI_API_KEY = 'test-key-for-tests';
+        // Force OpenAI provider for tests (override any system default)
+        process.env.EMBEDDING_PROVIDER = 'openai';
+        process.env.OPENAI_MODEL = 'text-embedding-3-large';
 
         // Ensure test config directory exists
         if (!fs.existsSync(testConfigDir)) {
@@ -217,6 +220,8 @@ describe('Doc2Vec class', () => {
         delete process.env.TEST_DOC2VEC_URL;
         delete process.env.TEST_DOC2VEC_API_KEY;
         delete process.env.OPENAI_API_KEY;
+        delete process.env.EMBEDDING_PROVIDER;
+        delete process.env.OPENAI_MODEL;
     });
 
     // ─────────────────────────────────────────────────────────────────────────

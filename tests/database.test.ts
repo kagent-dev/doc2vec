@@ -9,14 +9,17 @@ import * as path from 'path';
 
 const testLogger = new Logger('test', { level: LogLevel.NONE });
 
+// Default embedding dimension for tests
+const TEST_EMBEDDING_DIMENSION = 3072;
+
 // Helper to create an in-memory SQLite database matching the app schema
-function createTestDb(): BetterSqlite3.Database {
+function createTestDb(embeddingDimension: number = TEST_EMBEDDING_DIMENSION): BetterSqlite3.Database {
     const db = new BetterSqlite3(':memory:', { allowExtension: true } as any);
     sqliteVec.load(db);
 
     db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-            embedding FLOAT[3072],
+            embedding FLOAT[${embeddingDimension}],
             product_name TEXT,
             version TEXT,
             branch TEXT,
@@ -60,8 +63,8 @@ function createTestChunk(overrides: Partial<DocumentChunk & { metadata?: Partial
     };
 }
 
-function createTestEmbedding(): number[] {
-    return new Array(3072).fill(0.1);
+function createTestEmbedding(embeddingDimension: number = TEST_EMBEDDING_DIMENSION): number[] {
+    return new Array(embeddingDimension).fill(0.1);
 }
 
 describe('DatabaseManager', () => {
@@ -115,14 +118,14 @@ describe('DatabaseManager', () => {
         });
 
         it('should set and get metadata values', async () => {
-            await DatabaseManager.setMetadataValue(conn, 'mykey', 'myvalue', testLogger);
+            await DatabaseManager.setMetadataValue(conn, 'mykey', 'myvalue', testLogger, TEST_EMBEDDING_DIMENSION);
             const value = await DatabaseManager.getMetadataValue(conn, 'mykey', undefined, testLogger);
             expect(value).toBe('myvalue');
         });
 
         it('should upsert metadata values', async () => {
-            await DatabaseManager.setMetadataValue(conn, 'key1', 'value1', testLogger);
-            await DatabaseManager.setMetadataValue(conn, 'key1', 'value2', testLogger);
+            await DatabaseManager.setMetadataValue(conn, 'key1', 'value1', testLogger, TEST_EMBEDDING_DIMENSION);
+            await DatabaseManager.setMetadataValue(conn, 'key1', 'value2', testLogger, TEST_EMBEDDING_DIMENSION);
             const value = await DatabaseManager.getMetadataValue(conn, 'key1', undefined, testLogger);
             expect(value).toBe('value2');
         });
@@ -149,7 +152,7 @@ describe('DatabaseManager', () => {
         });
 
         it('should update and retrieve last run date', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
             const date = await DatabaseManager.getLastRunDate(conn, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
             // Should be an ISO date string, not the default
             expect(date).not.toBe('2025-01-01T00:00:00Z');
@@ -157,7 +160,7 @@ describe('DatabaseManager', () => {
         });
 
         it('should normalize repo names in metadata keys', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
             // Check directly in db that the key uses underscore
             const result = db.prepare('SELECT key FROM vec_metadata WHERE key LIKE ?').get('last_run_%') as { key: string };
             expect(result.key).toBe('last_run_owner_repo');
@@ -693,12 +696,12 @@ describe('DatabaseManager', () => {
                 createCollection: vi.fn().mockResolvedValue({}),
             };
 
-            await DatabaseManager.createCollectionQdrant(mockClient as any, 'test_col', testLogger);
+            await DatabaseManager.createCollectionQdrant(mockClient as any, 'test_col', testLogger, TEST_EMBEDDING_DIMENSION);
 
             expect(mockClient.createCollection).toHaveBeenCalledOnce();
             expect(mockClient.createCollection).toHaveBeenCalledWith('test_col', expect.objectContaining({
                 vectors: expect.objectContaining({
-                    size: 3072,
+                    size: TEST_EMBEDDING_DIMENSION,
                     distance: 'Cosine',
                 }),
             }));
@@ -805,7 +808,7 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            await DatabaseManager.setMetadataValue(qdrantDb, 'test_key', 'test_value', testLogger);
+            await DatabaseManager.setMetadataValue(qdrantDb, 'test_key', 'test_value', testLogger, TEST_EMBEDDING_DIMENSION);
 
             expect(mockClient.upsert).toHaveBeenCalledOnce();
             const call = mockClient.upsert.mock.calls[0];
@@ -904,7 +907,7 @@ describe('DatabaseManager', () => {
             sqliteVec.load(db);
             db.exec(`
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-                    embedding FLOAT[3072],
+                    embedding FLOAT[${TEST_EMBEDDING_DIMENSION}],
                     product_name TEXT,
                     version TEXT,
                     branch TEXT,
@@ -1002,7 +1005,7 @@ describe('DatabaseManager', () => {
             } as SourceConfig;
 
             await expect(
-                DatabaseManager.initDatabase(config, testLogger)
+                DatabaseManager.initDatabase(config, testLogger, TEST_EMBEDDING_DIMENSION)
             ).rejects.toThrow('Unsupported database type: mongodb');
         });
     });
@@ -1082,7 +1085,7 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
 
             expect(mockClient.upsert).toHaveBeenCalledOnce();
             const call = mockClient.upsert.mock.calls[0];
@@ -1091,7 +1094,7 @@ describe('DatabaseManager', () => {
             expect(point.payload.is_metadata).toBe(true);
             expect(point.payload.metadata_key).toBe('last_run_owner_repo');
             expect(point.payload.metadata_value).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-            expect(point.vector).toHaveLength(3072);
+            expect(point.vector).toHaveLength(TEST_EMBEDDING_DIMENSION);
         });
 
         it('should handle upsert error gracefully', async () => {
@@ -1105,7 +1108,7 @@ describe('DatabaseManager', () => {
             };
 
             // Should not throw
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger);
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
         });
     });
 
@@ -1312,7 +1315,7 @@ describe('DatabaseManager', () => {
             const conn: SqliteDB = { db: mockDb, type: 'sqlite' };
 
             // Should not throw - error is caught internally
-            await DatabaseManager.setMetadataValue(conn, 'key', 'value', testLogger);
+            await DatabaseManager.setMetadataValue(conn, 'key', 'value', testLogger, TEST_EMBEDDING_DIMENSION);
         });
 
         it('should handle Qdrant upsert error gracefully', async () => {
@@ -1326,7 +1329,7 @@ describe('DatabaseManager', () => {
             };
 
             // Should not throw - error is caught internally
-            await DatabaseManager.setMetadataValue(qdrantDb, 'key', 'value', testLogger);
+            await DatabaseManager.setMetadataValue(qdrantDb, 'key', 'value', testLogger, TEST_EMBEDDING_DIMENSION);
         });
     });
 

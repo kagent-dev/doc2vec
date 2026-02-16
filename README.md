@@ -145,6 +145,9 @@ Configuration is managed through two files:
     OPENAI_API_KEY="sk-..."
     OPENAI_MODEL="text-embedding-3-large"  # Optional, defaults to text-embedding-3-large
 
+    # Optional: Embedding dimension size (defaults to 3072)
+    EMBEDDING_DIMENSION="3072"
+
     # Required: Your Azure OpenAI credentials (if using Azure provider)
     AZURE_OPENAI_KEY="your-azure-key"
     AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
@@ -223,6 +226,10 @@ Configuration is managed through two files:
                     *   `qdrant_port`: (Optional) Port for the Qdrant REST API. Defaults to `443` if `qdrant_url` starts with `https`, otherwise `6333`.
                     *   `collection_name`: (Optional) Name of the Qdrant collection to use. Defaults to `<product_name>_<version>` (lowercased, spaces replaced with underscores).
 
+        Optional embedding configuration:
+        *   `embedding.provider`: Provider for embeddings (`openai` or `azure`).
+        *   `embedding.dimension`: Embedding vector size. Defaults to `3072` when not set.
+
     **Example (`config.yaml`):**
     ```yaml
     # Optional: Configure embedding provider
@@ -230,6 +237,7 @@ Configuration is managed through two files:
     # Defaults to OpenAI if not specified
     embedding:
       provider: 'openai'  # or 'azure'
+      dimension: 3072  # Optional, defaults to 3072
       openai:
         api_key: '${OPENAI_API_KEY}'  # Optional, uses env var by default
         model: 'text-embedding-3-large'  # Optional, defaults to text-embedding-3-large

@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import * as path from 'path';
+import { Logger } from './logger';
 
 export class Utils {
     static generateHash(content: string): string {
@@ -33,11 +34,13 @@ export class Utils {
         }
     }
 
-    static buildUrl(href: string, currentUrl: string): string {
+    static buildUrl(href: string, currentUrl: string, logger?: Logger): string {
         try {
             return new URL(href, currentUrl).toString();
         } catch (error) {
-            console.warn(`Invalid URL found: ${href}`);
+            if (logger) {
+                logger.warn(`Invalid URL found: ${href}`);
+            }
             return '';
         }
     }
@@ -85,4 +88,5 @@ export class Utils {
     static tokenize(text: string): string[] {
         return text.split(/(\s+)/).filter(token => token.length > 0);
     }
+
 } 

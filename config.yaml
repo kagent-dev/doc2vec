@@ -1,4 +1,10 @@
 # Doc2Vec Configuration
+embedding:
+  provider: 'openai'
+  dimension: 3072
+  openai:
+    model: 'text-embedding-3-large'
+
 sources:
   # GitHub Sources
   - type: github
