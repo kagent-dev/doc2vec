@@ -134,7 +134,8 @@ Usage:
 docker build -t sqlite-vec-mcp-server:latest .
 ```
 
-This is going to include any `*.db` files in the `/data` directory of the image.
+This is going to include any `*.db` files in the `<src>/mcp/data` directory in
+the final image.
 
 ### Running with Docker
 
