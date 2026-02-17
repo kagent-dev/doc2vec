@@ -23,6 +23,7 @@ export interface WebsiteSourceConfig extends BaseSourceConfig {
     type: 'website';
     url: string;
     sitemap_url?: string; // Optional sitemap URL to extract additional URLs to crawl
+    markdown_store?: boolean; // Enable storing generated markdown in Postgres (default: false)
 }
 
 // Configuration specific to GitHub repo sources
@@ -94,9 +95,21 @@ export interface EmbeddingConfig {
     };
 }
 
+// Postgres markdown store configuration (top-level)
+export interface MarkdownStoreConfig {
+    connection_string?: string;   // e.g., 'postgres://user:pass@host:5432/db'
+    host?: string;
+    port?: number;
+    database?: string;
+    user?: string;
+    password?: string;            // Can use ${PG_PASSWORD} env var substitution
+    table_name?: string;          // Defaults to 'markdown_pages'
+}
+
 export interface Config {
     sources: SourceConfig[];
     embedding?: EmbeddingConfig;  // Optional, defaults to OpenAI
+    markdown_store?: MarkdownStoreConfig;  // Optional Postgres markdown store
 }
 
 export interface DocumentChunk {
