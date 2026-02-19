@@ -1568,6 +1568,121 @@ sources:
                 expect.anything()
             );
         });
+
+        // ── Search API fallback on 403 ────────────────────────────────────────
+
+        it('falls back to Search API when Incremental Export returns 403', async () => {
+            const axiosGet = await getAxiosMock();
+
+            const forbiddenError: any = new Error('Request failed with status code 403');
+            forbiddenError.response = { status: 403 };
+
+            axiosGet
+                // Incremental API → 403 (propagates immediately, no retry)
+                .mockRejectedValueOnce(forbiddenError)
+                // Search API: all time-window pages empty so the run completes fast
+                .mockResolvedValue({ data: { results: [], next_page: null } });
+
+            vi.useFakeTimers({ now: new Date('2026-01-15T00:00:00Z') });
+            const instance = makeInstance();
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const fetchPromise = callFetchTickets(instance);
+            await vi.runAllTimersAsync();
+            await fetchPromise;
+            vi.useRealTimers();
+
+            // First call was the incremental URL, second was a search.json URL
+            const urls: string[] = axiosGet.mock.calls.map((c: any) => c[0]);
+            expect(urls[0]).toMatch(/\/incremental\/tickets\/cursor/);
+            expect(urls[1]).toMatch(/search\.json/);
+        });
+
+        it('rethrows non-403 errors from the Incremental Export API without retrying', async () => {
+            const axiosGet = await getAxiosMock();
+
+            const serverError: any = new Error('Request failed with status code 500');
+            serverError.response = { status: 500 };
+            // 500 should be retried up to 3 times then thrown — use fake timers to skip waits
+            axiosGet.mockRejectedValue(serverError);
+
+            vi.useFakeTimers();
+            const instance = makeInstance();
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const fetchPromise = callFetchTickets(instance);
+            await vi.runAllTimersAsync();
+            await expect(fetchPromise).rejects.toThrow('500');
+            vi.useRealTimers();
+        });
+
+        it('Search API fallback processes tickets across time-window pages', async () => {
+            const { DatabaseManager: DB } = await import('../database');
+            // Set lastRunDate to a fixed point so we can predict the window boundaries
+            (DB.getLastRunDate as any).mockResolvedValueOnce('2026-01-01T00:00:00Z');
+
+            const axiosGet = await getAxiosMock();
+            const forbiddenError: any = new Error('403');
+            forbiddenError.response = { status: 403 };
+
+            const ticket1 = makeTicket({ id: 10 });
+            const ticket2 = makeTicket({ id: 20 });
+
+            axiosGet
+                // Incremental API → 403
+                .mockRejectedValueOnce(forbiddenError)
+                // Window 1: one ticket, no next_page
+                .mockResolvedValueOnce({ data: { results: [ticket1], next_page: null } })
+                // Comments for ticket1
+                .mockResolvedValueOnce({ data: makeCommentsResponse() })
+                // Window 2: one ticket, no next_page
+                .mockResolvedValueOnce({ data: { results: [ticket2], next_page: null } })
+                // Comments for ticket2
+                .mockResolvedValueOnce({ data: makeCommentsResponse() })
+                // Remaining windows return empty (there will be more windows up to now)
+                .mockResolvedValue({ data: { results: [], next_page: null } });
+
+            const instance = makeInstance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            // Use fake timers to skip inter-page and inter-window sleeps
+            vi.useFakeTimers({ now: new Date('2026-02-01T00:00:00Z') });
+            const fetchPromise = callFetchTickets(instance);
+            await vi.runAllTimersAsync();
+            await fetchPromise;
+            vi.useRealTimers();
+
+            // Both tickets must have been processed
+            expect(processChunksSpy).toHaveBeenCalledTimes(2);
+            // Watermark must have advanced (no failures)
+            expect(DB.updateLastRunDate).toHaveBeenCalledTimes(1);
+        });
+
+        it('Search API fallback: watermark not advanced when a ticket fails', async () => {
+            const { DatabaseManager: DB } = await import('../database');
+            (DB.getLastRunDate as any).mockResolvedValueOnce('2026-01-15T00:00:00Z');
+
+            const axiosGet = await getAxiosMock();
+            const forbiddenError: any = new Error('403');
+            forbiddenError.response = { status: 403 };
+
+            axiosGet
+                .mockRejectedValueOnce(forbiddenError)
+                // One window, one ticket whose comments always fail
+                .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                .mockRejectedValue(new Error('Comments fail'));
+
+            vi.useFakeTimers({ now: new Date('2026-02-01T00:00:00Z') });
+            const instance = makeInstance();
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const fetchPromise = callFetchTickets(instance);
+            await vi.runAllTimersAsync();
+            await fetchPromise;
+            vi.useRealTimers();
+
+            expect(DB.updateLastRunDate).not.toHaveBeenCalled();
+        });
     });
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -1137,6 +1137,8 @@ export class Doc2Vec {
                         attempt--;
                         continue;
                     }
+                    // 403 is a permissions error — retrying won't help, propagate immediately.
+                    if (error.response?.status === 403) throw error;
                     logger.error(`Zendesk API error (attempt ${attempt + 1}):`, error.message);
                     if (attempt === retries - 1) throw error;
                     await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
@@ -1235,16 +1237,52 @@ export class Doc2Vec {
             await this.processChunksForUrl(chunks, url, dbConnection, logger);
         };
 
-        // ── Pagination using the Incremental Ticket Export (cursor-based) ────────
-        // This replaces the old /api/v2/search.json approach which:
-        //   • Had a hard 1 000-result cap (silently dropping tickets beyond it)
-        //   • Used date-only granularity in the query (timezone boundary misses)
-        // The Incremental Export API:
-        //   • Has no result cap
-        //   • Accepts a Unix epoch timestamp (exact, timezone-independent)
-        //   • Returns an opaque cursor we persist so runs can resume mid-stream
+        // ── Shared pagination loop ───────────────────────────────────────────────
+        // Used by both the incremental-export path and the search-API fallback.
+        // Accepts a function that returns successive page URLs so the two strategies
+        // can share the same per-ticket processing, watermark, and cursor logic.
+        let totalTickets = 0;
+        let skippedTickets = 0;
+        let failedTickets = 0;
+
+        const processPages = async (
+            firstUrl: string,
+            getNextUrl: (data: any) => string | null,
+            getTickets: (data: any) => any[],
+            onPageFetched?: (data: any) => Promise<void>,
+            interPageDelayMs = 0
+        ): Promise<void> => {
+            let currentUrl: string | null = firstUrl;
+            while (currentUrl) {
+                const data = await fetchWithRetry(currentUrl);
+                const tickets: any[] = getTickets(data);
+
+                logger.info(`Processing batch of ${tickets.length} tickets`);
+
+                for (const ticket of tickets) {
+                    try {
+                        await processTicket(ticket);
+                        totalTickets++;
+                    } catch (error: any) {
+                        failedTickets++;
+                        logger.error(`Failed to process ticket #${ticket.id}, will retry next run: ${error.message}`);
+                    }
+                }
+
+                if (onPageFetched) await onPageFetched(data);
+
+                currentUrl = getNextUrl(data);
+                if (currentUrl && interPageDelayMs > 0) {
+                    await new Promise(res => setTimeout(res, interPageDelayMs));
+                }
+            }
+        };
+
+        // ── Strategy 1: Incremental Ticket Export API (preferred) ───────────────
+        // No result cap, exact Unix-epoch timestamps, cursor-based pagination.
+        // Requires Admin role — falls back to Strategy 2 on 403.
         const startTimeUnix = Math.floor(new Date(lastRunDate).getTime() / 1000);
-        const initialUrl = savedCursor
+        const initialIncrementalUrl = savedCursor
             ? `${baseUrl}/incremental/tickets/cursor.json?cursor=${encodeURIComponent(savedCursor)}`
             : `${baseUrl}/incremental/tickets/cursor.json?start_time=${startTimeUnix}`;
 
@@ -1254,57 +1292,74 @@ export class Doc2Vec {
                 : `Starting Zendesk incremental export from ${lastRunDate} (unix: ${startTimeUnix})`
         );
 
-        let currentUrl: string | null = initialUrl;
-        let totalTickets = 0;
-        let skippedTickets = 0;
-        let failedTickets = 0;
-        let lastCursor: string | undefined;
+        let usedIncrementalApi = true;
+        try {
+            await processPages(
+                initialIncrementalUrl,
+                // next URL: follow after_url unless end_of_stream
+                (data) => data.end_of_stream ? null : (data.after_url || null),
+                (data) => data.tickets || [],
+                // after each page: persist the cursor so a crash can resume
+                async (data) => {
+                    if (data.end_of_stream) {
+                        logger.info('Reached end of Zendesk incremental export stream');
+                    }
+                    if (data.after_cursor) {
+                        await DatabaseManager.setMetadataValue(
+                            dbConnection, cursorKey, data.after_cursor, logger, this.embeddingDimension
+                        );
+                    }
+                },
+                1000  // 1 s between pages (incremental API: 10 req/min)
+            );
+        } catch (error: any) {
+            if (error.response?.status !== 403) throw error;
 
-        while (currentUrl) {
-            const data = await fetchWithRetry(currentUrl);
-            const tickets: any[] = data.tickets || [];
+            // ── Strategy 2: Search API fallback (Agent role sufficient) ──────────
+            // The Incremental Export API requires Admin privileges.  Fall back to
+            // /api/v2/search.json with 30-day time windows so no single query can
+            // exceed the 1,000-result hard cap.
+            usedIncrementalApi = false;
+            logger.warn(
+                'Zendesk Incremental Export API returned 403 (Admin role required). ' +
+                'Falling back to Search API with 30-day time windows. ' +
+                'To avoid this, use an API token from a Zendesk Admin account.'
+            );
 
-            logger.info(`Processing batch of ${tickets.length} tickets`);
+            const statusFilter30d = config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved', 'closed'];
+            const windowMs = 30 * 24 * 60 * 60 * 1000; // 30 days
+            const now = new Date();
+            let windowStart = new Date(lastRunDate);
 
-            for (const ticket of tickets) {
-                // Fix: wrap each ticket in try/catch so one bad ticket doesn't
-                // abort the entire run.  Failed tickets are counted; if any fail
-                // the watermark is NOT advanced so they will be retried next run.
-                try {
-                    await processTicket(ticket);
-                    totalTickets++;
-                } catch (error: any) {
-                    failedTickets++;
-                    logger.error(`Failed to process ticket #${ticket.id}, will retry next run: ${error.message}`);
-                }
-            }
+            while (windowStart < now) {
+                const windowEnd = new Date(Math.min(windowStart.getTime() + windowMs, now.getTime()));
+                const startStr = windowStart.toISOString().split('T')[0];
+                const endStr = windowEnd.toISOString().split('T')[0];
 
-            // Persist cursor after every page so a crash mid-run can resume
-            // from the last successfully fetched page rather than the beginning.
-            if (data.after_cursor) {
-                lastCursor = data.after_cursor;
-                await DatabaseManager.setMetadataValue(
-                    dbConnection, cursorKey, lastCursor!, logger, this.embeddingDimension
+                // Build per-window query. Use updated>START updated<=END to avoid
+                // timezone boundary issues at the end of the range we add one day
+                // to endStr so that tickets updated on endStr are included.
+                const nextDay = new Date(windowEnd);
+                nextDay.setDate(nextDay.getDate() + 1);
+                const query = `updated>${startStr} updated<${nextDay.toISOString().split('T')[0]} ` +
+                    `status:${statusFilter30d.join(',status:')}`;
+
+                logger.info(`Search API fallback: querying window ${startStr} → ${endStr}`);
+
+                const searchUrl = `${baseUrl}/search.json?query=${encodeURIComponent(query)}&sort_by=updated_at&sort_order=asc`;
+                await processPages(
+                    searchUrl,
+                    (data) => data.next_page || null,
+                    (data) => (data.results || []).filter((r: any) => r.result_type === 'ticket' || r.subject !== undefined),
+                    undefined,
+                    1000  // 1 s between pages
                 );
-            }
 
-            if (data.end_of_stream) {
-                logger.info('Reached end of Zendesk incremental export stream');
-                break;
-            }
-
-            currentUrl = data.after_url || null;
-
-            if (currentUrl) {
-                // Rate limiting: wait 1 s between pages (10 req/min limit on incremental API)
-                await new Promise(res => setTimeout(res, 1000));
+                windowStart = windowEnd;
             }
         }
 
         // ── Advance the watermark only when all tickets succeeded ────────────────
-        // If any ticket failed we intentionally leave lastRunDate and the cursor
-        // unchanged so the next run re-processes from the same starting point and
-        // retries the failed tickets.
         if (failedTickets === 0) {
             await DatabaseManager.updateLastRunDate(
                 dbConnection,
@@ -1312,11 +1367,12 @@ export class Doc2Vec {
                 logger,
                 this.embeddingDimension
             );
-            // Clear the saved cursor now that the stream is fully consumed —
-            // next run will start fresh from the new lastRunDate.
-            await DatabaseManager.setMetadataValue(
-                dbConnection, cursorKey, '', logger, this.embeddingDimension
-            );
+            if (usedIncrementalApi) {
+                // Clear the saved cursor — next run starts fresh from the new watermark.
+                await DatabaseManager.setMetadataValue(
+                    dbConnection, cursorKey, '', logger, this.embeddingDimension
+                );
+            }
             logger.info(`Successfully processed ${totalTickets} tickets (${skippedTickets} skipped by status filter)`);
         } else {
             logger.warn(
