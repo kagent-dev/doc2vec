@@ -5,7 +5,7 @@
 | Metric | Value |
 |--------|-------|
 | **Framework** | [Vitest](https://vitest.dev/) v4 |
-| **Total tests** | 524 |
+| **Total tests** | 547 |
 | **Test files** | 8 |
 | **Total lines** | ~10,000 |
 | **Execution time** | ~40s |
@@ -32,7 +32,7 @@ npm run test:coverage
 | `tests/content-processor.test.ts` | 194 | `content-processor.ts` | HTML conversion, chunking, crawling, ETag/lastmod change detection, adaptive backoff, PDF/DOC processing, tab preprocessing |
 | `tests/database.test.ts` | 75 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup, URL-level hash queries, URL prefix queries |
 | `tests/code-chunker.test.ts` | 62 | `code-chunker.ts` | AST-based code chunking, language support, merge behavior, function boundary integrity |
-| `tests/doc2vec.test.ts` | 58 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings |
+| `tests/doc2vec.test.ts` | 79 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings, Zendesk ticket processing |
 | `tests/mcp-server.test.ts` | 12 | `mcp/src/server.ts` | MCP server helpers, query handlers, SQLite/Qdrant providers, end-to-end |
 | `tests/e2e.test.ts` | 11 (+2 conditional) | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, website source, multi-sync change detection, incomplete sync recovery, and markdown store integration (SQLite + Qdrant) |
 
@@ -501,7 +501,7 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 
 ---
 
-### `tests/doc2vec.test.ts` (58 tests)
+### `tests/doc2vec.test.ts` (79 tests)
 
 #### `constructor`
 - Creates Logger, loads config, initializes OpenAI client, initializes ContentProcessor
@@ -551,6 +551,20 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 
 #### `fetchWithRetry logic`
 - Implements exponential backoff (delay doubles each attempt)
+
+#### `fetchAndProcessZendeskTickets` (actual class method, 21 tests)
+- **API endpoint**: Uses `/api/v2/incremental/tickets/cursor.json` (not the capped `search.json`)
+- **First run**: Builds URL with Unix epoch `start_time` derived from `lastRunDate`
+- **Resumed run**: Uses a saved cursor from the database instead of `start_time`
+- **Cursor persistence**: Persists `after_cursor` to metadata after each page so a crash can resume mid-stream
+- **Multi-page pagination**: Follows `after_url` to fetch subsequent pages; stops when `end_of_stream` is true
+- **Chunk storage**: Delegates to `processChunksForUrl` for URL-level diff (old chunks deleted before reinserting)
+- **Watermark gating**: Does not advance `lastRunDate` or clear cursor when any ticket fails; advances and clears on full success
+- **Resilience**: A single failing ticket is caught and logged; remaining tickets continue processing
+- **Deleted tickets**: Tickets with `status: 'deleted'` have their DB chunks removed; no comments are fetched
+- **Status filtering**: `'closed'` included in the default filter; filter applied client-side; custom filter respected
+- **429 handling**: `Retry-After` header read from `error.response`; rate-limit waits do not burn a retry slot
+- **Retry exhaustion**: Throws after 3 failed attempts on persistent non-429 errors
 
 #### Edge cases
 - Handles empty sources array

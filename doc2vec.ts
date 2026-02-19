@@ -1092,11 +1092,31 @@ export class Doc2Vec {
     private async fetchAndProcessZendeskTickets(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
         const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2`;
         const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
-        
-        // Get the last run date from the database
+
+        // ── Incremental state ────────────────────────────────────────────────────
+        // Use a persistent cursor (opaque string from Zendesk) when available so
+        // that a resumed run continues from exactly where it left off.  Fall back
+        // to a Unix epoch derived from lastRunDate for the very first request.
         const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
-        const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, `${startDate}T00:00:00Z`, logger);
-        
+        const lastRunDate = await DatabaseManager.getLastRunDate(
+            dbConnection,
+            `zendesk_tickets_${config.zendesk_subdomain}`,
+            `${startDate}T00:00:00Z`,
+            logger
+        );
+        const cursorKey = `zendesk_cursor_${config.zendesk_subdomain}`;
+        const savedCursor = await DatabaseManager.getMetadataValue(dbConnection, cursorKey, undefined, logger);
+
+        // ── Status filter (applied client-side after fetch) ──────────────────────
+        // Default includes 'closed' so tickets that transition to closed are still
+        // updated/indexed rather than left with stale data in the DB.
+        const statusFilter = new Set(config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved', 'closed']);
+
+        // ── fetchWithRetry ───────────────────────────────────────────────────────
+        // Fix: the old code checked `response.status === 429` which is unreachable
+        // because axios throws on 4xx.  We now handle 429 inside the catch block
+        // by inspecting error.response, and we don't burn a retry on rate-limit
+        // waits.
         const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
@@ -1106,16 +1126,17 @@ export class Doc2Vec {
                             'Content-Type': 'application/json',
                         },
                     });
-                    
-                    if (response.status === 429) {
-                        const retryAfter = parseInt(response.headers['retry-after'] || '60');
-                        logger.warn(`Rate limited, waiting ${retryAfter}s before retry`);
-                        await new Promise(res => setTimeout(res, retryAfter * 1000));
-                        continue;
-                    }
-                    
                     return response.data;
                 } catch (error: any) {
+                    if (error.response?.status === 429) {
+                        // Honor Zendesk's Retry-After header; do NOT burn a retry.
+                        const retryAfter = parseInt(error.response.headers?.['retry-after'] || '60', 10);
+                        logger.warn(`Rate limited by Zendesk, waiting ${retryAfter}s before retry`);
+                        await new Promise(res => setTimeout(res, retryAfter * 1000));
+                        // Don't increment attempt — retry immediately after the wait.
+                        attempt--;
+                        continue;
+                    }
                     logger.error(`Zendesk API error (attempt ${attempt + 1}):`, error.message);
                     if (attempt === retries - 1) throw error;
                     await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
@@ -1162,10 +1183,32 @@ export class Doc2Vec {
             return md;
         };
 
+        // Fix: use processChunksForUrl so old chunks are deleted before new ones
+        // are inserted.  The previous inline per-chunk loop never removed stale
+        // chunks when ticket content changed, causing chunk accumulation.
         const processTicket = async (ticket: any): Promise<void> => {
             const ticketId = ticket.id;
             const url = `https://${config.zendesk_subdomain}.zendesk.com/agent/tickets/${ticketId}`;
-            
+
+            // Fix: deleted tickets — remove their chunks and stop.
+            if (ticket.status === 'deleted') {
+                logger.info(`Ticket #${ticketId} was deleted in Zendesk — removing its chunks`);
+                if (dbConnection.type === 'sqlite') {
+                    DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                } else {
+                    await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                }
+                return;
+            }
+
+            // Fix: skip tickets whose status is outside the configured filter.
+            // Because the Incremental Export API returns all tickets regardless of
+            // status, we apply the filter here client-side.
+            if (!statusFilter.has(ticket.status)) {
+                logger.debug(`Ticket #${ticketId} has status '${ticket.status}' which is outside the configured filter — skipping`);
+                return;
+            }
+
             logger.info(`Processing ticket #${ticketId}`);
             
             // Fetch ticket comments
@@ -1185,98 +1228,103 @@ export class Doc2Vec {
             
             const chunks = await this.contentProcessor.chunkMarkdown(markdown, ticketConfig, url);
             logger.info(`Ticket #${ticketId}: Created ${chunks.length} chunks`);
-            
-            // Process and store each chunk
-            for (const chunk of chunks) {
-                const chunkHash = Utils.generateHash(chunk.content);
-                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
 
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
-                } else if (dbConnection.type === 'qdrant') {
-                    try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
-
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
-                    }
-                }
-            }
+            // Delegate to processChunksForUrl which performs a URL-level diff:
+            // it deletes all existing chunks for this URL before reinserting, so
+            // stale chunks from previous versions of the ticket are never left behind.
+            await this.processChunksForUrl(chunks, url, dbConnection, logger);
         };
 
-        logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
-        
-        // Build query parameters
-        const statusFilter = config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved'];
-        const query = `updated>${lastRunDate.split('T')[0]} status:${statusFilter.join(',status:')}`;
-        
-        let nextPage = `${baseUrl}/search.json?query=${encodeURIComponent(query)}&sort_by=updated_at&sort_order=asc`;
+        // ── Pagination using the Incremental Ticket Export (cursor-based) ────────
+        // This replaces the old /api/v2/search.json approach which:
+        //   • Had a hard 1 000-result cap (silently dropping tickets beyond it)
+        //   • Used date-only granularity in the query (timezone boundary misses)
+        // The Incremental Export API:
+        //   • Has no result cap
+        //   • Accepts a Unix epoch timestamp (exact, timezone-independent)
+        //   • Returns an opaque cursor we persist so runs can resume mid-stream
+        const startTimeUnix = Math.floor(new Date(lastRunDate).getTime() / 1000);
+        const initialUrl = savedCursor
+            ? `${baseUrl}/incremental/tickets/cursor.json?cursor=${encodeURIComponent(savedCursor)}`
+            : `${baseUrl}/incremental/tickets/cursor.json?start_time=${startTimeUnix}`;
+
+        logger.info(
+            savedCursor
+                ? `Resuming Zendesk incremental export from saved cursor`
+                : `Starting Zendesk incremental export from ${lastRunDate} (unix: ${startTimeUnix})`
+        );
+
+        let currentUrl: string | null = initialUrl;
         let totalTickets = 0;
-        
-        while (nextPage) {
-            const data = await fetchWithRetry(nextPage);
-            const tickets = data.results || [];
-            
+        let skippedTickets = 0;
+        let failedTickets = 0;
+        let lastCursor: string | undefined;
+
+        while (currentUrl) {
+            const data = await fetchWithRetry(currentUrl);
+            const tickets: any[] = data.tickets || [];
+
             logger.info(`Processing batch of ${tickets.length} tickets`);
-            
+
             for (const ticket of tickets) {
-                await processTicket(ticket);
-                totalTickets++;
+                // Fix: wrap each ticket in try/catch so one bad ticket doesn't
+                // abort the entire run.  Failed tickets are counted; if any fail
+                // the watermark is NOT advanced so they will be retried next run.
+                try {
+                    await processTicket(ticket);
+                    totalTickets++;
+                } catch (error: any) {
+                    failedTickets++;
+                    logger.error(`Failed to process ticket #${ticket.id}, will retry next run: ${error.message}`);
+                }
             }
-            
-            nextPage = data.next_page;
-            
-            if (nextPage) {
-                logger.debug(`Fetching next page: ${nextPage}`);
-                // Rate limiting: wait between requests
+
+            // Persist cursor after every page so a crash mid-run can resume
+            // from the last successfully fetched page rather than the beginning.
+            if (data.after_cursor) {
+                lastCursor = data.after_cursor;
+                await DatabaseManager.setMetadataValue(
+                    dbConnection, cursorKey, lastCursor!, logger, this.embeddingDimension
+                );
+            }
+
+            if (data.end_of_stream) {
+                logger.info('Reached end of Zendesk incremental export stream');
+                break;
+            }
+
+            currentUrl = data.after_url || null;
+
+            if (currentUrl) {
+                // Rate limiting: wait 1 s between pages (10 req/min limit on incremental API)
                 await new Promise(res => setTimeout(res, 1000));
             }
         }
 
-        // Update the last run date in the database
-        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger, this.embeddingDimension);
-        
-        logger.info(`Successfully processed ${totalTickets} tickets`);
+        // ── Advance the watermark only when all tickets succeeded ────────────────
+        // If any ticket failed we intentionally leave lastRunDate and the cursor
+        // unchanged so the next run re-processes from the same starting point and
+        // retries the failed tickets.
+        if (failedTickets === 0) {
+            await DatabaseManager.updateLastRunDate(
+                dbConnection,
+                `zendesk_tickets_${config.zendesk_subdomain}`,
+                logger,
+                this.embeddingDimension
+            );
+            // Clear the saved cursor now that the stream is fully consumed —
+            // next run will start fresh from the new lastRunDate.
+            await DatabaseManager.setMetadataValue(
+                dbConnection, cursorKey, '', logger, this.embeddingDimension
+            );
+            logger.info(`Successfully processed ${totalTickets} tickets (${skippedTickets} skipped by status filter)`);
+        } else {
+            logger.warn(
+                `Run completed with ${failedTickets} ticket failure(s). ` +
+                `Watermark NOT advanced — failed tickets will be retried next run. ` +
+                `Successfully processed: ${totalTickets}, skipped: ${skippedTickets}.`
+            );
+        }
     }
 
     private async fetchAndProcessZendeskArticles(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {

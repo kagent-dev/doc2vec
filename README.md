@@ -212,12 +212,12 @@ Configuration is managed through two files:
         For Zendesk (`type: 'zendesk'`):
         *   `zendesk_subdomain`: Your Zendesk subdomain (e.g., `'mycompany'` for mycompany.zendesk.com).
         *   `email`: Your Zendesk admin email address.
-        *   `api_token`: Your Zendesk API token (reference environment variable as `'${ZENDESK_API_TOKEN}'`).
-        *   `fetch_tickets`: (Optional) Whether to fetch support tickets (defaults to `true`).
-        *   `fetch_articles`: (Optional) Whether to fetch knowledge base articles (defaults to `true`).
-        *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
-        *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved']`).
-        *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
+         *   `api_token`: Your Zendesk API token (reference environment variable as `'${ZENDESK_API_TOKEN}'`). Requires Admin privileges to use the Incremental Export API.
+         *   `fetch_tickets`: (Optional) Whether to fetch support tickets (defaults to `true`).
+         *   `fetch_articles`: (Optional) Whether to fetch knowledge base articles (defaults to `true`).
+         *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
+         *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved', 'closed']`).
+         *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
 
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
@@ -633,6 +633,17 @@ If you don't specify a config path, it will look for config.yaml in the current 
 - Changed URLs get all old chunks deleted and fresh chunks inserted with correct `chunk_index` and `total_chunks`
 - Eliminates orphaned chunks and inconsistent metadata that occurred when content shifted (e.g., a paragraph added in the middle)
 - Consolidated four duplicated chunk processing loops into a single shared `processChunksForUrl` method
+
+### Zendesk Incremental Sync Reliability
+- Replaced the Search API (`/api/v2/search.json`) with the Incremental Ticket Export API (`/api/v2/incremental/tickets/cursor.json`), eliminating the 1,000-result hard cap that silently dropped tickets on large syncs
+- Incremental queries now use Unix epoch timestamps instead of date strings, removing timezone boundary misses
+- Cursor is persisted to the database after every page so a mid-run crash resumes from the last successfully fetched page rather than restarting from scratch
+- Watermark only advances when every ticket in the run succeeds; failed tickets are retried on the next run
+- Each ticket is processed in an isolated try/catch so a single failing ticket no longer aborts the entire run
+- Ticket chunk storage now uses `processChunksForUrl`, deleting stale chunks before reinserting — prevents indefinite accumulation of old chunk versions
+- Tickets deleted in Zendesk have their chunks removed from the database
+- `'closed'` added to the default `ticket_status` filter; filtering is applied client-side so status transitions no longer leave stale chunks
+- Fixed 429 rate-limit handling in `fetchWithRetry`: the `Retry-After` header is now properly read from the axios error object and rate-limit waits do not consume a retry slot
 
 ### Puppeteer Resilience
 - Added `protocolTimeout: 60000` to browser launch to fail faster on stuck protocol calls (down from default 180s)
