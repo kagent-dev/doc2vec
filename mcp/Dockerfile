@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/wolfi-base:latest AS builder
+FROM --platform=$TARGETPLATFORM cgr.dev/chainguard/wolfi-base:latest AS builder
 
 # Import build arguments for cross-compilation
 ARG BUILDPLATFORM
