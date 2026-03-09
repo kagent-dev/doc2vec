@@ -44,7 +44,7 @@
         "openai": "^4.20.1",
         "pdfjs-dist": "^5.3.31",
         "pg": "^8.18.0",
-        "puppeteer": "^24.1.1",
+        "puppeteer": "^24.36.1",
         "sanitize-html": "^2.11.0",
         "sqlite-vec": "0.1.7-alpha.2",
         "tree-sitter-wasms": "^0.1.0",
