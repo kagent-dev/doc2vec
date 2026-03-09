@@ -1,6 +1,6 @@
 // Base configuration that applies to all source types
 export interface BaseSourceConfig {
-    type: 'website' | 'github' | 'local_directory' | 'zendesk' | 'code';
+    type: 'website' | 'github' | 'local_directory' | 'zendesk' | 'code' | 's3';
     product_name: string;
     version: string;
     max_size: number;
@@ -61,8 +61,21 @@ export interface CodeSourceConfig extends BaseSourceConfig {
     chunk_size?: number;           // Optional chunk size for Chonkie
 }
 
+// Configuration specific to S3 sources
+export interface S3SourceConfig extends BaseSourceConfig {
+    type: 's3';
+    bucket: string;                // S3 bucket name
+    prefix?: string;               // Optional key prefix to filter objects (e.g., 'docs/')
+    region?: string;               // AWS region (default: AWS_DEFAULT_REGION env var or 'us-east-1')
+    endpoint?: string;             // Custom S3 endpoint for S3-compatible services (MinIO, LocalStack)
+    include_extensions?: string[]; // File extensions to include (e.g., ['.md', '.txt', '.pdf'])
+    exclude_extensions?: string[]; // File extensions to exclude
+    encoding?: BufferEncoding;     // Text file encoding (default: 'utf8')
+    url_rewrite_prefix?: string;   // Optional URL prefix to rewrite s3:// URLs
+}
+
 // Union type for all possible source configurations
-export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig | CodeSourceConfig;
+export type SourceConfig = WebsiteSourceConfig | GithubSourceConfig | LocalDirectorySourceConfig | ZendeskSourceConfig | CodeSourceConfig | S3SourceConfig;
 
 // Database configuration
 export interface DatabaseConfig {

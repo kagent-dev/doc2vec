@@ -152,15 +152,16 @@ describe('DatabaseManager', () => {
         });
 
         it('should update and retrieve last run date', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            const syncDate = new Date().toISOString();
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, syncDate);
             const date = await DatabaseManager.getLastRunDate(conn, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
-            // Should be an ISO date string, not the default
-            expect(date).not.toBe('2025-01-01T00:00:00Z');
+            // Should be the date we passed in
+            expect(date).toBe(syncDate);
             expect(date).toMatch(/^\d{4}-\d{2}-\d{2}T/);
         });
 
         it('should normalize repo names in metadata keys', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, new Date().toISOString());
             // Check directly in db that the key uses underscore
             const result = db.prepare('SELECT key FROM vec_metadata WHERE key LIKE ?').get('last_run_%') as { key: string };
             expect(result.key).toBe('last_run_owner_repo');
@@ -1085,7 +1086,8 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            const syncDate = new Date().toISOString();
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, syncDate);
 
             expect(mockClient.upsert).toHaveBeenCalledOnce();
             const call = mockClient.upsert.mock.calls[0];
@@ -1093,7 +1095,7 @@ describe('DatabaseManager', () => {
             const point = call[1].points[0];
             expect(point.payload.is_metadata).toBe(true);
             expect(point.payload.metadata_key).toBe('last_run_owner_repo');
-            expect(point.payload.metadata_value).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+            expect(point.payload.metadata_value).toBe(syncDate);
             expect(point.vector).toHaveLength(TEST_EMBEDDING_DIMENSION);
         });
 
@@ -1108,7 +1110,7 @@ describe('DatabaseManager', () => {
             };
 
             // Should not throw
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, new Date().toISOString());
         });
     });
 

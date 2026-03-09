@@ -1442,6 +1442,36 @@ export class ContentProcessor {
         }
     }
 
+    async convertFileToMarkdown(filePath: string, extension: string, logger: Logger): Promise<string> {
+        const ext = extension.toLowerCase();
+        if (ext === '.pdf') {
+            return this.convertPdfToMarkdown(filePath, logger);
+        } else if (ext === '.doc') {
+            return this.convertDocToMarkdown(filePath, logger);
+        } else if (ext === '.docx') {
+            return this.convertDocxToMarkdown(filePath, logger);
+        } else if (ext === '.html' || ext === '.htm') {
+            const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+            const cleanHtml = sanitizeHtml(content, {
+                allowedTags: [
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                ],
+                allowedAttributes: {
+                    'a': ['href'],
+                    'pre': ['class', 'data-language'],
+                    'code': ['class', 'data-language'],
+                    'div': ['class'],
+                    'span': ['class']
+                }
+            });
+            return this.turndownService.turndown(cleanHtml);
+        } else {
+            throw new Error(`Unsupported file extension for conversion: ${extension}`);
+        }
+    }
+
     private async downloadAndConvertPdfFromUrl(url: string, logger: Logger): Promise<string> {
         logger.debug(`Downloading and converting PDF from URL: ${url}`);
         
@@ -1599,49 +1629,29 @@ export class ContentProcessor {
                         let content: string;
                         let processedContent: string;
                         
-                        if (extension === '.pdf') {
-                            // Handle PDF files
-                            logger.debug(`Processing PDF file: ${filePath}`);
-                            processedContent = await this.convertPdfToMarkdown(filePath, logger);
-                        } else if (extension === '.doc') {
-                            // Handle legacy Word DOC files
-                            logger.debug(`Processing DOC file: ${filePath}`);
-                            processedContent = await this.convertDocToMarkdown(filePath, logger);
-                        } else if (extension === '.docx') {
-                            // Handle modern Word DOCX files
-                            logger.debug(`Processing DOCX file: ${filePath}`);
-                            processedContent = await this.convertDocxToMarkdown(filePath, logger);
+                        const convertibleExtensions = ['.pdf', '.doc', '.docx', '.html', '.htm'];
+                        if (convertibleExtensions.includes(extension)) {
+                            if (extension === '.html' || extension === '.htm') {
+                                // For HTML, check raw file size before converting
+                                content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
+                                if (content.length > config.max_size) {
+                                    logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                                    skippedFiles++;
+                                    continue;
+                                }
+                            }
+                            processedContent = await this.convertFileToMarkdown(filePath, extension, logger);
                         } else {
                             // Handle text-based files
                             content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
-                            
+
                             if (content.length > config.max_size) {
                                 logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
                                 skippedFiles++;
                                 continue;
                             }
-                            
-                            // Convert HTML to Markdown if needed
-                            if (extension === '.html' || extension === '.htm') {
-                                logger.debug(`Converting HTML to Markdown for ${filePath}`);
-                                const cleanHtml = sanitizeHtml(content, {
-                                    allowedTags: [
-                                        'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
-                                        'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
-                                        'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
-                                    ],
-                                    allowedAttributes: {
-                                        'a': ['href'],
-                                        'pre': ['class', 'data-language'],
-                                        'code': ['class', 'data-language'],
-                                        'div': ['class'],
-                                        'span': ['class']
-                                    }
-                                });
-                                processedContent = this.turndownService.turndown(cleanHtml);
-                            } else {
-                                processedContent = content;
-                            }
+
+                            processedContent = content;
                         }
                         
                         // Check size limit for processed content
