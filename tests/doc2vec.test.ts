@@ -86,8 +86,25 @@ vi.mock('../content-processor', () => {
         this.processDirectory = vi.fn().mockResolvedValue(undefined);
         this.processCodeDirectory = vi.fn().mockResolvedValue({ maxMtime: 0 });
         this.convertHtmlToMarkdown = vi.fn().mockReturnValue('converted markdown');
+        this.convertFileToMarkdown = vi.fn().mockResolvedValue('converted file markdown');
     }
     return { ContentProcessor: MockContentProcessor };
+});
+
+// Mock AWS S3 SDK
+const { mockS3Send } = vi.hoisted(() => {
+    return { mockS3Send: vi.fn() };
+});
+vi.mock('@aws-sdk/client-s3', () => {
+    function MockS3Client() {}
+    MockS3Client.prototype.send = mockS3Send;
+    function MockListObjectsV2Command(params: any) { Object.assign(this, params); }
+    function MockGetObjectCommand(params: any) { Object.assign(this, params); }
+    return {
+        S3Client: MockS3Client,
+        ListObjectsV2Command: MockListObjectsV2Command,
+        GetObjectCommand: MockGetObjectCommand,
+    };
 });
 
 // Mock Logger - must use function() not arrow so it works with `new`
@@ -1092,7 +1109,6 @@ sources:
         });
     });
 
-    // ─────────────────────────────────────────────────────────────────────────
     // 14. Edge cases
     // ─────────────────────────────────────────────────────────────────────────
     describe('edge cases', () => {
@@ -1134,6 +1150,465 @@ sources:
             expect(mockCreate).toHaveBeenCalledWith(
                 expect.objectContaining({ model: 'text-embedding-3-large' })
             );
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S3 source tests
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('processS3', () => {
+        function makeS3Config(overrides: any = {}) {
+            return {
+                type: 's3',
+                product_name: 'TestS3',
+                version: '1.0',
+                bucket: 'test-bucket',
+                max_size: 1048576,
+                database_config: { type: 'sqlite', params: { db_path: ':memory:' } },
+                ...overrides,
+            };
+        }
+
+        function makeS3Instance(configOverrides: any = {}) {
+            const s3Config = makeS3Config(configOverrides);
+            const configPath = writeTestConfig('s3-test.yaml', { sources: [s3Config] });
+            const instance = new Doc2Vec(configPath);
+            vi.spyOn(instance as any, 'createEmbeddings').mockResolvedValue([[0.1, 0.2, 0.3]]);
+            return instance;
+        }
+
+        function makeS3Object(key: string, lastModified: Date, size: number = 100) {
+            return { Key: key, LastModified: lastModified, Size: size };
+        }
+
+        function makeListResponse(contents: any[], nextToken?: string) {
+            return {
+                Contents: contents,
+                NextContinuationToken: nextToken,
+            };
+        }
+
+        function makeGetResponse(body: string) {
+            return {
+                Body: {
+                    transformToString: vi.fn().mockResolvedValue(body),
+                    transformToByteArray: vi.fn().mockResolvedValue(new Uint8Array(Buffer.from(body))),
+                },
+            };
+        }
+
+        it('should route s3 source to processS3 via run()', async () => {
+            const instance = makeS3Instance();
+            const spy = vi.spyOn(instance as any, 'processS3').mockResolvedValue(undefined);
+            await instance.run();
+            expect(spy).toHaveBeenCalledTimes(1);
+            expect(spy).toHaveBeenCalledWith(
+                expect.objectContaining({ type: 's3', bucket: 'test-bucket' }),
+                expect.anything()
+            );
+        });
+
+        it('should list objects and process text files', async () => {
+            const instance = makeS3Instance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('docs/readme.md', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('# Hello World'));
+
+            // chunkMarkdown returns mock chunks
+            const mockChunks = [{ content: '# Hello World', metadata: { chunk_id: 'c1', url: 's3://test-bucket/docs/readme.md' } }];
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce(mockChunks);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            expect(processChunksSpy).toHaveBeenCalledWith(
+                mockChunks,
+                's3://test-bucket/docs/readme.md',
+                expect.anything(),
+                expect.anything()
+            );
+        });
+
+        it('should filter objects by include_extensions', async () => {
+            const instance = makeS3Instance({ include_extensions: ['.md'] });
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('file.md', now),
+                    makeS3Object('file.txt', now),
+                    makeS3Object('file.py', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('# Only MD'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // Only 1 GetObject call (for .md file), not 3
+            expect(mockS3Send).toHaveBeenCalledTimes(2); // 1 ListObjects + 1 GetObject
+        });
+
+        it('should filter objects by exclude_extensions', async () => {
+            const instance = makeS3Instance({ exclude_extensions: ['.log'] });
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('file.md', now),
+                    makeS3Object('file.log', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            expect(mockS3Send).toHaveBeenCalledTimes(2); // 1 ListObjects + 1 GetObject (only .md)
+        });
+
+        it('should skip objects that have not changed since last sync (incremental)', async () => {
+            const { DatabaseManager: DB } = await import('../database');
+            const lastSync = Date.now();
+            (DB.getMetadataValue as any)
+                .mockResolvedValueOnce(String(lastSync))   // s3_last_sync_*
+                .mockResolvedValueOnce('[]');               // s3_filelist_*
+
+            const instance = makeS3Instance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const oldDate = new Date(lastSync - 10000); // 10s before last sync
+            const newDate = new Date(lastSync + 10000); // 10s after last sync
+
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('old-file.md', oldDate),
+                    makeS3Object('new-file.md', newDate),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('new content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // Only 1 GetObject (new-file.md), old-file.md skipped
+            expect(mockS3Send).toHaveBeenCalledTimes(2); // 1 ListObjects + 1 GetObject
+            expect(processChunksSpy).toHaveBeenCalledTimes(1);
+        });
+
+        it('should process all objects on first run (no last sync)', async () => {
+            const { DatabaseManager: DB } = await import('../database');
+            (DB.getMetadataValue as any)
+                .mockResolvedValueOnce('0')    // s3_last_sync_* = 0 (first run)
+                .mockResolvedValueOnce('[]');   // s3_filelist_*
+
+            const instance = makeS3Instance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('file1.md', now),
+                    makeS3Object('file2.md', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('content 1'))
+                .mockResolvedValueOnce(makeGetResponse('content 2'));
+
+            (instance as any).contentProcessor.chunkMarkdown
+                .mockResolvedValueOnce([])
+                .mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // Both files processed
+            expect(processChunksSpy).toHaveBeenCalledTimes(2);
+        });
+
+        it('should handle paginated S3 listings', async () => {
+            const instance = makeS3Instance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                // Page 1 with continuation token
+                .mockResolvedValueOnce(makeListResponse(
+                    [makeS3Object('page1.md', now)],
+                    'next-token'
+                ))
+                // Page 2, no continuation token
+                .mockResolvedValueOnce(makeListResponse(
+                    [makeS3Object('page2.md', now)]
+                ))
+                .mockResolvedValueOnce(makeGetResponse('page 1 content'))
+                .mockResolvedValueOnce(makeGetResponse('page 2 content'));
+
+            (instance as any).contentProcessor.chunkMarkdown
+                .mockResolvedValueOnce([])
+                .mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            expect(processChunksSpy).toHaveBeenCalledTimes(2);
+        });
+
+        it('should skip folder markers (keys ending with /)', async () => {
+            const instance = makeS3Instance();
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('docs/', now),         // folder marker
+                    makeS3Object('docs/file.md', now),  // actual file
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // Only 2 calls: ListObjects + GetObject for file.md (not folder marker)
+            expect(mockS3Send).toHaveBeenCalledTimes(2);
+        });
+
+        it('should skip objects exceeding max_size', async () => {
+            const instance = makeS3Instance({ max_size: 50 });
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send.mockResolvedValueOnce(makeListResponse([
+                makeS3Object('large-file.md', now, 100), // exceeds max_size of 50
+            ]));
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // No GetObject call because size exceeds limit
+            expect(mockS3Send).toHaveBeenCalledTimes(1); // Only ListObjects
+            expect(processChunksSpy).not.toHaveBeenCalled();
+        });
+
+        it('should use url_rewrite_prefix for generated URLs', async () => {
+            const instance = makeS3Instance({
+                prefix: 'docs/',
+                url_rewrite_prefix: 'https://docs.example.com',
+            });
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('docs/guide/intro.md', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('# Intro'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            expect(processChunksSpy).toHaveBeenCalledWith(
+                expect.anything(),
+                'https://docs.example.com/guide/intro.md',
+                expect.anything(),
+                expect.anything()
+            );
+        });
+
+        it('should use s3:// URL when no url_rewrite_prefix', async () => {
+            const instance = makeS3Instance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('docs/readme.md', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            expect(processChunksSpy).toHaveBeenCalledWith(
+                expect.anything(),
+                's3://test-bucket/docs/readme.md',
+                expect.anything(),
+                expect.anything()
+            );
+        });
+
+        it('should remove chunks for deleted objects', async () => {
+            const { DatabaseManager: DB } = await import('../database');
+            // Previous run had 2 files, now bucket only has 1
+            (DB.getMetadataValue as any)
+                .mockResolvedValueOnce('0')   // s3_last_sync_*
+                .mockResolvedValueOnce(JSON.stringify(['file1.md', 'file2.md'])); // s3_filelist_*
+
+            const instance = makeS3Instance();
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('file1.md', now), // file2.md no longer exists
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // Should remove chunks for file2.md
+            expect(DB.removeChunksByUrlSQLite).toHaveBeenCalledWith(
+                expect.anything(),
+                's3://test-bucket/file2.md',
+                expect.anything()
+            );
+        });
+
+        it('should persist sync state after processing', async () => {
+            const { DatabaseManager: DB } = await import('../database');
+
+            const instance = makeS3Instance();
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('file.md', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            const beforeTimestamp = Date.now();
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            const setCalls = (DB.setMetadataValue as any).mock.calls;
+
+            // Should save file list
+            const fileListCall = setCalls.find((c: any[]) => /s3_filelist_/.test(c[1]));
+            expect(fileListCall).toBeDefined();
+            expect(JSON.parse(fileListCall[2])).toEqual(['file.md']);
+
+            // Should save sync timestamp captured at the start of the sync
+            const syncCall = setCalls.find((c: any[]) => /s3_last_sync_/.test(c[1]));
+            expect(syncCall).toBeDefined();
+            const storedTimestamp = parseInt(syncCall[2], 10);
+            expect(storedTimestamp).toBeGreaterThan(0);
+            // Timestamp should be captured at the start of sync, not long after
+            expect(storedTimestamp).toBeLessThanOrEqual(beforeTimestamp + 50);
+        });
+
+        it('should use prefix in ListObjectsV2Command', async () => {
+            const instance = makeS3Instance({ prefix: 'docs/v2/' });
+            vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            mockS3Send.mockResolvedValueOnce(makeListResponse([]));
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // Verify send was called with a command containing the prefix
+            const firstSendCall = mockS3Send.mock.calls[0][0];
+            expect(firstSendCall).toEqual(
+                expect.objectContaining({
+                    Bucket: 'test-bucket',
+                    Prefix: 'docs/v2/',
+                })
+            );
+        });
+
+        it('should handle binary files (PDF) via convertFileToMarkdown', async () => {
+            const instance = makeS3Instance({ include_extensions: ['.pdf'] });
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('doc.pdf', now),
+                ]))
+                .mockResolvedValueOnce(makeGetResponse('pdf-binary-content'));
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            expect((instance as any).contentProcessor.convertFileToMarkdown).toHaveBeenCalledWith(
+                expect.stringContaining('doc.pdf'),
+                '.pdf',
+                expect.anything()
+            );
+        });
+
+        it('should handle errors for individual objects without stopping', async () => {
+            const instance = makeS3Instance();
+            const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(0);
+
+            const now = new Date();
+            mockS3Send
+                .mockResolvedValueOnce(makeListResponse([
+                    makeS3Object('bad.md', now),
+                    makeS3Object('good.md', now),
+                ]))
+                .mockRejectedValueOnce(new Error('Access Denied'))  // bad.md fetch fails
+                .mockResolvedValueOnce(makeGetResponse('good content')); // good.md succeeds
+
+            (instance as any).contentProcessor.chunkMarkdown.mockResolvedValueOnce([]);
+
+            await (instance as any).processS3(
+                (instance as any).config.sources[0],
+                (instance as any).logger
+            );
+
+            // good.md should still be processed despite bad.md failing
+            expect(processChunksSpy).toHaveBeenCalledTimes(1);
         });
     });
 });

@@ -263,9 +263,10 @@ export class DatabaseManager {
         dbConnection: DatabaseConnection,
         repo: string,
         logger: Logger,
-        embeddingDimension: number
+        embeddingDimension: number,
+        date: string
     ): Promise<void> {
-        const now = new Date().toISOString();
+        const now = date;
         
         try {
             if (dbConnection.type === 'sqlite') {

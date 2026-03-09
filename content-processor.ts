@@ -1442,6 +1442,36 @@ export class ContentProcessor {
         }
     }
 
+    async convertFileToMarkdown(filePath: string, extension: string, logger: Logger): Promise<string> {
+        const ext = extension.toLowerCase();
+        if (ext === '.pdf') {
+            return this.convertPdfToMarkdown(filePath, logger);
+        } else if (ext === '.doc') {
+            return this.convertDocToMarkdown(filePath, logger);
+        } else if (ext === '.docx') {
+            return this.convertDocxToMarkdown(filePath, logger);
+        } else if (ext === '.html' || ext === '.htm') {
+            const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+            const cleanHtml = sanitizeHtml(content, {
+                allowedTags: [
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                ],
+                allowedAttributes: {
+                    'a': ['href'],
+                    'pre': ['class', 'data-language'],
+                    'code': ['class', 'data-language'],
+                    'div': ['class'],
+                    'span': ['class']
+                }
+            });
+            return this.turndownService.turndown(cleanHtml);
+        } else {
+            throw new Error(`Unsupported file extension for conversion: ${extension}`);
+        }
+    }
+
     private async downloadAndConvertPdfFromUrl(url: string, logger: Logger): Promise<string> {
         logger.debug(`Downloading and converting PDF from URL: ${url}`);
         

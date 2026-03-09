@@ -176,7 +176,7 @@ Configuration is managed through two files:
     **Structure:**
 
     *   `sources`: An array of source configurations.
-        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, `'code'`, or `'zendesk'`
+        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, `'code'`, `'zendesk'`, or `'s3'`
         
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
@@ -218,6 +218,20 @@ Configuration is managed through two files:
         *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
         *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved']`).
         *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
+
+        For S3 buckets (`type: 's3'`):
+        *   `bucket`: The S3 bucket name.
+        *   `prefix`: (Optional) Key prefix to filter objects (e.g., `'docs/'`). Only objects under this prefix will be processed.
+        *   `region`: (Optional) AWS region (defaults to `AWS_DEFAULT_REGION` environment variable or `'us-east-1'`).
+        *   `endpoint`: (Optional) Custom S3 endpoint for S3-compatible services (MinIO, LocalStack, etc.).
+        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf', '.doc', '.docx']`.
+        *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
+        *   `encoding`: (Optional) Text file encoding (defaults to `'utf8'`). Does not apply to binary files (PDF, DOC, DOCX).
+        *   `url_rewrite_prefix`: (Optional) URL prefix to rewrite `s3://` URLs (e.g., `'https://docs.example.com'`).
+
+        Authentication uses the AWS SDK default credential chain: environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, IAM roles, etc.
+
+        Incremental sync tracks object `LastModified` timestamps so only new or updated objects are processed on subsequent runs. Deleted objects are automatically cleaned up.
 
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
@@ -349,6 +363,21 @@ Configuration is managed through two files:
           params:
             db_path: './zendesk-kb.db'
       
+      # S3 bucket source example
+      - type: 's3'
+        product_name: 'my-docs'
+        version: 'latest'
+        bucket: 'my-documentation-bucket'
+        prefix: 'docs/v2/'
+        region: 'us-west-2'
+        include_extensions: ['.md', '.txt', '.pdf', '.html']
+        url_rewrite_prefix: 'https://docs.example.com'
+        max_size: 1048576
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './s3-docs.db'
+
       # Qdrant example
       - type: 'website'
         product_name: 'Istio'

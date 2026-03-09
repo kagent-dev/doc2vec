@@ -1,6 +1,6 @@
 {
     "name": "doc2vec",
-    "version": "2.6.0",
+    "version": "2.7.0",
     "type": "commonjs",
     "description": "",
     "main": "dist/doc2vec.js",
@@ -29,6 +29,7 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@aws-sdk/client-s3": "^3.1004.0",
         "@chonkiejs/core": "^0.0.7",
         "@mozilla/readability": "^0.4.4",
         "@qdrant/js-client-rest": "^1.13.0",

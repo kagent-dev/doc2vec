@@ -15,20 +15,22 @@ import { Logger, LogLevel } from './logger';
 import { Utils } from './utils';
 import { DatabaseManager } from './database';
 import { ContentProcessor } from './content-processor';
-import { 
-    Config, 
-    SourceConfig, 
-    GithubSourceConfig, 
-    WebsiteSourceConfig, 
+import {
+    Config,
+    SourceConfig,
+    GithubSourceConfig,
+    WebsiteSourceConfig,
     LocalDirectorySourceConfig,
     CodeSourceConfig,
     ZendeskSourceConfig,
+    S3SourceConfig,
     DatabaseConnection,
     DocumentChunk,
     BrokenLink,
     EmbeddingConfig,
     MarkdownStoreConfig
 } from './types';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { MarkdownStore } from './markdown-store';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
@@ -191,6 +193,8 @@ export class Doc2Vec {
                 await this.processCodeSource(sourceConfig, sourceLogger);
             } else if (sourceConfig.type === 'zendesk') {
                 await this.processZendesk(sourceConfig, sourceLogger);
+            } else if (sourceConfig.type === 's3') {
+                await this.processS3(sourceConfig, sourceLogger);
             } else {
                 sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
             }
@@ -210,7 +214,9 @@ export class Doc2Vec {
         
         // Initialize metadata storage if needed
         await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
-        
+        // Capture timestamp at the start so issues updated during sync are re-processed next run
+        const syncStartDate = new Date().toISOString();
+
         // Get the last run date from the database
         const startDate = sourceConfig.start_date || '2025-01-01';
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, repo, `${startDate}T00:00:00Z`, logger);
@@ -428,7 +434,7 @@ export class Doc2Vec {
         }
 
         // Update the last run date in the database after processing all issues
-        await DatabaseManager.updateLastRunDate(dbConnection, repo, logger, this.embeddingDimension);
+        await DatabaseManager.updateLastRunDate(dbConnection, repo, logger, this.embeddingDimension, syncStartDate);
         
         logger.info(`Successfully processed ${issues.length} issues`);
     }
@@ -699,6 +705,200 @@ export class Doc2Vec {
         }
         
         logger.info(`Finished processing local directory: ${config.path}`);
+    }
+
+    private async processS3(config: S3SourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for S3 bucket: ${config.bucket}${config.prefix ? ` (prefix: ${config.prefix})` : ''}`);
+
+        const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
+        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+        const processedFiles: Set<string> = new Set();
+        // Capture timestamp at the start so objects modified during sync are re-processed next run
+        const syncStartTimestamp = Date.now();
+
+        const s3Client = new S3Client({
+            region: config.region || process.env.AWS_DEFAULT_REGION || 'us-east-1',
+            ...(config.endpoint ? { endpoint: config.endpoint, forcePathStyle: true } : {})
+        });
+
+        // Metadata keys for incremental sync
+        const sanitizedPrefix = (config.prefix || '').replace(/[^a-zA-Z0-9]+/g, '_');
+        const bucketKey = `${config.bucket}_${sanitizedPrefix}`;
+        const lastSyncKey = `s3_last_sync_${bucketKey}`;
+        const fileListKey = `s3_filelist_${bucketKey}`;
+
+        const lastSyncValue = await DatabaseManager.getMetadataValue(dbConnection, lastSyncKey, '0', logger);
+        const lastSyncTimestamp = parseInt(lastSyncValue || '0', 10);
+
+        const includeExtensions = config.include_extensions || ['.md', '.txt', '.html', '.htm', '.pdf', '.doc', '.docx'];
+        const excludeExtensions = config.exclude_extensions || [];
+        const encoding = config.encoding || 'utf8' as BufferEncoding;
+
+        // List all matching objects
+        logger.section('S3 OBJECT LISTING');
+        const allObjects: Array<{ key: string; lastModified: Date; size: number }> = [];
+        let continuationToken: string | undefined;
+
+        do {
+            const response = await s3Client.send(new ListObjectsV2Command({
+                Bucket: config.bucket,
+                Prefix: config.prefix || undefined,
+                ContinuationToken: continuationToken,
+            }));
+
+            for (const obj of response.Contents || []) {
+                if (!obj.Key || obj.Key.endsWith('/')) continue; // skip folder markers
+
+                const extension = path.extname(obj.Key).toLowerCase();
+
+                if (excludeExtensions.includes(extension)) continue;
+                if (includeExtensions.length > 0 && !includeExtensions.includes(extension)) continue;
+
+                allObjects.push({
+                    key: obj.Key,
+                    lastModified: obj.LastModified!,
+                    size: obj.Size || 0,
+                });
+            }
+
+            continuationToken = response.NextContinuationToken;
+        } while (continuationToken);
+
+        logger.info(`Found ${allObjects.length} matching objects in S3 bucket`);
+
+        // Process objects
+        logger.section('S3 FILE PROCESSING AND EMBEDDING');
+        let processedCount = 0;
+        let skippedCount = 0;
+
+        for (const obj of allObjects) {
+            processedFiles.add(obj.key);
+
+            // Incremental check: skip if object hasn't been modified since last sync
+            if (lastSyncTimestamp > 0 && obj.lastModified.getTime() <= lastSyncTimestamp) {
+                logger.debug(`Skipping unchanged object: ${obj.key}`);
+                skippedCount++;
+                continue;
+            }
+
+            // Size check
+            if (obj.size > config.max_size) {
+                logger.warn(`Object ${obj.key} (${obj.size} bytes) exceeds max_size (${config.max_size}). Skipping.`);
+                skippedCount++;
+                continue;
+            }
+
+            logger.info(`Processing S3 object: ${obj.key} (${obj.size} bytes)`);
+
+            try {
+                const getResponse = await s3Client.send(new GetObjectCommand({
+                    Bucket: config.bucket,
+                    Key: obj.key,
+                }));
+
+                const extension = path.extname(obj.key).toLowerCase();
+                let content: string;
+
+                const binaryExtensions = ['.pdf', '.doc', '.docx'];
+                if (binaryExtensions.includes(extension)) {
+                    // Binary files: write to temp file and convert
+                    const bodyBytes = await getResponse.Body!.transformToByteArray();
+                    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 's3-doc2vec-'));
+                    const tempFilePath = path.join(tempDir, path.basename(obj.key));
+                    try {
+                        fs.writeFileSync(tempFilePath, Buffer.from(bodyBytes));
+                        content = await this.contentProcessor.convertFileToMarkdown(tempFilePath, extension, logger);
+                    } finally {
+                        // Cleanup temp files
+                        try { fs.unlinkSync(tempFilePath); } catch {}
+                        try { fs.rmdirSync(tempDir); } catch {}
+                    }
+                } else if (extension === '.html' || extension === '.htm') {
+                    // HTML files: write to temp, convert via contentProcessor
+                    const bodyString = await getResponse.Body!.transformToString(encoding);
+                    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 's3-doc2vec-'));
+                    const tempFilePath = path.join(tempDir, path.basename(obj.key));
+                    try {
+                        fs.writeFileSync(tempFilePath, bodyString, { encoding });
+                        content = await this.contentProcessor.convertFileToMarkdown(tempFilePath, extension, logger);
+                    } finally {
+                        try { fs.unlinkSync(tempFilePath); } catch {}
+                        try { fs.rmdirSync(tempDir); } catch {}
+                    }
+                } else {
+                    // Text files: read directly as string
+                    content = await getResponse.Body!.transformToString(encoding);
+                }
+
+                if (content.length > config.max_size) {
+                    logger.warn(`Processed content for ${obj.key} (${content.length} chars) exceeds max_size. Skipping.`);
+                    skippedCount++;
+                    continue;
+                }
+
+                // Generate URL
+                let fileUrl: string;
+                if (config.url_rewrite_prefix) {
+                    const prefix = config.url_rewrite_prefix.endsWith('/')
+                        ? config.url_rewrite_prefix.slice(0, -1)
+                        : config.url_rewrite_prefix;
+                    const relativePath = config.prefix
+                        ? obj.key.substring(config.prefix.length).replace(/^\//, '')
+                        : obj.key;
+                    fileUrl = `${prefix}/${relativePath}`;
+                } else {
+                    fileUrl = `s3://${config.bucket}/${obj.key}`;
+                }
+
+                const chunks = await this.contentProcessor.chunkMarkdown(content, config, fileUrl);
+                logger.info(`Created ${chunks.length} chunks for ${obj.key}`);
+
+                await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
+                processedCount++;
+            } catch (error) {
+                logger.error(`Error processing S3 object ${obj.key}:`, error);
+            }
+        }
+
+        logger.info(`Processed: ${processedCount}, Skipped: ${skippedCount}`);
+
+        // Cleanup: remove chunks for deleted objects
+        logger.section('CLEANUP');
+        const previousListValue = await DatabaseManager.getMetadataValue(dbConnection, fileListKey, '[]', logger);
+        const previousList: string[] = previousListValue ? JSON.parse(previousListValue) : [];
+        const deletedKeys = previousList.filter(key => !processedFiles.has(key));
+
+        if (deletedKeys.length > 0) {
+            logger.info(`Removing chunks for ${deletedKeys.length} deleted objects`);
+            for (const deletedKey of deletedKeys) {
+                let fileUrl: string;
+                if (config.url_rewrite_prefix) {
+                    const prefix = config.url_rewrite_prefix.endsWith('/')
+                        ? config.url_rewrite_prefix.slice(0, -1)
+                        : config.url_rewrite_prefix;
+                    const relativePath = config.prefix
+                        ? deletedKey.substring(config.prefix.length).replace(/^\//, '')
+                        : deletedKey;
+                    fileUrl = `${prefix}/${relativePath}`;
+                } else {
+                    fileUrl = `s3://${config.bucket}/${deletedKey}`;
+                }
+
+                if (dbConnection.type === 'sqlite') {
+                    DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, fileUrl, logger);
+                } else if (dbConnection.type === 'qdrant') {
+                    await DatabaseManager.removeChunksByUrlQdrant(dbConnection, fileUrl, logger);
+                }
+            }
+        }
+
+        // Persist sync state
+        const currentKeys = Array.from(processedFiles);
+        await DatabaseManager.setMetadataValue(dbConnection, fileListKey, JSON.stringify(currentKeys), logger, this.embeddingDimension);
+        await DatabaseManager.setMetadataValue(dbConnection, lastSyncKey, `${syncStartTimestamp}`, logger, this.embeddingDimension);
+
+        logger.info(`Finished processing S3 bucket: ${config.bucket}`);
     }
 
     private async processCodeSource(config: CodeSourceConfig, parentLogger: Logger): Promise<void> {
@@ -1092,7 +1292,9 @@ export class Doc2Vec {
     private async fetchAndProcessZendeskTickets(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
         const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2`;
         const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
-        
+        // Capture timestamp at the start so tickets updated during sync are re-processed next run
+        const syncStartDate = new Date().toISOString();
+
         // Get the last run date from the database
         const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, `${startDate}T00:00:00Z`, logger);
@@ -1274,8 +1476,8 @@ export class Doc2Vec {
         }
 
         // Update the last run date in the database
-        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger, this.embeddingDimension);
-        
+        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger, this.embeddingDimension, syncStartDate);
+
         logger.info(`Successfully processed ${totalTickets} tickets`);
     }
 
