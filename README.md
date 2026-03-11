@@ -229,6 +229,8 @@ Configuration is managed through two files:
         *   `encoding`: (Optional) Text file encoding (defaults to `'utf8'`). Does not apply to binary files (PDF, DOC, DOCX).
         *   `url_rewrite_prefix`: (Optional) URL prefix to rewrite `s3://` URLs (e.g., `'https://docs.example.com'`).
 
+        **S3 user metadata resolution:** The `product_name` and `version` fields support a `metadata(...)` syntax to dynamically resolve values from S3 object user metadata. For example, `product_name: 'metadata(x-amz-meta-product-name)'` will set `product_name` to the value of the `x-amz-meta-product-name` user metadata on each S3 object. If the metadata key doesn't exist on an object, an empty string is used. Literal values (without the `metadata(...)` wrapper) work as before.
+
         Authentication uses the AWS SDK default credential chain: environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, IAM roles, etc.
 
         Incremental sync tracks object `LastModified` timestamps so only new or updated objects are processed on subsequent runs. Deleted objects are automatically cleaned up.
@@ -365,7 +367,7 @@ Configuration is managed through two files:
       
       # S3 bucket source example
       - type: 's3'
-        product_name: 'my-docs'
+        product_name: 'metadata(x-amz-meta-product-name)'
         version: 'latest'
         bucket: 'my-documentation-bucket'
         prefix: 'docs/v2/'

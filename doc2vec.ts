@@ -851,7 +851,15 @@ export class Doc2Vec {
                     fileUrl = `s3://${config.bucket}/${obj.key}`;
                 }
 
-                const chunks = await this.contentProcessor.chunkMarkdown(content, config, fileUrl);
+                // Resolve metadata(...) references in product_name and version
+                const s3Meta = getResponse.Metadata || {};
+                const resolvedConfig = {
+                    ...config,
+                    product_name: this.resolveS3MetadataValue(config.product_name, s3Meta),
+                    version: this.resolveS3MetadataValue(config.version, s3Meta),
+                };
+
+                const chunks = await this.contentProcessor.chunkMarkdown(content, resolvedConfig, fileUrl);
                 logger.info(`Created ${chunks.length} chunks for ${obj.key}`);
 
                 await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
@@ -899,6 +907,21 @@ export class Doc2Vec {
         await DatabaseManager.setMetadataValue(dbConnection, lastSyncKey, `${syncStartTimestamp}`, logger, this.embeddingDimension);
 
         logger.info(`Finished processing S3 bucket: ${config.bucket}`);
+    }
+
+    /**
+     * Resolves a config value that may use the metadata(...) syntax.
+     * e.g. "metadata(x-amz-meta-product-name)" looks up "product-name" in the S3 object's user metadata.
+     * Returns the original value if no metadata(...) pattern is found.
+     * Returns empty string if the referenced metadata key doesn't exist on the object.
+     */
+    private resolveS3MetadataValue(configValue: string, s3Metadata: Record<string, string>): string {
+        const match = configValue.match(/^metadata\((.+)\)$/);
+        if (!match) return configValue;
+        const metaKey = match[1];
+        // AWS SDK returns user metadata keys without the x-amz-meta- prefix
+        const lookupKey = metaKey.replace(/^x-amz-meta-/, '');
+        return s3Metadata[lookupKey] ?? '';
     }
 
     private async processCodeSource(config: CodeSourceConfig, parentLogger: Logger): Promise<void> {
