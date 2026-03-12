@@ -1726,7 +1726,7 @@ export class Doc2Vec {
             const response = await this.openai.embeddings.create({
                 model: this.embeddingModel,
                 input: safeTexts,
-            });
+            }, { timeout: 60000 });
             logger.debug(`Successfully created ${response.data.length} embeddings`);
             return response.data.map(d => d.embedding);
         } catch (error) {
@@ -1743,5 +1743,7 @@ if (require.main === module) {
         process.exit(1);
     }
     const doc2Vec = new Doc2Vec(configPath);
-    doc2Vec.run().catch(console.error);
+    doc2Vec.run()
+        .then(() => process.exit(0))
+        .catch((err) => { console.error(err); process.exit(1); });
 } 

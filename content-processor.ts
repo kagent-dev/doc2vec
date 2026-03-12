@@ -1935,7 +1935,12 @@ export class ContentProcessor {
         if (lang) {
             try {
                 const codeChunker = await this.getCodeChunker(lang, sourceConfig.chunk_size);
-                chunks = await codeChunker.chunk(code);
+                chunks = await Promise.race([
+                    codeChunker.chunk(code),
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error(`CodeChunker timed out after 30s for ${normalizedPath || url}`)), 30000)
+                    )
+                ]);
             } catch (error) {
                 logger.warn(`CodeChunker failed for ${normalizedPath || url}, falling back to token chunking:`, error);
                 const chunker = await this.getTokenChunker(sourceConfig.chunk_size);
