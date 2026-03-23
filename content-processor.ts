@@ -1997,9 +1997,9 @@ export class ContentProcessor {
     async chunkMarkdown(markdown: string, sourceConfig: SourceConfig, url: string): Promise<DocumentChunk[]> {
         const logger = this.logger.child('chunker');
         
-        // --- Configuration ---
-        const MAX_TOKENS = 1000;
-        const MIN_TOKENS = 150;      // 💡 Merges "OpenAI-compatible" sentence into the next block
+        // --- Configuration (character-based, ~4 chars ≈ 1 token) ---
+        const MAX_CHARS = 4000;
+        const MIN_CHARS = 600;       // 💡 Merges short sections into the next block
         const OVERLAP_PERCENT = 0.1; // 10% overlap for large splits
         
         const chunks: DocumentChunk[] = [];
@@ -2071,39 +2071,37 @@ export class ContentProcessor {
     
         /**
          * Flushes the current buffer into the chunks array.
-         * Uses sub-splitting logic if the buffer exceeds MAX_TOKENS.
+         * Uses sub-splitting logic if the buffer exceeds MAX_CHARS.
          */
         const flushBuffer = (force = false) => {
             const trimmedBuffer = buffer.trim();
             if (!trimmedBuffer) return;
-    
-            const tokenCount = Utils.tokenize(trimmedBuffer).length;
-    
+
+            const charCount = trimmedBuffer.length;
+
             // 💡 SEMANTIC MERGING
             // If the current section is too short (like just a title or a one-liner),
             // we don't flush yet unless it's the end of the file (force=true).
-            if (tokenCount < MIN_TOKENS && !force) {
-                return; 
+            if (charCount < MIN_CHARS && !force) {
+                return;
             }
-    
+
             // Compute the appropriate topic hierarchy for merged content
             const topicHierarchy = computeTopicHierarchy();
-    
-            if (tokenCount > MAX_TOKENS) {
-                // 💡 RECURSIVE OVERLAP SPLITTING
+
+            if (charCount > MAX_CHARS) {
+                // 💡 OVERLAP SPLITTING
                 // If the section is a massive guide, split it but keep headers on every sub-piece.
-                const tokens = Utils.tokenize(trimmedBuffer);
-                const overlapSize = Math.floor(MAX_TOKENS * OVERLAP_PERCENT);
-                
-                for (let i = 0; i < tokens.length; i += (MAX_TOKENS - overlapSize)) {
-                    const subTokens = tokens.slice(i, i + MAX_TOKENS);
-                    const subContent = subTokens.join("");
+                const overlapSize = Math.floor(MAX_CHARS * OVERLAP_PERCENT);
+
+                for (let i = 0; i < trimmedBuffer.length; i += (MAX_CHARS - overlapSize)) {
+                    const subContent = trimmedBuffer.slice(i, i + MAX_CHARS);
                     chunks.push(createDocumentChunk(subContent, topicHierarchy));
                 }
             } else {
                 chunks.push(createDocumentChunk(trimmedBuffer, topicHierarchy));
             }
-            
+
             buffer = ""; // Reset buffer after successful flush
             bufferHeadings = []; // Reset tracked headings
         };
@@ -2124,9 +2122,9 @@ export class ContentProcessor {
                     .trim();
                 
                 // Check if we should merge with previous content
-                const currentTokenCount = Utils.tokenize(buffer.trim()).length;
-                const hasBufferContent = currentTokenCount > 0;
-                const bufferIsSmall = currentTokenCount < MIN_TOKENS;
+                const currentCharCount = buffer.trim().length;
+                const hasBufferContent = currentCharCount > 0;
+                const bufferIsSmall = currentCharCount < MIN_CHARS;
                 
                 // Only merge if:
                 // 1. Buffer has content and is small
@@ -2157,7 +2155,7 @@ export class ContentProcessor {
                 buffer += `${line}\n`;
                 
                 // Safety valve: if a single section is huge, flush it periodically
-                if (Utils.tokenize(buffer).length >= MAX_TOKENS) {
+                if (buffer.length >= MAX_CHARS) {
                     flushBuffer();
                 }
             }

@@ -651,7 +651,7 @@ sources:
             expect(mockEmbeddingsCreate).toHaveBeenCalledWith({
                 model: 'text-embedding-3-large',
                 input: ['test text'],
-            });
+            }, { timeout: 60000 });
         });
 
         it('should return multiple embeddings for multiple texts', async () => {
@@ -1369,7 +1369,8 @@ sources:
             await (instance as any).createEmbeddings(['hello']);
 
             expect(mockCreate).toHaveBeenCalledWith(
-                expect.objectContaining({ model: 'text-embedding-3-large' })
+                expect.objectContaining({ model: 'text-embedding-3-large' }),
+                { timeout: 60000 }
             );
         });
     });
