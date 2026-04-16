@@ -218,6 +218,7 @@ Configuration is managed through two files:
         *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
         *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved']`).
         *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
+        *   `excluded_organizations`: (Optional) An array of Zendesk organization names whose tickets should be skipped. The sync will abort if any name cannot be resolved.
 
         For S3 buckets (`type: 's3'`):
         *   `bucket`: The S3 bucket name.
@@ -359,6 +360,7 @@ Configuration is managed through two files:
         start_date: '2025-01-01'
         ticket_status: ['open', 'pending']
         ticket_priority: ['high']
+        excluded_organizations: ['Acme Corp', 'Internal Testing']
         max_size: 1048576
         database_config:
           type: 'sqlite'
