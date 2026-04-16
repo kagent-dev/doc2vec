@@ -1326,6 +1326,9 @@ export class Doc2Vec {
         // transitioning to closed get updated rather than left stale)
         const statusFilter = new Set(config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved', 'closed']);
 
+        const excludedOrgNames = new Set((config.excluded_organizations || []).map(n => n.toLowerCase()));
+        const excludedOrgIds = new Set<number>();
+
         const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
@@ -1409,6 +1412,12 @@ export class Doc2Vec {
                 return;
             }
 
+            // Skip tickets belonging to excluded organizations
+            if (ticket.organization_id && excludedOrgIds.has(ticket.organization_id)) {
+                logger.debug(`Ticket #${ticketId} belongs to excluded organization ${ticket.organization_id} — skipping`);
+                return;
+            }
+
             // Skip tickets whose status is outside the configured filter
             if (!statusFilter.has(ticket.status)) {
                 logger.debug(`Ticket #${ticketId} has status '${ticket.status}' outside configured filter — skipping`);
@@ -1440,6 +1449,28 @@ export class Doc2Vec {
             // so stale chunks from previous versions are never left behind.
             await this.processChunksForUrl(chunks, url, dbConnection, logger);
         };
+
+        if (excludedOrgNames.size > 0) {
+            logger.info(`Resolving ${excludedOrgNames.size} excluded organization name(s) to IDs`);
+            const resolvedNames = new Set<string>();
+            let orgsUrl: string | null = `${baseUrl}/organizations.json?page[size]=100`;
+            while (orgsUrl) {
+                const orgsData: any = await fetchWithRetry(orgsUrl);
+                for (const org of orgsData?.organizations || []) {
+                    const orgName = (org.name || '').toLowerCase();
+                    if (excludedOrgNames.has(orgName)) {
+                        excludedOrgIds.add(org.id);
+                        resolvedNames.add(orgName);
+                    }
+                }
+                orgsUrl = orgsData?.meta?.has_more ? orgsData?.links?.next : null;
+            }
+            logger.info(`Excluding tickets from ${excludedOrgIds.size} organization(s): ${[...excludedOrgIds].join(', ')}`);
+            const unresolved = [...excludedOrgNames].filter(name => !resolvedNames.has(name));
+            if (unresolved.length > 0) {
+                throw new Error(`Cannot resolve excluded organization(s): ${unresolved.join(', ')}. Aborting to avoid syncing data for them.`);
+            }
+        }
 
         logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
 

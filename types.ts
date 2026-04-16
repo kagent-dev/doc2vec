@@ -44,6 +44,7 @@ export interface ZendeskSourceConfig extends BaseSourceConfig {
     start_date?: string;           // For incremental updates (default: start of current year)
     ticket_status?: string[];      // Filter tickets by status (default: ['new', 'open', 'pending', 'hold', 'solved'])
     ticket_priority?: string[];    // Filter tickets by priority (default: all)
+    excluded_organizations?: string[]; // Organization names whose tickets should be skipped
 }
 
 // Configuration specific to code sources (local directory or GitHub repo)
