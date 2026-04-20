@@ -1476,19 +1476,15 @@ export class Doc2Vec {
 
         // Build query parameters — use the status filter for the search query
         const statusList = Array.from(statusFilter);
-        const query = `updated>${lastRunDate.split('T')[0]} status:${statusList.join(',status:')}`;
+        const statusClause = `status:${statusList.join(',status:')}`;
 
-        let nextPage: string | null = `${baseUrl}/search.json?query=${encodeURIComponent(query)}&sort_by=updated_at&sort_order=asc`;
+        // Zendesk /search.json caps results at 1000 (10 pages * 100). Bisect the date range
+        // into smaller windows whenever a window would exceed that cap, so we never hit page 11.
         let totalTickets = 0;
         let failedTickets = 0;
 
-        while (nextPage) {
-            const data = await fetchWithRetry(nextPage);
-            const tickets = data.results || [];
-
-            logger.info(`Processing batch of ${tickets.length} tickets`);
-
-            for (const ticket of tickets) {
+        const processResults = async (results: any[]) => {
+            for (const ticket of results) {
                 try {
                     await processTicket(ticket);
                     totalTickets++;
@@ -1497,13 +1493,44 @@ export class Doc2Vec {
                     logger.error(`Failed to process ticket #${ticket.id}, will retry next run: ${error.message}`);
                 }
             }
+        };
 
-            nextPage = data.next_page || null;
+        // Work queue of [start, end) date windows (ISO strings). Seed with [lastRunDate, syncStartDate).
+        const windows: Array<[string, string]> = [[lastRunDate, syncStartDate]];
+        const MAX_PER_WINDOW = 1000;
 
-            if (nextPage) {
+        while (windows.length > 0) {
+            const [wStart, wEnd] = windows.shift()!;
+            const q = `updated>${wStart} updated<${wEnd} ${statusClause}`;
+            const firstUrl = `${baseUrl}/search.json?query=${encodeURIComponent(q)}&sort_by=updated_at&sort_order=asc`;
+
+            logger.debug(`Searching window ${wStart} .. ${wEnd}`);
+            const firstData = await fetchWithRetry(firstUrl);
+            const count = firstData?.count ?? 0;
+
+            if (count > MAX_PER_WINDOW) {
+                const startMs = new Date(wStart).getTime();
+                const endMs = new Date(wEnd).getTime();
+                if (endMs - startMs <= 1000) {
+                    logger.warn(`Window ${wStart} .. ${wEnd} has ${count} tickets but is already ≤1s wide — processing first 1000 only, some may be missed`);
+                } else {
+                    const midIso = new Date(startMs + Math.floor((endMs - startMs) / 2)).toISOString();
+                    logger.debug(`Window has ${count} tickets (>${MAX_PER_WINDOW}) — bisecting at ${midIso}`);
+                    windows.unshift([wStart, midIso], [midIso, wEnd]);
+                    continue;
+                }
+            }
+
+            logger.info(`Processing window ${wStart}..${wEnd}: ${count} tickets`);
+            await processResults(firstData.results || []);
+
+            let nextPage: string | null = firstData.next_page || null;
+            while (nextPage) {
                 logger.debug(`Fetching next page: ${nextPage}`);
-                // Rate limiting: wait between requests
                 await new Promise(res => setTimeout(res, 1000));
+                const data = await fetchWithRetry(nextPage);
+                await processResults(data.results || []);
+                nextPage = data.next_page || null;
             }
         }
 
