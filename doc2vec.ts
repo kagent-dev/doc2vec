@@ -89,15 +89,19 @@ export class Doc2Vec {
         } else {
             const openaiApiKey = embeddingConfig.openai?.api_key || process.env.OPENAI_API_KEY;
             const openaiModel = embeddingConfig.openai?.model || process.env.OPENAI_MODEL || 'text-embedding-3-large';
-            
+            const openaiBaseURL = embeddingConfig.openai?.base_url || process.env.OPENAI_BASE_URL;
+
             if (!openaiApiKey) {
                 this.logger.error('OpenAI requires api_key to be configured');
                 process.exit(1);
             }
-            
-            this.openai = new OpenAI({ apiKey: openaiApiKey });
+
+            this.openai = new OpenAI({
+                apiKey: openaiApiKey,
+                ...(openaiBaseURL && { baseURL: openaiBaseURL }),
+            });
             this.embeddingModel = openaiModel;
-            this.logger.info(`Using OpenAI with model: ${openaiModel} (${this.embeddingDimension} dimensions)`);
+            this.logger.info(`Using OpenAI with model: ${openaiModel} (${this.embeddingDimension} dimensions)${openaiBaseURL ? ` via ${openaiBaseURL}` : ''}`);
         }
         
         this.contentProcessor = new ContentProcessor(this.logger);

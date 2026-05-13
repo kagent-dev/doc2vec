@@ -98,8 +98,9 @@ export interface EmbeddingConfig {
     provider: 'openai' | 'azure';
     dimension?: number;
     openai?: {
-        api_key?: string;  // Can also use OPENAI_API_KEY env var
-        model?: string;    // Default: text-embedding-3-large
+        api_key?: string;   // Can also use OPENAI_API_KEY env var
+        model?: string;     // Default: text-embedding-3-large
+        base_url?: string;  // Override OpenAI API base URL — useful for Ollama or other OpenAI-compatible endpoints. Can also use OPENAI_BASE_URL env var.
     };
     azure?: {
         api_key?: string;        // Can also use AZURE_OPENAI_KEY env var
