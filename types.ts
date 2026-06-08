@@ -45,6 +45,7 @@ export interface ZendeskSourceConfig extends BaseSourceConfig {
     ticket_status?: string[];      // Filter tickets by status (default: ['new', 'open', 'pending', 'hold', 'solved'])
     ticket_priority?: string[];    // Filter tickets by priority (default: all)
     excluded_organizations?: string[]; // Organization names whose tickets should be skipped
+    include_internal_comments?: boolean; // Include non-public (internal/agent-only) comments (default: false)
 }
 
 // Configuration specific to code sources (local directory or GitHub repo)

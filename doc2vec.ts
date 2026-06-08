@@ -1380,15 +1380,19 @@ export class Doc2Vec {
             if (comments && comments.length > 0) {
                 md += `## Comments\n\n`;
                 for (const comment of comments) {
-                    if (comment.public) {
-                        md += `### ${comment.author_id} - ${new Date(comment.created_at).toDateString()}\n\n`;
-                        
-                        // Handle comment body
-                        const rawBody = comment.plain_body || comment.html_body || comment.body || '';
-                        const commentBody = rawBody.replace(/&nbsp;/g, " ") || '_No content._';
-                        
-                        md += `${commentBody}\n\n---\n\n`;
+                    // Skip non-public comments unless internal comments are explicitly enabled
+                    if (!comment.public && !config.include_internal_comments) {
+                        continue;
                     }
+
+                    const visibility = comment.public ? '' : ' (internal)';
+                    md += `### ${comment.author_id} - ${new Date(comment.created_at).toDateString()}${visibility}\n\n`;
+
+                    // Handle comment body
+                    const rawBody = comment.plain_body || comment.html_body || comment.body || '';
+                    const commentBody = rawBody.replace(/&nbsp;/g, " ") || '_No content._';
+
+                    md += `${commentBody}\n\n---\n\n`;
                 }
             } else {
                 md += `## Comments\n\n_No comments._\n`;
@@ -1426,10 +1430,17 @@ export class Doc2Vec {
 
             logger.info(`Processing ticket #${ticketId}`);
 
-            // Fetch ticket comments
-            const commentsUrl = `${baseUrl}/tickets/${ticketId}/comments.json`;
-            const commentsData = await fetchWithRetry(commentsUrl);
-            const comments = commentsData?.comments || [];
+            // Fetch ticket comments. Zendesk returns at most 100 comments per page
+            // (ordered oldest-first), so follow next_page to capture the newest
+            // comments on tickets with more than 100 — otherwise they're silently dropped.
+            const comments: any[] = [];
+            let commentsUrl: string | null = `${baseUrl}/tickets/${ticketId}/comments.json`;
+            while (commentsUrl) {
+                const commentsData: any = await fetchWithRetry(commentsUrl);
+                comments.push(...(commentsData?.comments || []));
+                commentsUrl = commentsData?.next_page || null;
+                if (commentsUrl) await new Promise(res => setTimeout(res, 1000));
+            }
 
             // Generate markdown for the ticket
             const markdown = generateMarkdownForTicket(ticket, comments);
