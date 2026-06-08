@@ -32,6 +32,12 @@ RUN apt-get update && apt-get install -y \
 
 COPY package*.json ./
 RUN npm install --ignore-scripts
+# --ignore-scripts skips node-gyp rebuild for native modules
+# (security best-practice, blocks malicious postinstall scripts).
+# Explicitly rebuild better-sqlite3 so its arm64/amd64 .node binding
+# is compiled — otherwise the runtime fails with "Could not locate
+# the bindings file" on architectures lacking a prebuild.
+RUN npm rebuild better-sqlite3
 # Install Chrome via Puppeteer as fallback (system Chromium will be used first)
 RUN npx puppeteer browsers install chrome || true
 COPY . .

@@ -151,6 +151,16 @@ Configuration is managed through two files:
     OPENAI_API_KEY="sk-..."
     OPENAI_MODEL="text-embedding-3-large"  # Optional, defaults to text-embedding-3-large
 
+    # Optional: Override the OpenAI API base URL. Useful for pointing the
+    # OpenAI SDK at an OpenAI-compatible endpoint such as Ollama, LM Studio,
+    # llama.cpp, vLLM, or a proxy gateway. When unset, the SDK uses the
+    # default OpenAI endpoint. Equivalent to the `embedding.openai.base_url`
+    # field in config.yaml; the env var wins if both are set.
+    # Example values:
+    #   OPENAI_BASE_URL="http://localhost:11434/v1"        # Ollama
+    #   OPENAI_BASE_URL="https://gateway.example.com/v1"   # proxy / gateway
+    OPENAI_BASE_URL="http://localhost:11434/v1"
+
     # Optional: Embedding dimension size (defaults to 3072)
     EMBEDDING_DIMENSION="3072"
 
@@ -277,6 +287,7 @@ Configuration is managed through two files:
       openai:
         api_key: '${OPENAI_API_KEY}'  # Optional, uses env var by default
         model: 'text-embedding-3-large'  # Optional, defaults to text-embedding-3-large
+        # base_url: 'http://localhost:11434/v1'  # Optional, override OpenAI API base URL for Ollama / other OpenAI-compatible endpoints. Falls back to OPENAI_BASE_URL env var.
       # For Azure OpenAI, use this instead:
       # azure:
       #   api_key: '${AZURE_OPENAI_KEY}'
