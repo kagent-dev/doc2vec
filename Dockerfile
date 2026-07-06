@@ -70,6 +70,3 @@ COPY --from=builder --chown=doc2vec:doc2vec /app/dist ./dist
 COPY --from=builder --chown=doc2vec:doc2vec /app/README.md /app/LICENSE /app/config.yaml ./
 
 USER doc2vec
-
-# Install Chrome via Puppeteer as fallback. System Chromium is used first.
-RUN npx puppeteer browsers install chrome || true
