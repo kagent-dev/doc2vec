@@ -818,44 +818,54 @@ export class DatabaseManager {
             }
             
             logger.debug(`Checking for obsolete chunks with URL prefix: ${urlPrefix}`);
-            const response = await client.scroll(collectionName, {
-                limit: 10000,
-                with_payload: true,
-                with_vector: false,
-                filter: {
-                    must: [
-                        {
-                            key: "url",
-                            match: {
-                                text: urlPrefix
-                            }
+
+            // Scroll through ALL matching points via next_page_offset. A single
+            // capped scroll would only examine the first page, so obsolete
+            // chunks beyond it (in collections larger than the page limit) would
+            // never be removed.
+            const filter = {
+                must: [
+                    {
+                        key: "url",
+                        match: {
+                            text: urlPrefix
                         }
-                    ],
-                    must_not: [
-                        {
-                            key: "is_metadata",
-                            match: {
-                                value: true
-                            }
+                    }
+                ],
+                must_not: [
+                    {
+                        key: "is_metadata",
+                        match: {
+                            value: true
                         }
-                    ]
-                }
-            });
-            
-            const obsoletePointIds = response.points
-                .filter((point: any) => {
+                    }
+                ]
+            };
+
+            const obsoletePointIds: any[] = [];
+            let offset: any = undefined;
+            do {
+                const response = await client.scroll(collectionName, {
+                    limit: 1000,
+                    offset,
+                    with_payload: true,
+                    with_vector: false,
+                    filter
+                });
+
+                for (const point of response.points) {
                     const url = point.payload?.url;
                     // Double check it's not a metadata record
                     if (point.payload?.is_metadata === true) {
-                        return false;
+                        continue;
                     }
-                    
+
                     if (!url || !url.startsWith(urlPrefix)) {
-                        return false;
+                        continue;
                     }
-                    
+
                     let filePath: string;
-                    
+
                     if (isRewriteMode) {
                         // URL rewrite mode: extract relative path and construct full file path
                         const config = pathConfig as { path: string; url_rewrite_prefix?: string };
@@ -865,11 +875,15 @@ export class DatabaseManager {
                         // Direct file path mode: remove file:// prefix to match with processedFiles
                         filePath = url.startsWith('file://') ? url.substring(7) : '';
                     }
-                    
-                    return filePath && !processedFiles.has(filePath);
-                })
-                .map((point: any) => point.id);
-            
+
+                    if (filePath && !processedFiles.has(filePath)) {
+                        obsoletePointIds.push(point.id);
+                    }
+                }
+
+                offset = response.next_page_offset;
+            } while (offset !== null && offset !== undefined);
+
             if (obsoletePointIds.length > 0) {
                 await client.delete(collectionName, {
                     points: obsoletePointIds,

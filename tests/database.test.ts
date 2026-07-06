@@ -1230,6 +1230,43 @@ describe('DatabaseManager', () => {
             expect(deleteCall[1].points).not.toContain('p1');
         });
 
+        it('should paginate through all scroll pages when finding obsolete files', async () => {
+            const mockClient = {
+                scroll: vi.fn()
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p1', payload: { url: 'file:///project/src/a.ts', is_metadata: false } },
+                            { id: 'p2', payload: { url: 'file:///project/src/deleted1.ts', is_metadata: false } },
+                        ],
+                        next_page_offset: 'cursor-2',
+                    })
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p3', payload: { url: 'file:///project/src/deleted2.ts', is_metadata: false } },
+                        ],
+                        next_page_offset: null,
+                    }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, processedFiles, '/project/src', testLogger);
+
+            expect(mockClient.scroll).toHaveBeenCalledTimes(2);
+            expect(mockClient.scroll.mock.calls[1][1].offset).toBe('cursor-2');
+
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleted = mockClient.delete.mock.calls[0][1].points;
+            expect(deleted).toContain('p2');
+            expect(deleted).toContain('p3');
+            expect(deleted).not.toContain('p1');
+        });
+
         it('should delete obsolete file chunks in URL rewrite mode', async () => {
             const mockClient = {
                 scroll: vi.fn().mockResolvedValue({
