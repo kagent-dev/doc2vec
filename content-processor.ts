@@ -609,6 +609,11 @@ export class ContentProcessor {
                             logger.debug(`HEAD returned ${headStatus} for ${url}, skipping`);
                             if (headStatus === 404) {
                                 notFoundUrls.add(url);
+                                // The URL was optimistically added to visitedUrls when
+                                // dequeued (before we knew it was dead). Remove it so the
+                                // obsolete-chunk cleanup treats it as gone and purges its
+                                // chunks — otherwise deleted pages linger forever.
+                                visitedUrls.delete(normalizedUrl);
                             }
                             skippedCount++;
                             continue;
@@ -768,6 +773,11 @@ export class ContentProcessor {
                     }
 
                     if (status === 404) {
+                        notFoundUrls.add(url);
+                        // The URL was optimistically added to visitedUrls when dequeued
+                        // (before this GET revealed it's a 404). Remove it so the
+                        // obsolete-chunk cleanup treats it as gone and purges its chunks.
+                        visitedUrls.delete(normalizedUrl);
                         const sources = referrers.get(url) ?? new Set([baseUrl]);
                         for (const source of sources) {
                             addBrokenLink(source, url);

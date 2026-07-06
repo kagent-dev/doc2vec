@@ -759,6 +759,51 @@ describe('DatabaseManager', () => {
             expect(deleteCall[1].points).not.toContain('p2');
         });
 
+        it('should paginate through all scroll pages when finding obsolete chunks', async () => {
+            // Qdrant caps a single scroll at its page limit and returns a
+            // next_page_offset to fetch the rest. removeObsoleteChunksQdrant
+            // must follow that cursor — otherwise large collections would only
+            // have their first page examined and obsolete chunks beyond it
+            // (e.g. a deleted page in a 20k+ chunk collection) would survive.
+            const mockClient = {
+                scroll: vi.fn()
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p1', payload: { url: 'https://example.com/old1', is_metadata: false } },
+                            { id: 'p2', payload: { url: 'https://example.com/current', is_metadata: false } },
+                        ],
+                        next_page_offset: 'cursor-2',
+                    })
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p3', payload: { url: 'https://example.com/old2', is_metadata: false } },
+                        ],
+                        next_page_offset: null,
+                    }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const visitedUrls = new Set(['https://example.com/current']);
+            await DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, visitedUrls, 'https://example.com', testLogger);
+
+            // Both pages must be scrolled, second call carrying the cursor
+            expect(mockClient.scroll).toHaveBeenCalledTimes(2);
+            expect(mockClient.scroll.mock.calls[1][1].offset).toBe('cursor-2');
+
+            // Obsolete points from BOTH pages deleted; the visited one retained
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleted = mockClient.delete.mock.calls[0][1].points;
+            expect(deleted).toContain('p1');
+            expect(deleted).toContain('p3');
+            expect(deleted).not.toContain('p2');
+        });
+
         it('should not delete metadata points from Qdrant', async () => {
             const mockClient = {
                 scroll: vi.fn().mockResolvedValue({

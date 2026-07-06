@@ -1247,6 +1247,31 @@ describe('ContentProcessor', () => {
             expect(processContent).not.toHaveBeenCalled();
         });
 
+        it('should remove a 404 URL from visitedUrls and record it in notFoundUrls', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 404'), {
+                    response: { status: 404 },
+                })
+            );
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // The dead URL must be recorded as not-found...
+            expect([...result.notFoundUrls].some(u => u.startsWith('https://example.com'))).toBe(true);
+            // ...and must NOT linger in visitedUrls. It was optimistically added
+            // when dequeued; leaving it there would make the obsolete-chunk
+            // cleanup treat the deleted page as still-live and never purge it.
+            expect(visited.size).toBe(0);
+        });
+
         it('should skip URL when HEAD returns 403', async () => {
             const axiosModule = await import('axios');
             vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
