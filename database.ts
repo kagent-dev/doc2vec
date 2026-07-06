@@ -512,41 +512,54 @@ export class DatabaseManager {
     static async removeObsoleteChunksQdrant(db: QdrantDB, visitedUrls: Set<string>, urlPrefix: string, logger: Logger) {
         const { client, collectionName } = db;
         try {
-            // Get all points that match the URL prefix but are not metadata points
-            const response = await client.scroll(collectionName, {
-                limit: 10000,
-                with_payload: true,
-                with_vector: false,
-                filter: {
-                    must: [
-                        {
-                            key: "url",
-                            match: {
-                                text: urlPrefix
-                            }
+            // Scroll through ALL points that match the URL prefix but are not
+            // metadata points. Qdrant caps a single scroll at its page limit, so
+            // we must paginate via next_page_offset — otherwise large collections
+            // (e.g. tens of thousands of chunks) would only have their first page
+            // examined and obsolete chunks beyond it would never be removed.
+            const filter = {
+                must: [
+                    {
+                        key: "url",
+                        match: {
+                            text: urlPrefix
                         }
-                    ],
-                    must_not: [
-                        {
-                            key: "is_metadata",
-                            match: {
-                                value: true
-                            }
+                    }
+                ],
+                must_not: [
+                    {
+                        key: "is_metadata",
+                        match: {
+                            value: true
                         }
-                    ]
-                }
-            });
+                    }
+                ]
+            };
 
-            const obsoletePointIds = response.points
-                .filter((point: any) => {
+            const obsoletePointIds: any[] = [];
+            let offset: any = undefined;
+            do {
+                const response = await client.scroll(collectionName, {
+                    limit: 1000,
+                    offset,
+                    with_payload: true,
+                    with_vector: false,
+                    filter
+                });
+
+                for (const point of response.points) {
                     const url = point.payload?.url;
                     // Double check it's not a metadata record
                     if (point.payload?.is_metadata === true) {
-                        return false;
+                        continue;
                     }
-                    return url && !visitedUrls.has(url);
-                })
-                .map((point: any) => point.id);
+                    if (url && !visitedUrls.has(url)) {
+                        obsoletePointIds.push(point.id);
+                    }
+                }
+
+                offset = response.next_page_offset;
+            } while (offset !== null && offset !== undefined);
 
             if (obsoletePointIds.length > 0) {
                 await client.delete(collectionName, {

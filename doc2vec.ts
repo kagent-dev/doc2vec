@@ -571,18 +571,34 @@ export class Doc2Vec {
 
         logger.section('CLEANUP');
 
-        // Remove 404 URLs from the Postgres markdown store
-        if (useMarkdownStore && crawlResult.notFoundUrls && crawlResult.notFoundUrls.size > 0) {
-            logger.info(`Removing ${crawlResult.notFoundUrls.size} not-found URLs from markdown store`);
+        // Remove URLs that returned 404 during the crawl. A 404 is a definitive
+        // "this page is gone" signal (network errors fall through to full
+        // processing and never land here), so we purge these unconditionally —
+        // even when hasNetworkErrors below skips the broad obsolete cleanup.
+        if (crawlResult.notFoundUrls && crawlResult.notFoundUrls.size > 0) {
+            logger.info(`Removing ${crawlResult.notFoundUrls.size} not-found (404) URLs`);
             for (const url of crawlResult.notFoundUrls) {
+                // Postgres markdown store
+                if (useMarkdownStore) {
+                    try {
+                        await this.markdownStore!.deleteMarkdown(url);
+                    } catch (pgError) {
+                        logger.error(`Failed to delete markdown from Postgres for ${url}:`, pgError);
+                    }
+                }
+                // Vector DB chunks
                 try {
-                    await this.markdownStore!.deleteMarkdown(url);
-                } catch (pgError) {
-                    logger.error(`Failed to delete markdown from Postgres for ${url}:`, pgError);
+                    if (dbConnection.type === 'sqlite') {
+                        DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                    } else if (dbConnection.type === 'qdrant') {
+                        await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                    }
+                } catch (dbError) {
+                    logger.error(`Failed to delete chunks for 404 URL ${url}:`, dbError);
                 }
             }
         }
-        
+
         if (crawlResult.hasNetworkErrors) {
             logger.warn('Skipping cleanup due to network errors encountered during crawling. This prevents removal of valid chunks when the site is temporarily unreachable.');
         } else {

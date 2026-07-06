@@ -74,6 +74,8 @@ vi.mock('../database', () => ({
         removeChunksByUrlQdrant: vi.fn().mockResolvedValue(undefined),
         getChunkHashesByUrlSQLite: vi.fn().mockReturnValue([]),
         getChunkHashesByUrlQdrant: vi.fn().mockResolvedValue([]),
+        getStoredUrlsByPrefixSQLite: vi.fn().mockReturnValue([]),
+        getStoredUrlsByPrefixQdrant: vi.fn().mockResolvedValue([]),
     },
 }));
 
@@ -741,6 +743,67 @@ sources:
             const configPath = writeTestConfig('run-routing.yaml', config);
             return new Doc2Vec(configPath);
         }
+
+        // ─── 404 cleanup during processWebsite ───────────────────────────
+        // A page that 404s during the crawl must have its chunks purged from
+        // the vector DB — not just the markdown store. Because a 404 is a
+        // definitive "gone" signal (network errors fall through to full
+        // processing and never reach notFoundUrls), the purge must run even
+        // when network errors cause the broad obsolete sweep to be skipped.
+        describe('404 cleanup', () => {
+            function makeLogger(): any {
+                const l: any = {
+                    info: vi.fn(), warn: vi.fn(), error: vi.fn(),
+                    debug: vi.fn(), section: vi.fn(),
+                };
+                l.child = vi.fn(() => makeLogger());
+                return l;
+            }
+
+            const websiteConfig = {
+                type: 'website',
+                product_name: 'TestSite',
+                version: '1.0',
+                max_size: 50000,
+                url: 'https://example.com',
+                database_config: { type: 'sqlite', params: { db_path: ':memory:' } },
+            };
+
+            it('should delete chunks for 404 URLs from the vector DB during cleanup', async () => {
+                const { DatabaseManager } = await import('../database');
+                instance = createInstanceWithSources([websiteConfig]);
+                (instance as any).contentProcessor.crawlWebsite = vi.fn().mockResolvedValue({
+                    hasNetworkErrors: false,
+                    brokenLinks: [],
+                    notFoundUrls: new Set(['https://example.com/gone']),
+                });
+
+                await (instance as any).processWebsite(websiteConfig, makeLogger());
+
+                expect(DatabaseManager.removeChunksByUrlSQLite).toHaveBeenCalledWith(
+                    expect.anything(), 'https://example.com/gone', expect.anything(),
+                );
+            });
+
+            it('should purge 404 URLs even when network errors skip the broad cleanup', async () => {
+                const { DatabaseManager } = await import('../database');
+                instance = createInstanceWithSources([websiteConfig]);
+                (instance as any).contentProcessor.crawlWebsite = vi.fn().mockResolvedValue({
+                    hasNetworkErrors: true,
+                    brokenLinks: [],
+                    notFoundUrls: new Set(['https://example.com/gone']),
+                });
+
+                await (instance as any).processWebsite(websiteConfig, makeLogger());
+
+                // 404 chunks are still purged (definitive signal)...
+                expect(DatabaseManager.removeChunksByUrlSQLite).toHaveBeenCalledWith(
+                    expect.anything(), 'https://example.com/gone', expect.anything(),
+                );
+                // ...but the broad obsolete sweep is skipped when the site was flaky
+                expect(DatabaseManager.removeObsoleteChunksSQLite).not.toHaveBeenCalled();
+            });
+        });
 
         it('should route website source to processWebsite', async () => {
             instance = createInstanceWithSources([{
