@@ -672,7 +672,7 @@ describe('DatabaseManager', () => {
             expect(pointId).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
         });
 
-        it('should handle upsert errors gracefully', async () => {
+        it('should propagate upsert errors so the job fails', async () => {
             const mockClient = {
                 upsert: vi.fn().mockRejectedValue(new Error('Connection refused')),
             };
@@ -685,8 +685,12 @@ describe('DatabaseManager', () => {
             const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
             const chunk = createTestChunk();
 
-            // Should not throw
-            await DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, createTestEmbedding());
+            // Must throw — a swallowed write error would let a sync report
+            // success while chunks silently fail to store (e.g. disk full).
+            await expect(
+                DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, createTestEmbedding())
+            ).rejects.toThrow('Connection refused');
+            expect(consoleSpy).toHaveBeenCalled();
 
             consoleSpy.mockRestore();
         });
@@ -1161,7 +1165,7 @@ describe('DatabaseManager', () => {
 
     // ─── removeObsoleteChunksQdrant - error handling ─────────────────
     describe('removeObsoleteChunksQdrant - error handling', () => {
-        it('should handle scroll error gracefully', async () => {
+        it('should propagate scroll errors so the job fails', async () => {
             const mockClient = {
                 scroll: vi.fn().mockRejectedValue(new Error('Scroll failed')),
             };
@@ -1171,14 +1175,17 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            // Should not throw
-            await DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, new Set(), 'https://example.com', testLogger);
+            // Must throw — a swallowed cleanup failure silently leaves orphans
+            // behind while the sync reports success.
+            await expect(
+                DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, new Set(), 'https://example.com', testLogger)
+            ).rejects.toThrow('Scroll failed');
         });
     });
 
     // ─── removeChunksByUrlQdrant - error handling ────────────────────
     describe('removeChunksByUrlQdrant - error handling', () => {
-        it('should handle delete error gracefully', async () => {
+        it('should propagate delete errors so the job fails', async () => {
             const mockClient = {
                 delete: vi.fn().mockRejectedValue(new Error('Delete failed')),
             };
@@ -1188,8 +1195,11 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            // Should not throw
-            await DatabaseManager.removeChunksByUrlQdrant(qdrantDb, 'https://example.com/page', testLogger);
+            // Must throw — a swallowed delete leaves stale chunks behind while
+            // the sync reports success. Best-effort callers wrap this themselves.
+            await expect(
+                DatabaseManager.removeChunksByUrlQdrant(qdrantDb, 'https://example.com/page', testLogger)
+            ).rejects.toThrow('Delete failed');
         });
     });
 
@@ -1218,6 +1228,43 @@ describe('DatabaseManager', () => {
             const deleteCall = mockClient.delete.mock.calls[0];
             expect(deleteCall[1].points).toContain('p2');
             expect(deleteCall[1].points).not.toContain('p1');
+        });
+
+        it('should paginate through all scroll pages when finding obsolete files', async () => {
+            const mockClient = {
+                scroll: vi.fn()
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p1', payload: { url: 'file:///project/src/a.ts', is_metadata: false } },
+                            { id: 'p2', payload: { url: 'file:///project/src/deleted1.ts', is_metadata: false } },
+                        ],
+                        next_page_offset: 'cursor-2',
+                    })
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p3', payload: { url: 'file:///project/src/deleted2.ts', is_metadata: false } },
+                        ],
+                        next_page_offset: null,
+                    }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, processedFiles, '/project/src', testLogger);
+
+            expect(mockClient.scroll).toHaveBeenCalledTimes(2);
+            expect(mockClient.scroll.mock.calls[1][1].offset).toBe('cursor-2');
+
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleted = mockClient.delete.mock.calls[0][1].points;
+            expect(deleted).toContain('p2');
+            expect(deleted).toContain('p3');
+            expect(deleted).not.toContain('p1');
         });
 
         it('should delete obsolete file chunks in URL rewrite mode', async () => {
@@ -1271,7 +1318,7 @@ describe('DatabaseManager', () => {
             expect(mockClient.delete).not.toHaveBeenCalled();
         });
 
-        it('should handle error gracefully', async () => {
+        it('should propagate errors so the job fails', async () => {
             const mockClient = {
                 scroll: vi.fn().mockRejectedValue(new Error('Qdrant scroll failed')),
             };
@@ -1281,8 +1328,10 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            // Should not throw
-            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, new Set(), '/project/src', testLogger);
+            // Must throw — a swallowed cleanup failure silently leaves orphans behind.
+            await expect(
+                DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, new Set(), '/project/src', testLogger)
+            ).rejects.toThrow('Qdrant scroll failed');
         });
     });
 

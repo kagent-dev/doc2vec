@@ -1,0 +1,33 @@
+# Dependencies & build output (reinstalled/regenerated inside the image)
+node_modules
+dist
+build
+
+# Local vector databases and data dumps
+*.db
+
+# Sub-project that is not part of this build
+mcp
+
+# Tests (already excluded from the tsconfig build)
+tests
+
+# Version control & CI
+.git
+.github
+.gitignore
+
+# Environment & secrets
+.env
+.env.*
+
+# Editor / OS / agent cruft
+.DS_Store
+.claude
+.vscode
+.idea
+
+# Local artifacts, session logs and scratch files
+session-*.md
+tmp
+*.log

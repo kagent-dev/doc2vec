@@ -213,7 +213,13 @@ export class DatabaseManager {
                 logger.debug(`Updated metadata value for ${key}`);
             }
         } catch (error) {
-            logger.error(`Failed to update metadata value for ${key}:`, error);
+            // Best-effort by design: a failed metadata write errs toward the
+            // safe direction (redundant reprocessing next run — etag/lastmod/
+            // watermark stay behind, never skip ahead), so we warn rather than
+            // fail the job. Genuine disk/connection failures surface earlier at
+            // the chunk-write stage (storeChunkInQdrant), which shares this
+            // collection and throws.
+            logger.warn(`Failed to update metadata value for ${key} (continuing; will retry next run):`, error);
         }
     }
 
@@ -481,7 +487,11 @@ export class DatabaseManager {
                 points: [pointItem],
             });
         } catch (error) {
-            console.error("Error storing chunk in Qdrant:", error);
+            // Rethrow so the failure propagates to the top-level handler and the
+            // job exits non-zero. Swallowing here previously let a sync "succeed"
+            // while chunks silently failed to store (e.g. Qdrant disk full).
+            console.error(`Error storing chunk in Qdrant (collection ${collectionName}, url ${chunk.metadata.url}):`, error);
+            throw error;
         }
     }
 
@@ -570,7 +580,11 @@ export class DatabaseManager {
                 logger.info(`No obsolete chunks to delete from Qdrant for URL ${urlPrefix}`);
             }
         } catch (error) {
+            // Rethrow so a failed cleanup fails the job instead of silently
+            // leaving orphans behind. This is idempotent and recomputed each
+            // run, so a rerun retries it cleanly.
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+            throw error;
         }
     }
 
@@ -614,7 +628,12 @@ export class DatabaseManager {
             });
             logger.info(`Deleted chunks from Qdrant for URL ${url}`);
         } catch (error) {
+            // Rethrow so the failure propagates and the job exits non-zero.
+            // A swallowed delete leaves stale chunks behind while the sync
+            // reports success. Callers that treat deletion as best-effort
+            // (e.g. 404 cleanup) wrap this call in their own try/catch.
             logger.error(`Error deleting chunks from Qdrant for URL ${url}:`, error);
+            throw error;
         }
     }
 
@@ -799,44 +818,54 @@ export class DatabaseManager {
             }
             
             logger.debug(`Checking for obsolete chunks with URL prefix: ${urlPrefix}`);
-            const response = await client.scroll(collectionName, {
-                limit: 10000,
-                with_payload: true,
-                with_vector: false,
-                filter: {
-                    must: [
-                        {
-                            key: "url",
-                            match: {
-                                text: urlPrefix
-                            }
+
+            // Scroll through ALL matching points via next_page_offset. A single
+            // capped scroll would only examine the first page, so obsolete
+            // chunks beyond it (in collections larger than the page limit) would
+            // never be removed.
+            const filter = {
+                must: [
+                    {
+                        key: "url",
+                        match: {
+                            text: urlPrefix
                         }
-                    ],
-                    must_not: [
-                        {
-                            key: "is_metadata",
-                            match: {
-                                value: true
-                            }
+                    }
+                ],
+                must_not: [
+                    {
+                        key: "is_metadata",
+                        match: {
+                            value: true
                         }
-                    ]
-                }
-            });
-            
-            const obsoletePointIds = response.points
-                .filter((point: any) => {
+                    }
+                ]
+            };
+
+            const obsoletePointIds: any[] = [];
+            let offset: any = undefined;
+            do {
+                const response = await client.scroll(collectionName, {
+                    limit: 1000,
+                    offset,
+                    with_payload: true,
+                    with_vector: false,
+                    filter
+                });
+
+                for (const point of response.points) {
                     const url = point.payload?.url;
                     // Double check it's not a metadata record
                     if (point.payload?.is_metadata === true) {
-                        return false;
+                        continue;
                     }
-                    
+
                     if (!url || !url.startsWith(urlPrefix)) {
-                        return false;
+                        continue;
                     }
-                    
+
                     let filePath: string;
-                    
+
                     if (isRewriteMode) {
                         // URL rewrite mode: extract relative path and construct full file path
                         const config = pathConfig as { path: string; url_rewrite_prefix?: string };
@@ -846,11 +875,15 @@ export class DatabaseManager {
                         // Direct file path mode: remove file:// prefix to match with processedFiles
                         filePath = url.startsWith('file://') ? url.substring(7) : '';
                     }
-                    
-                    return filePath && !processedFiles.has(filePath);
-                })
-                .map((point: any) => point.id);
-            
+
+                    if (filePath && !processedFiles.has(filePath)) {
+                        obsoletePointIds.push(point.id);
+                    }
+                }
+
+                offset = response.next_page_offset;
+            } while (offset !== null && offset !== undefined);
+
             if (obsoletePointIds.length > 0) {
                 await client.delete(collectionName, {
                     points: obsoletePointIds,
@@ -860,7 +893,10 @@ export class DatabaseManager {
                 logger.info(`No obsolete chunks to delete from Qdrant for URL prefix ${urlPrefix}`);
             }
         } catch (error) {
+            // Rethrow so a failed cleanup fails the job instead of silently
+            // leaving orphans behind (idempotent — retried cleanly next run).
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+            throw error;
         }
     }
-} 
+}
