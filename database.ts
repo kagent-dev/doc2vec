@@ -213,7 +213,13 @@ export class DatabaseManager {
                 logger.debug(`Updated metadata value for ${key}`);
             }
         } catch (error) {
-            logger.error(`Failed to update metadata value for ${key}:`, error);
+            // Best-effort by design: a failed metadata write errs toward the
+            // safe direction (redundant reprocessing next run — etag/lastmod/
+            // watermark stay behind, never skip ahead), so we warn rather than
+            // fail the job. Genuine disk/connection failures surface earlier at
+            // the chunk-write stage (storeChunkInQdrant), which shares this
+            // collection and throws.
+            logger.warn(`Failed to update metadata value for ${key} (continuing; will retry next run):`, error);
         }
     }
 
@@ -481,7 +487,11 @@ export class DatabaseManager {
                 points: [pointItem],
             });
         } catch (error) {
-            console.error("Error storing chunk in Qdrant:", error);
+            // Rethrow so the failure propagates to the top-level handler and the
+            // job exits non-zero. Swallowing here previously let a sync "succeed"
+            // while chunks silently failed to store (e.g. Qdrant disk full).
+            console.error(`Error storing chunk in Qdrant (collection ${collectionName}, url ${chunk.metadata.url}):`, error);
+            throw error;
         }
     }
 
@@ -570,7 +580,11 @@ export class DatabaseManager {
                 logger.info(`No obsolete chunks to delete from Qdrant for URL ${urlPrefix}`);
             }
         } catch (error) {
+            // Rethrow so a failed cleanup fails the job instead of silently
+            // leaving orphans behind. This is idempotent and recomputed each
+            // run, so a rerun retries it cleanly.
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+            throw error;
         }
     }
 
@@ -614,7 +628,12 @@ export class DatabaseManager {
             });
             logger.info(`Deleted chunks from Qdrant for URL ${url}`);
         } catch (error) {
+            // Rethrow so the failure propagates and the job exits non-zero.
+            // A swallowed delete leaves stale chunks behind while the sync
+            // reports success. Callers that treat deletion as best-effort
+            // (e.g. 404 cleanup) wrap this call in their own try/catch.
             logger.error(`Error deleting chunks from Qdrant for URL ${url}:`, error);
+            throw error;
         }
     }
 
@@ -860,7 +879,10 @@ export class DatabaseManager {
                 logger.info(`No obsolete chunks to delete from Qdrant for URL prefix ${urlPrefix}`);
             }
         } catch (error) {
+            // Rethrow so a failed cleanup fails the job instead of silently
+            // leaving orphans behind (idempotent — retried cleanly next run).
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+            throw error;
         }
     }
-} 
+}
