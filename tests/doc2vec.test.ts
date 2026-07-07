@@ -118,6 +118,7 @@ vi.mock('../logger', () => {
             error: vi.fn(),
             debug: vi.fn(),
             section: vi.fn(),
+            event: vi.fn(),
             progress: vi.fn().mockReturnValue({
                 update: vi.fn(),
                 complete: vi.fn(),
@@ -755,7 +756,7 @@ sources:
             function makeLogger(): any {
                 const l: any = {
                     info: vi.fn(), warn: vi.fn(), error: vi.fn(),
-                    debug: vi.fn(), section: vi.fn(),
+                    debug: vi.fn(), section: vi.fn(), event: vi.fn(),
                 };
                 l.child = vi.fn(() => makeLogger());
                 return l;
@@ -1403,7 +1404,7 @@ sources:
             const instance = new Doc2Vec(configPath);
 
             // run() should complete without errors on empty sources
-            await expect(instance.run()).resolves.toBeUndefined();
+            await expect(instance.run()).resolves.toEqual([]);
         });
 
         it('should handle config with only code sources', () => {

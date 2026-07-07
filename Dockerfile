@@ -41,7 +41,7 @@ RUN npm ci --ignore-scripts
 
 COPY --chown=doc2vec:doc2vec . .
 
-RUN npm run build
+RUN npm run build && npm run build:ui
 
 FROM base AS prod-deps
 
@@ -68,5 +68,8 @@ COPY --from=prod-deps --chown=doc2vec:doc2vec /app/package*.json ./
 COPY --from=prod-deps --chown=doc2vec:doc2vec /app/node_modules ./node_modules
 COPY --from=builder --chown=doc2vec:doc2vec /app/dist ./dist
 COPY --from=builder --chown=doc2vec:doc2vec /app/README.md /app/LICENSE /app/config.yaml ./
+
+# Controller mode serves its API/UI here (one-shot sync runs ignore it)
+EXPOSE 8080
 
 USER doc2vec

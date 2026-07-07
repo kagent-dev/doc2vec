@@ -52,6 +52,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
+*   **[Controller Mode](#controller-mode):** Optionally runs as a long-lived controller that schedules sync jobs from multiple config files (cron `schedule` field), persists run history and statistics in Postgres, and serves a web UI with live log streaming — read-only (configs from files/ConfigMap) or read-write (create/edit configs from the UI).
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
 
 ## Chunk Metadata & Page Reconstruction
@@ -436,6 +437,96 @@ The script will then:
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
+
+## Controller Mode
+
+Besides the one-shot sync, doc2vec can run as a **long-lived controller** that schedules sync jobs, records run history and statistics in Postgres, and serves a web UI for monitoring and managing configs:
+
+```bash
+doc2vec controller --database-url postgres://user:pass@host:5432/doc2vec ./configs/
+```
+
+Open http://localhost:8080 to see the dashboard: configs with their schedule and next run, run history with per-source statistics, and live log streaming for running jobs.
+
+### Scheduling
+
+Add a top-level cron `schedule` (and optionally a display `name`) to a config file, and the controller runs it automatically:
+
+```yaml
+name: product-docs
+schedule: "0 2 * * *"   # every day at 02:00
+sources:
+  - type: website
+    ...
+```
+
+Configs without a `schedule` are still listed in the UI and can be triggered manually with **Run now**. Each run executes `doc2vec run <config.yaml>` as a child process; overlapping runs of the same config are skipped, and `--max-parallel` (default 1) caps how many sync jobs run at once — keep it low, since website sources launch a headless Chromium.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--database-url <url>` | `DATABASE_URL` env | Postgres connection string (required) |
+| `--port <n>` | `8080` (or `PORT`) | HTTP port for the API and UI |
+| `--read-write` | off (read-only) | Allow creating/editing/deleting configs from the UI |
+| `--config-dir <dir>` | — | Where UI-created configs are written (required with `--read-write`) |
+| `--max-parallel <n>` | `1` | Max concurrent sync jobs |
+| `--reload-interval <s>` | `30` | How often config files are re-read for changes |
+| `--log-retention-days <n>` | `14` | Run logs older than this are pruned (run history is kept) |
+
+Positional arguments are config files and/or directories (directories are scanned for `*.yaml`/`*.yml`, and re-scanned on every reload).
+
+### Read-only vs read-write
+
+- **Read-only** (default): configs come solely from the files passed on the command line — ideal for Kubernetes, where they live in a ConfigMap. The UI can view configs, trigger runs, and browse history/stats, but not modify anything. ConfigMap updates are picked up automatically via content-hash polling.
+- **Read-write** (`--read-write --config-dir ./configs`): the UI can also create, edit, and delete config YAML files. Files stay the source of truth on disk; concurrent edits are protected by a content-hash check.
+
+In both modes the UI always shows raw YAML: `${ENV_VAR}` secret placeholders are **never** resolved outside the sync job itself.
+
+### Kubernetes example
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doc2vec-controller
+spec:
+  replicas: 1        # keep a single replica: the scheduler is not distributed
+  selector:
+    matchLabels: { app: doc2vec-controller }
+  template:
+    metadata:
+      labels: { app: doc2vec-controller }
+    spec:
+      containers:
+        - name: controller
+          image: ghcr.io/kagent-dev/doc2vec:latest
+          command: ["node", "dist/doc2vec.js", "controller", "/etc/doc2vec"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: doc2vec-secrets, key: database-url }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: doc2vec-secrets, key: openai-api-key }
+          volumeMounts:
+            - name: configs
+              mountPath: /etc/doc2vec
+          resources:
+            requests: { memory: 1Gi }
+            limits: { memory: 4Gi }   # website sources launch headless Chromium
+      volumes:
+        - name: configs
+          configMap: { name: doc2vec-configs }
+```
+
+The controller detects ConfigMap updates without a restart. Health endpoint: `GET /api/health`.
+
+### API
+
+The UI is backed by a small REST API you can also use directly: `GET /api/configs`, `POST /api/configs/:id/run`, `GET /api/runs?configId=`, `GET /api/runs/:id/logs`, `POST /api/runs/:id/cancel`, `GET /api/configs/:id/stats?days=30`, plus server-sent events at `GET /api/events` and `GET /api/runs/:id/logs/stream`.
 
 ## Database Options
 
