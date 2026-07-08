@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { LogRow } from '../api';
 
 const MAX_CLIENT_ROWS = 10_000;
@@ -64,17 +64,36 @@ export default function LogViewer({ runId, isActive }: { runId: number; isActive
     });
   }, [rows, levelFilter, keyword]);
 
-  useEffect(() => {
+  // Distinguishes our own scrollTop writes from user scrolling: during log
+  // bursts the content grows between the programmatic scroll and its async
+  // scroll event, which would otherwise measure as "not at bottom" and switch
+  // follow off spontaneously.
+  const programmaticScroll = useRef(false);
+
+  useLayoutEffect(() => {
     if (followRef.current && scrollRef.current) {
+      programmaticScroll.current = true;
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [visibleRows]);
+  }, [visibleRows, follow]);
 
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (programmaticScroll.current) {
+      programmaticScroll.current = false;
+      // Our own scroll never disables follow; it can only confirm it
+      if (atBottom && !followRef.current) setFollow(true);
+      return;
+    }
     if (atBottom !== followRef.current) setFollow(atBottom);
+  };
+
+  // Scrolling up is an unambiguous "stop following" signal — react to the
+  // gesture itself so a heavy log burst can't re-pin the view mid-scroll
+  const onWheel = (event: React.WheelEvent) => {
+    if (event.deltaY < 0 && followRef.current) setFollow(false);
   };
 
   const toggleLevel = (level: string) => {
@@ -145,6 +164,7 @@ export default function LogViewer({ runId, isActive }: { runId: number; isActive
       <div
         ref={scrollRef}
         onScroll={onScroll}
+        onWheel={onWheel}
         className="log-scroll max-h-[560px] overflow-auto px-4 py-3 font-mono text-xs leading-5"
       >
         {visibleRows.length === 0 && (
