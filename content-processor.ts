@@ -20,6 +20,19 @@ import {
 import type { TokenChunker, Tokenizer } from '@chonkiejs/core';
 import { CodeChunker } from './code-chunker';
 
+/**
+ * Thrown when the browser cannot be launched at all (even after a retry).
+ * Without a browser no page in the crawl can be processed, so this aborts the
+ * whole website source — the run is then reported as failed instead of
+ * "succeeding" with an error on every URL.
+ */
+export class BrowserLaunchError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'BrowserLaunchError';
+    }
+}
+
 export class ContentProcessor {
     private turndownService: TurndownService;
     private logger: Logger;
@@ -381,7 +394,7 @@ export class ContentProcessor {
                     executablePath = '/usr/bin/chromium-browser';
                 }
             }
-            const b = await puppeteer.launch({
+            const launchOptions = {
                 executablePath,
                 args: [
                     '--no-sandbox',
@@ -391,7 +404,25 @@ export class ContentProcessor {
                     '--disable-extensions',
                 ],
                 protocolTimeout: 60000,
-            });
+            };
+            let b: Browser;
+            try {
+                b = await puppeteer.launch(launchOptions);
+            } catch (firstError) {
+                // One retry after a pause — the failure may be transient (e.g.
+                // memory pressure from a page that just closed). If the browser
+                // cannot launch at all, no page in this crawl can be processed,
+                // so escalate as fatal instead of failing every URL one by one.
+                logger.warn('Browser launch failed, retrying once in 5s...', firstError);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                try {
+                    b = await puppeteer.launch(launchOptions);
+                } catch (secondError) {
+                    throw new BrowserLaunchError(
+                        `browser failed to launch twice: ${secondError instanceof Error ? secondError.message : String(secondError)}`
+                    );
+                }
+            }
             const p = await b.newPage();
             return { browser: b, page: p };
         };
@@ -719,6 +750,14 @@ export class ContentProcessor {
                         }
                     }
                 } catch (error: any) {
+                    // A browser that cannot launch is fatal for the whole crawl —
+                    // rethrow so the source (and the run) is reported as failed
+                    // rather than logging an error per URL and finishing "green".
+                    if (error instanceof BrowserLaunchError) {
+                        logger.error(`Aborting crawl of ${baseUrl}: ${error.message}`);
+                        throw error;
+                    }
+
                     const status = this.getHttpStatus(error);
 
                     // ── Handle 429 (Too Many Requests) with retry ──

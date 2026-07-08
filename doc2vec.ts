@@ -682,7 +682,11 @@ export class Doc2Vec {
     }
 
     private writeBrokenLinksReport(): void {
-        const reportPath = path.join(this.configDir, '404.yaml');
+        // The default (next to the config file) breaks when the config lives on
+        // a read-only mount (e.g. a Kubernetes ConfigMap in controller mode) —
+        // DOC2VEC_REPORT_DIR points the report somewhere writable instead.
+        const reportDir = process.env.DOC2VEC_REPORT_DIR || this.configDir;
+        const reportPath = path.join(reportDir, '404.yaml');
         const orderedEntries = Object.entries(this.brokenLinksByWebsite)
             .sort(([a], [b]) => a.localeCompare(b));
         const reportPayload = orderedEntries.map(([website, links]) => ({
