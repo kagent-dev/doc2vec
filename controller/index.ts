@@ -4,6 +4,7 @@ import { Logger, LogLevel } from '../logger';
 import { ConfigRegistry } from './config-registry';
 import { ControllerEvents } from './events';
 import { JobRunner } from './job-runner';
+import { SlackNotifier } from './notifier';
 import { Scheduler } from './scheduler';
 import { createServer } from './server';
 import { ControllerStore } from './store';
@@ -62,6 +63,18 @@ export async function startController(opts: StartControllerOptions): Promise<voi
     }, logger.child('scheduler'));
 
     events.on('config:update', () => scheduler.sync(registry.list()));
+
+    if (opts.slackWebhookUrl) {
+        new SlackNotifier(
+            {
+                webhookUrl: opts.slackWebhookUrl,
+                notify: opts.slackNotify ?? 'all',
+                publicUrl: opts.publicUrl,
+            },
+            store,
+            logger.child('slack')
+        ).attach(events);
+    }
 
     await registry.start();
     scheduler.sync(registry.list());

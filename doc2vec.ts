@@ -1909,6 +1909,9 @@ if (require.main === module) {
         .option('--max-parallel <n>', 'maximum number of sync jobs running at once', (v: string) => parseInt(v, 10), 1)
         .option('--reload-interval <seconds>', 'how often to re-poll config files for changes', (v: string) => parseInt(v, 10), 30)
         .option('--log-retention-days <days>', 'delete run logs older than this many days', (v: string) => parseInt(v, 10), 14)
+        .option('--slack-webhook-url <url>', 'Slack incoming webhook for run notifications (or SLACK_WEBHOOK_URL env var)')
+        .option('--slack-notify <mode>', "which runs to notify about: 'all' or 'failures'", 'all')
+        .option('--public-url <url>', 'externally reachable base URL, used for links in notifications (or PUBLIC_URL env var)')
         .action(async (configs: string[], options: any) => {
             // Lazy-require so the one-shot path doesn't load express/pg
             const { startController } = require('./controller') as typeof import('./controller');
@@ -1922,6 +1925,9 @@ if (require.main === module) {
                     maxParallel: options.maxParallel,
                     reloadIntervalSec: options.reloadInterval,
                     logRetentionDays: options.logRetentionDays,
+                    slackWebhookUrl: options.slackWebhookUrl || process.env.SLACK_WEBHOOK_URL,
+                    slackNotify: options.slackNotify === 'failures' ? 'failures' : 'all',
+                    publicUrl: options.publicUrl || process.env.PUBLIC_URL,
                 });
             } catch (err) {
                 console.error(err instanceof Error ? err.message : err);

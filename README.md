@@ -473,8 +473,15 @@ Configs without a `schedule` are still listed in the UI and can be triggered man
 | `--max-parallel <n>` | `1` | Max concurrent sync jobs |
 | `--reload-interval <s>` | `30` | How often config files are re-read for changes |
 | `--log-retention-days <n>` | `14` | Run logs older than this are pruned (run history is kept) |
+| `--slack-webhook-url <url>` | `SLACK_WEBHOOK_URL` env | Slack incoming webhook — post a message when a run finishes |
+| `--slack-notify <mode>` | `all` | `all` or `failures` (failures also covers canceled runs) |
+| `--public-url <url>` | `PUBLIC_URL` env | Externally reachable base URL, used for "view run" links in notifications |
 
 Positional arguments are config files and/or directories (directories are scanned for `*.yaml`/`*.yml`, and re-scanned on every reload).
+
+### Slack notifications
+
+With `--slack-webhook-url` (or `SLACK_WEBHOOK_URL`) set, the controller posts to a [Slack incoming webhook](https://api.slack.com/messaging/webhooks) whenever a run reaches a terminal state — ✅ succeeded, ❌ failed (naming the failing sources and their errors), or ⚠️ canceled. Overlap-`skipped` runs are not notified. Set `--slack-notify failures` to silence successes, and `--public-url https://doc2vec.example.com` to get clickable "view run" links.
 
 ### Read-only vs read-write
 

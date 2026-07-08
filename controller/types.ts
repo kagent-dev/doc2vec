@@ -9,6 +9,9 @@ export interface StartControllerOptions {
     maxParallel: number;
     reloadIntervalSec: number;
     logRetentionDays: number;
+    slackWebhookUrl?: string;      // Slack incoming webhook — notifies when runs finish
+    slackNotify?: 'all' | 'failures';
+    publicUrl?: string;            // externally reachable base URL, used for links in notifications
 }
 
 export interface SourceSummary {
