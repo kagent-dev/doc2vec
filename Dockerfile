@@ -2,8 +2,11 @@ FROM node:20-slim AS base
 
 WORKDIR /app
 
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-
+# NOTE: chromium from apt is kept as the shared-library provider and the
+# linux/arm64 fallback, but it is no longer the browser we run on amd64 —
+# Debian has shipped chromium builds that crash at startup in containers
+# (150.0.7871 dies with SIGTRAP immediately). The runtime stage downloads
+# Puppeteer's version-matched Chrome for Testing instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sqlite3 \
@@ -73,3 +76,10 @@ COPY --from=builder --chown=doc2vec:doc2vec /app/README.md /app/LICENSE /app/con
 EXPOSE 8080
 
 USER doc2vec
+
+# Version-matched Chrome for Testing (see note in the base stage). Published
+# for linux/amd64 only — arm64 falls back to the apt chromium at runtime.
+ENV PUPPETEER_CACHE_DIR=/home/doc2vec/.cache/puppeteer
+RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      npx puppeteer browsers install chrome; \
+    fi

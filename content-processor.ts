@@ -34,6 +34,30 @@ export class BrowserLaunchError extends Error {
 }
 
 /**
+ * Resolve which browser binary to launch, in order of preference:
+ *  1. PUPPETEER_EXECUTABLE_PATH (explicit override)
+ *  2. Puppeteer's own downloaded Chrome for Testing (version-matched, the
+ *     reliable choice — Debian's chromium package has shipped builds that
+ *     crash at startup in containers, e.g. 150.0.7871 SIGTRAPs immediately)
+ *  3. A system chromium, as the fallback (also covers linux/arm64, where
+ *     Chrome for Testing is not published)
+ *  4. undefined — let puppeteer decide
+ */
+export function resolveBrowserExecutablePath(): string | undefined {
+    const override = process.env.PUPPETEER_EXECUTABLE_PATH;
+    if (override) return override;
+    try {
+        const bundled = puppeteer.executablePath();
+        if (bundled && fs.existsSync(bundled)) return bundled;
+    } catch {
+        // no browser downloaded for this platform
+    }
+    if (fs.existsSync('/usr/bin/chromium')) return '/usr/bin/chromium';
+    if (fs.existsSync('/usr/bin/chromium-browser')) return '/usr/bin/chromium-browser';
+    return undefined;
+}
+
+/**
  * Best-effort snapshot of process + container memory, for diagnosing browser
  * launch failures (the usual cause in Kubernetes is the pod's memory cgroup —
  * Chromium forks, then its renderers are immediately OOM-killed).
@@ -58,6 +82,24 @@ function memoryDiagnostics(): string {
         }
     } catch {
         // diagnostics only — never fail because of them
+    }
+    try {
+        // /proc/meminfo reflects the NODE in Kubernetes — catches host-level pressure
+        const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+        const available = meminfo.match(/^MemAvailable:\s+(\d+) kB/m);
+        if (available) {
+            parts.push(`node available ${gib(Number(available[1]) * 1024)}`);
+        }
+    } catch {
+        // not Linux
+    }
+    try {
+        // Chromium writes its profile and (with --disable-dev-shm-usage) its
+        // shared memory under /tmp — a full disk breaks launches
+        const stat = fs.statfsSync('/tmp');
+        parts.push(`/tmp free ${gib(stat.bavail * stat.bsize)}`);
+    } catch {
+        // statfs unavailable
     }
     return parts.join(', ');
 }
@@ -415,14 +457,7 @@ export class ContentProcessor {
         let page: Page | null = null;
 
         const launchBrowser = async (): Promise<{ browser: Browser; page: Page }> => {
-            let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
-            if (!executablePath) {
-                if (fs.existsSync('/usr/bin/chromium')) {
-                    executablePath = '/usr/bin/chromium';
-                } else if (fs.existsSync('/usr/bin/chromium-browser')) {
-                    executablePath = '/usr/bin/chromium-browser';
-                }
-            }
+            const executablePath = resolveBrowserExecutablePath();
             const launchOptions = {
                 executablePath,
                 args: [
@@ -974,17 +1009,8 @@ export class ContentProcessor {
                 page = existingPage;
             } else {
                 // Standalone mode: launch a browser for this single page
-                let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
-                if (!executablePath) {
-                    if (fs.existsSync('/usr/bin/chromium')) {
-                        executablePath = '/usr/bin/chromium';
-                    } else if (fs.existsSync('/usr/bin/chromium-browser')) {
-                        executablePath = '/usr/bin/chromium-browser';
-                    }
-                }
-                
                 browser = await puppeteer.launch({
-                    executablePath,
+                    executablePath: resolveBrowserExecutablePath(),
                     args: [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
