@@ -33,6 +33,35 @@ export class BrowserLaunchError extends Error {
     }
 }
 
+/**
+ * Best-effort snapshot of process + container memory, for diagnosing browser
+ * launch failures (the usual cause in Kubernetes is the pod's memory cgroup —
+ * Chromium forks, then its renderers are immediately OOM-killed).
+ */
+function memoryDiagnostics(): string {
+    const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(2)}GiB`;
+    const parts: string[] = [`node rss ${gib(process.memoryUsage().rss)}`];
+    try {
+        // cgroup v2, else v1 — absent entirely outside Linux/containers
+        let current: string | undefined;
+        let max: string | undefined;
+        if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
+            current = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
+            max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+        } else if (fs.existsSync('/sys/fs/cgroup/memory/memory.usage_in_bytes')) {
+            current = fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim();
+            max = fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim();
+        }
+        if (current !== undefined && max !== undefined) {
+            const unlimited = max === 'max' || Number(max) > 2 ** 60;
+            parts.push(`cgroup ${gib(Number(current))} used / ${unlimited ? 'no limit' : gib(Number(max))}`);
+        }
+    } catch {
+        // diagnostics only — never fail because of them
+    }
+    return parts.join(', ');
+}
+
 export class ContentProcessor {
     private turndownService: TurndownService;
     private logger: Logger;
@@ -413,13 +442,13 @@ export class ContentProcessor {
                 // memory pressure from a page that just closed). If the browser
                 // cannot launch at all, no page in this crawl can be processed,
                 // so escalate as fatal instead of failing every URL one by one.
-                logger.warn('Browser launch failed, retrying once in 5s...', firstError);
+                logger.warn(`Browser launch failed (${memoryDiagnostics()}), retrying once in 5s...`, firstError);
                 await new Promise(resolve => setTimeout(resolve, 5000));
                 try {
                     b = await puppeteer.launch(launchOptions);
                 } catch (secondError) {
                     throw new BrowserLaunchError(
-                        `browser failed to launch twice: ${secondError instanceof Error ? secondError.message : String(secondError)}`
+                        `browser failed to launch twice (${memoryDiagnostics()}): ${secondError instanceof Error ? secondError.message : String(secondError)}`
                     );
                 }
             }
