@@ -297,14 +297,13 @@ export class Doc2Vec {
             let issues: any[] = [];
             let page = 1;
             const perPage = 100;
-            const sinceTimestamp = new Date(sinceDate);
 
             while (true) {
                 // Log progress every 10 pages to reduce noise
                 if (page === 1 || page % 10 === 0) {
                     logger.debug(`Fetching issues page ${page}... (${issues.length} issues so far)`);
                 }
-                
+
                 const data = await fetchWithRetry(GITHUB_API_URL, {
                     per_page: perPage,
                     page,
@@ -314,10 +313,15 @@ export class Doc2Vec {
 
                 if (data.length === 0) break;
 
-                const filtered = data.filter((issue: any) => new Date(issue.created_at) >= sinceTimestamp);
-                issues = issues.concat(filtered);
+                // The `since` param already scopes results to issues whose
+                // updated_at is after sinceDate — i.e. anything created, closed,
+                // reopened, edited, or newly commented since the last run. Do NOT
+                // re-filter by created_at: an old issue that was just closed or
+                // received a new comment has an old created_at and would be
+                // dropped, leaving its status and comments permanently stale.
+                issues = issues.concat(data);
 
-                if (filtered.length < data.length) break;
+                if (data.length < perPage) break;
                 page++;
             }
             return issues;
@@ -368,7 +372,19 @@ export class Doc2Vec {
             
             const chunks = await this.contentProcessor.chunkMarkdown(markdown, issueConfig, url);
             logger.info(`Issue #${issueNumber}: Created ${chunks.length} chunks`);
-            
+
+            // Purge the issue's existing chunks before inserting the fresh set.
+            // chunk_id is a content hash, so when an issue changes (closed/reopened,
+            // edited, new comments) the regenerated chunks get new ids and the old
+            // ones would otherwise linger — leaving stale state ("open") and missing
+            // the latest comments in search results. All chunks for an issue share
+            // its unique url, so delete-by-url reconciles them exactly.
+            if (dbConnection.type === 'sqlite') {
+                DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+            } else if (dbConnection.type === 'qdrant') {
+                await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+            }
+
             // Process and store each chunk immediately
             for (const chunk of chunks) {
                 const chunkHash = Utils.generateHash(chunk.content);
