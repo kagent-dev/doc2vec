@@ -28,7 +28,8 @@ import {
     DocumentChunk,
     BrokenLink,
     EmbeddingConfig,
-    MarkdownStoreConfig
+    MarkdownStoreConfig,
+    SourceRunStats
 } from './types';
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { MarkdownStore } from './markdown-store';
@@ -174,34 +175,57 @@ export class Doc2Vec {
         return parsedValue;
     }
 
-    public async run(): Promise<void> {
+    public async run(): Promise<SourceRunStats[]> {
         // Initialize Postgres markdown store table if configured
         if (this.markdownStore) {
             await this.markdownStore.init();
         }
 
         this.logger.section('PROCESSING SOURCES');
-        
+
+        const runStats: SourceRunStats[] = [];
+
         for (const sourceConfig of this.config.sources) {
             const sourceLogger = this.logger.child(`source:${sourceConfig.product_name}`);
-            
+
             sourceLogger.info(`Processing ${sourceConfig.type} source for ${sourceConfig.product_name}@${sourceConfig.version}`);
-            
-            if (sourceConfig.type === 'github') {
-                await this.processGithubRepo(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'website') {
-                await this.processWebsite(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'local_directory') {
-                await this.processLocalDirectory(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'code') {
-                await this.processCodeSource(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'zendesk') {
-                await this.processZendesk(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 's3') {
-                await this.processS3(sourceConfig, sourceLogger);
-            } else {
-                sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
+
+            const startTime = Date.now();
+            let ok = true;
+            let errorMessage: string | undefined;
+
+            try {
+                if (sourceConfig.type === 'github') {
+                    await this.processGithubRepo(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'website') {
+                    await this.processWebsite(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'local_directory') {
+                    await this.processLocalDirectory(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'code') {
+                    await this.processCodeSource(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'zendesk') {
+                    await this.processZendesk(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 's3') {
+                    await this.processS3(sourceConfig, sourceLogger);
+                } else {
+                    ok = false;
+                    errorMessage = `Unknown source type: ${(sourceConfig as any).type}`;
+                    sourceLogger.error(errorMessage);
+                }
+            } catch (error) {
+                ok = false;
+                errorMessage = error instanceof Error ? error.message : String(error);
+                sourceLogger.error(`Failed to process ${sourceConfig.type} source for ${sourceConfig.product_name}:`, error);
             }
+
+            runStats.push({
+                product_name: sourceConfig.product_name,
+                type: sourceConfig.type,
+                version: sourceConfig.version,
+                duration_ms: Date.now() - startTime,
+                ok,
+                ...(errorMessage && { error: errorMessage })
+            });
         }
 
         // Close the Postgres markdown store connection pool
@@ -210,6 +234,9 @@ export class Doc2Vec {
         }
 
         this.logger.section('PROCESSING COMPLETE');
+        this.logger.event('run-summary', { sources: runStats });
+
+        return runStats;
     }
 
     private async fetchAndProcessGitHubIssues(repo: string, sourceConfig: GithubSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
@@ -655,7 +682,11 @@ export class Doc2Vec {
     }
 
     private writeBrokenLinksReport(): void {
-        const reportPath = path.join(this.configDir, '404.yaml');
+        // The default (next to the config file) breaks when the config lives on
+        // a read-only mount (e.g. a Kubernetes ConfigMap in controller mode) —
+        // DOC2VEC_REPORT_DIR points the report somewhere writable instead.
+        const reportDir = process.env.DOC2VEC_REPORT_DIR || this.configDir;
+        const reportPath = path.join(reportDir, '404.yaml');
         const orderedEntries = Object.entries(this.brokenLinksByWebsite)
             .sort(([a], [b]) => a.localeCompare(b));
         const reportPayload = orderedEntries.map(([website, links]) => ({
@@ -1841,14 +1872,68 @@ export class Doc2Vec {
     }
 }
 
-if (require.main === module) {
-    const configPath = process.argv[2] || 'config.yaml';
+function runOneShot(configPath: string): void {
     if (!fs.existsSync(configPath)) {
         console.error('Please provide a valid path to a YAML config file.');
         process.exit(1);
     }
     const doc2Vec = new Doc2Vec(configPath);
     doc2Vec.run()
-        .then(() => process.exit(0))
+        .then((stats) => process.exit(stats.some(s => !s.ok) ? 1 : 0))
         .catch((err) => { console.error(err); process.exit(1); });
+}
+
+if (require.main === module) {
+    const { Command } = require('commander') as typeof import('commander');
+    const program = new Command();
+
+    program
+        .name('doc2vec')
+        .description('Crawl documentation sources and store embeddings in vector databases')
+        // Legacy invocation: `doc2vec [config.yaml]` runs a one-shot sync
+        .argument('[config]', 'path to a YAML config file', 'config.yaml')
+        .action((configPath: string) => runOneShot(configPath));
+
+    program
+        .command('run <config>')
+        .description('Run a one-shot sync for a config file (what the controller spawns)')
+        .action((configPath: string) => runOneShot(configPath));
+
+    program
+        .command('controller [configs...]')
+        .description('Run as a long-lived controller: schedule sync jobs per config file, persist runs in Postgres, serve a web UI')
+        .option('--database-url <url>', 'Postgres connection string (or DATABASE_URL env var)')
+        .option('--port <port>', 'HTTP port for the API/UI (or PORT env var)', (v: string) => parseInt(v, 10))
+        .option('--read-write', 'allow creating/editing configs from the UI (default: read-only)', false)
+        .option('--config-dir <dir>', 'directory where UI-created configs are written (required with --read-write)')
+        .option('--max-parallel <n>', 'maximum number of sync jobs running at once', (v: string) => parseInt(v, 10), 1)
+        .option('--reload-interval <seconds>', 'how often to re-poll config files for changes', (v: string) => parseInt(v, 10), 30)
+        .option('--log-retention-days <days>', 'delete run logs older than this many days', (v: string) => parseInt(v, 10), 14)
+        .option('--slack-webhook-url <url>', 'Slack incoming webhook for run notifications (or SLACK_WEBHOOK_URL env var)')
+        .option('--slack-notify <mode>', "which runs to notify about: 'all' or 'failures'", 'all')
+        .option('--public-url <url>', 'externally reachable base URL, used for links in notifications (or PUBLIC_URL env var)')
+        .action(async (configs: string[], options: any) => {
+            // Lazy-require so the one-shot path doesn't load express/pg
+            const { startController } = require('./controller') as typeof import('./controller');
+            try {
+                await startController({
+                    configArgs: configs,
+                    databaseUrl: options.databaseUrl || process.env.DATABASE_URL,
+                    port: options.port || (process.env.PORT ? parseInt(process.env.PORT, 10) : 8080),
+                    readWrite: options.readWrite,
+                    configDir: options.configDir,
+                    maxParallel: options.maxParallel,
+                    reloadIntervalSec: options.reloadInterval,
+                    logRetentionDays: options.logRetentionDays,
+                    slackWebhookUrl: options.slackWebhookUrl || process.env.SLACK_WEBHOOK_URL,
+                    slackNotify: options.slackNotify === 'failures' ? 'failures' : 'all',
+                    publicUrl: options.publicUrl || process.env.PUBLIC_URL,
+                });
+            } catch (err) {
+                console.error(err instanceof Error ? err.message : err);
+                process.exit(1);
+            }
+        });
+
+    program.parse();
 } 

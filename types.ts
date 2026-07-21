@@ -123,6 +123,8 @@ export interface MarkdownStoreConfig {
 }
 
 export interface Config {
+    name?: string;                // Optional display name (used by controller mode; defaults to file basename)
+    schedule?: string;            // Optional cron expression — controller mode runs this config on the schedule; ignored in one-shot mode
     sources: SourceConfig[];
     embedding?: EmbeddingConfig;  // Optional, defaults to OpenAI
     markdown_store?: MarkdownStoreConfig;  // Optional Postgres markdown store
@@ -148,6 +150,17 @@ export interface DocumentChunk {
 export interface BrokenLink {
     source: string;
     target: string;
+}
+
+// Per-source outcome of a sync run, emitted as the `run-summary` structured event
+// and consumed by the controller to build run statistics
+export interface SourceRunStats {
+    product_name: string;
+    type: string;
+    version: string;
+    duration_ms: number;
+    ok: boolean;
+    error?: string;
 }
 
 export interface SqliteDB {

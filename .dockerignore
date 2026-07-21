@@ -1,5 +1,6 @@
 # Dependencies & build output (reinstalled/regenerated inside the image)
 node_modules
+ui/node_modules
 dist
 build
 

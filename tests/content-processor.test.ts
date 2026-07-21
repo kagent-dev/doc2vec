@@ -944,6 +944,29 @@ describe('ContentProcessor', () => {
             database_config: { type: 'sqlite', params: {} }
         };
 
+        it('should abort the whole crawl when the browser cannot launch (after one retry)', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const launchSpy = vi.spyOn(puppeteerModule.default, 'launch')
+                .mockRejectedValue(new Error('Failed to launch the browser process!'));
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Fake timers to skip the 5s pause between the two launch attempts
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            // Attach the rejection expectation before advancing time so the
+            // rejection isn't treated as unhandled
+            const assertion = expect(crawlPromise).rejects.toThrow(/browser failed to launch twice/);
+            await vi.advanceTimersByTimeAsync(6000);
+            await assertion;
+            vi.useRealTimers();
+
+            // Exactly two attempts (initial + one retry), not one per queued URL
+            expect(launchSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).not.toHaveBeenCalled();
+        });
+
         it('should skip already visited URLs', async () => {
             vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
 
