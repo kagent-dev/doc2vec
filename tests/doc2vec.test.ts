@@ -162,6 +162,7 @@ import { Doc2Vec } from '../doc2vec';
 import { DatabaseManager } from '../database';
 import { ContentProcessor } from '../content-processor';
 import { Logger } from '../logger';
+import axios from 'axios';
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
@@ -1894,6 +1895,86 @@ sources:
 
             // good.md should still be processed despite bad.md failing
             expect(processChunksSpy).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GitHub issues: incremental re-processing of updated / closed issues
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('fetchAndProcessGitHubIssues', () => {
+        const repo = 'octo/repo';
+        const issuesUrl = `https://api.github.com/repos/${repo}/issues`;
+        const issueUrl = (n: number) => `https://github.com/${repo}/issues/${n}`;
+
+        function makeInstance() {
+            const configPath = writeTestConfig('gh-issues.yaml', makeMinimalConfig());
+            return new Doc2Vec(configPath) as any;
+        }
+
+        // getLastRunDate is mocked (line ~62) to return 2025-01-01T00:00:00Z.
+        // An issue created BEFORE that date but closed/commented AFTER it is the
+        // exact case that regressed: GitHub's `since` returns it, but the old
+        // created_at filter used to drop it.
+        const oldButRecentlyClosedIssue = {
+            number: 42,
+            title: 'Old bug that just got closed',
+            user: { login: 'alice' },
+            state: 'closed',
+            created_at: '2024-06-01T00:00:00Z', // before last run
+            updated_at: '2025-02-01T00:00:00Z', // closed/commented after last run
+            labels: [],
+            body: 'A long-standing bug.',
+        };
+
+        function mockGitHubApi(issues: any[], comments: any[] = []) {
+            (axios.get as any).mockImplementation((url: string, opts?: any) => {
+                if (url.endsWith('/comments')) {
+                    return Promise.resolve({ data: comments });
+                }
+                // Issues list: only page 1 carries data. Any page beyond the first
+                // returns empty so pagination terminates deterministically.
+                const page = opts?.params?.page ?? 1;
+                return Promise.resolve({ data: page === 1 ? issues : [] });
+            });
+        }
+
+        it('processes an old issue closed since the last run (no created_at filtering)', async () => {
+            const instance = makeInstance();
+            mockGitHubApi([oldButRecentlyClosedIssue]);
+
+            await instance.fetchAndProcessGitHubIssues(
+                repo,
+                { product_name: repo },
+                { type: 'sqlite', db: {} },
+                instance.logger,
+            );
+
+            // The issue must be processed, not silently dropped for being old.
+            const chunkCalls = instance.contentProcessor.chunkMarkdown.mock.calls;
+            expect(chunkCalls.length).toBe(1);
+            // Markdown reflects the up-to-date (closed) state.
+            expect(chunkCalls[0][0]).toContain('**State:** closed');
+            expect(chunkCalls[0][2]).toBe(issueUrl(42));
+        });
+
+        it('purges the issue\'s existing chunks before storing the refreshed set', async () => {
+            const instance = makeInstance();
+            mockGitHubApi([oldButRecentlyClosedIssue]);
+
+            await instance.fetchAndProcessGitHubIssues(
+                repo,
+                { product_name: repo },
+                { type: 'sqlite', db: {} },
+                instance.logger,
+            );
+
+            // Stale chunks (content-hash ids) would otherwise linger with the old
+            // "open" state and missing comments.
+            expect(DatabaseManager.removeChunksByUrlSQLite).toHaveBeenCalledWith(
+                {},
+                issueUrl(42),
+                expect.anything(),
+            );
         });
     });
 });
