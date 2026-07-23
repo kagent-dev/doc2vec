@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import { formatDuration, formatTime, runDuration } from '../lib/format';
 import LogViewer from '../components/LogViewer';
@@ -9,6 +9,7 @@ export default function RunDetail() {
   const { id } = useParams();
   const runId = Number(id);
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
   const { data: run, error } = useQuery({
     queryKey: ['runs', runId],
@@ -76,16 +77,36 @@ export default function RunDetail() {
                 <th className="px-4 py-2 font-medium">Type</th>
                 <th className="px-4 py-2 font-medium">Version</th>
                 <th className="px-4 py-2 font-medium">Duration</th>
+                <th className="px-4 py-2 font-medium">Changes</th>
                 <th className="px-4 py-2 font-medium">Result</th>
+                <th className="px-4 py-2" />
               </tr>
             </thead>
             <tbody>
-              {sources.map(source => (
-                <tr key={`${source.product_name}-${source.type}`} className="border-b border-edge/60 last:border-0">
+              {sources.map((source, index) => (
+                <tr
+                  key={`${source.product_name}-${source.type}-${index}`}
+                  onClick={() => navigate(`/runs/${run.id}/sources/${index}`)}
+                  className="cursor-pointer border-b border-edge/60 transition last:border-0 hover:bg-edge/20"
+                >
                   <td className="px-4 py-2 font-medium">{source.product_name}</td>
                   <td className="px-4 py-2 text-ink-secondary">{source.type}</td>
                   <td className="px-4 py-2 text-ink-secondary">{source.version}</td>
                   <td className="px-4 py-2 text-ink-secondary">{formatDuration(source.duration_ms / 1000)}</td>
+                  <td className="px-4 py-2 text-ink-secondary">
+                    {source.counters ? (
+                      <span className="whitespace-nowrap tabular-nums">
+                        <span className={source.counters.items_new > 0 ? 'text-good-text' : ''}>+{source.counters.items_new}</span>
+                        {' '}
+                        <span>~{source.counters.items_updated}</span>
+                        {' '}
+                        <span className={source.counters.items_deleted > 0 ? 'text-critical' : ''}>−{source.counters.items_deleted}</span>
+                        <span className="ml-1 text-xs text-ink-muted">{source.counters.items_kind}</span>
+                      </span>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
                   <td className="px-4 py-2">
                     {source.ok ? (
                       <span className="text-good-text">✓ ok</span>
@@ -93,6 +114,7 @@ export default function RunDetail() {
                       <span className="text-critical" title={source.error}>✕ {source.error ?? 'failed'}</span>
                     )}
                   </td>
+                  <td className="px-4 py-2 text-ink-muted">›</td>
                 </tr>
               ))}
             </tbody>

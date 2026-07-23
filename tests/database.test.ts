@@ -227,6 +227,17 @@ describe('DatabaseManager', () => {
             expect(result.product_name).toBe('TestProduct');
         });
 
+        it('should record a creation date for each inserted chunk', () => {
+            const chunk = createTestChunk();
+            DatabaseManager.insertVectorsSQLite(db, chunk, createTestEmbedding(), testLogger);
+
+            const row = db.prepare('SELECT created_at FROM vec_chunk_dates WHERE chunk_id = ?')
+                .get(chunk.metadata.chunk_id) as any;
+
+            expect(row).toBeDefined();
+            expect(new Date(row.created_at).getTime()).not.toBeNaN();
+        });
+
         it('should handle duplicate chunk_id inserts gracefully', () => {
             // Note: vec0 virtual tables silently ignore duplicate UNIQUE inserts
             // rather than throwing an error. This means the update path in
@@ -414,6 +425,27 @@ describe('DatabaseManager', () => {
             expect(remaining.length).toBe(1);
             expect(remaining[0].chunk_id).toBe('out-of-scope');
         });
+
+        it('should report deleted URL and chunk counts', () => {
+            const embedding = createTestEmbedding();
+            // Two chunks on one obsolete page, one chunk on another
+            for (const [chunkId, url] of [
+                ['gone-1a', 'https://example.com/gone1'],
+                ['gone-1b', 'https://example.com/gone1'],
+                ['gone-2', 'https://example.com/gone2'],
+                ['kept', 'https://example.com/kept'],
+            ]) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = chunkId;
+                chunk.metadata.url = url;
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger);
+            }
+
+            const visitedUrls = new Set(['https://example.com/kept']);
+            const removed = DatabaseManager.removeObsoleteChunksSQLite(db, visitedUrls, 'https://example.com', testLogger);
+
+            expect(removed).toEqual({ items: 2, chunks: 3 });
+        });
     });
 
     // ─── removeChunksByUrlSQLite ─────────────────────────────────────
@@ -453,6 +485,19 @@ describe('DatabaseManager', () => {
         it('should not error when no chunks match', () => {
             DatabaseManager.removeChunksByUrlSQLite(db, 'https://nonexistent.com/page', testLogger);
             // Should not throw
+        });
+
+        it('should return the number of deleted chunks', () => {
+            const embedding = createTestEmbedding();
+            for (let i = 0; i < 3; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = `chunk-${i}`;
+                chunk.metadata.url = 'https://example.com/target';
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger);
+            }
+
+            expect(DatabaseManager.removeChunksByUrlSQLite(db, 'https://example.com/target', testLogger)).toBe(3);
+            expect(DatabaseManager.removeChunksByUrlSQLite(db, 'https://example.com/target', testLogger)).toBe(0);
         });
     });
 
