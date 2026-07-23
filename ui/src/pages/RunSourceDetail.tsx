@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useParams } from 'react-router-dom';
 import { api, ApiError, ChunkLookupResult, ChunkRecord, SourceRunCounters } from '../api';
@@ -18,6 +18,61 @@ function statCards(counters: SourceRunCounters): Array<{ label: string; value: n
   ];
 }
 
+type SortKey = 'chunk_id' | 'position' | 'section' | 'size';
+
+// Default directions: sizes largest-first, the rest ascending
+const DEFAULT_DIR: Record<SortKey, 'asc' | 'desc'> = {
+  chunk_id: 'asc',
+  position: 'asc',
+  section: 'asc',
+  size: 'desc',
+};
+
+function compareChunks(a: ChunkRecord, b: ChunkRecord, key: SortKey, dir: 'asc' | 'desc'): number {
+  const sign = dir === 'asc' ? 1 : -1;
+  switch (key) {
+    case 'chunk_id':
+      return a.chunk_id.localeCompare(b.chunk_id) * sign;
+    case 'position':
+      return ((a.chunk_index ?? Number.MAX_SAFE_INTEGER) - (b.chunk_index ?? Number.MAX_SAFE_INTEGER)) * sign;
+    case 'section':
+      return (a.section ?? '').localeCompare(b.section ?? '') * sign;
+    case 'size':
+      return (a.content.length - b.content.length) * sign;
+  }
+}
+
+function SortableHeader({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  align = 'left',
+}: {
+  label: string;
+  sortKey: SortKey;
+  sort: { key: SortKey; dir: 'asc' | 'desc' };
+  onSort: (key: SortKey) => void;
+  align?: 'left' | 'right';
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <th className={`px-4 py-2 font-medium ${align === 'right' ? 'text-right' : 'text-left'}`}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={`inline-flex items-center gap-1 uppercase tracking-wide transition hover:text-accent ${
+          active ? 'text-accent' : ''
+        }`}
+        title={`Sort by ${label.toLowerCase()}`}
+      >
+        {label}
+        <span className={active ? '' : 'opacity-30'}>{active ? (sort.dir === 'asc' ? '▲' : '▼') : '↕'}</span>
+      </button>
+    </th>
+  );
+}
+
 function ChunkRow({ chunk }: { chunk: ChunkRecord }) {
   const [open, setOpen] = useState(false);
   return (
@@ -26,7 +81,6 @@ function ChunkRow({ chunk }: { chunk: ChunkRecord }) {
         onClick={() => setOpen(o => !o)}
         className="cursor-pointer border-b border-edge/60 transition last:border-0 hover:bg-edge/20"
       >
-        <td className="px-4 py-2 text-ink-secondary">{chunk.created_at ? formatTime(chunk.created_at) : '—'}</td>
         <td className="px-4 py-2 font-mono text-xs text-ink-secondary" title={chunk.chunk_id}>
           {chunk.chunk_id.slice(0, 10)}…
         </td>
@@ -43,7 +97,7 @@ function ChunkRow({ chunk }: { chunk: ChunkRecord }) {
       </tr>
       {open && (
         <tr className="border-b border-edge/60 last:border-0">
-          <td colSpan={6} className="bg-edge/10 px-4 py-3">
+          <td colSpan={5} className="bg-edge/10 px-4 py-3">
             <dl className="mb-3 flex flex-wrap gap-x-8 gap-y-1 text-xs">
               <div>
                 <dt className="uppercase tracking-wide text-ink-muted">Chunk ID</dt>
@@ -53,6 +107,12 @@ function ChunkRow({ chunk }: { chunk: ChunkRecord }) {
                 <div>
                   <dt className="uppercase tracking-wide text-ink-muted">Content hash</dt>
                   <dd className="mt-0.5 font-mono text-ink-secondary">{chunk.hash}</dd>
+                </div>
+              )}
+              {chunk.created_at && (
+                <div>
+                  <dt className="uppercase tracking-wide text-ink-muted">Created / Updated</dt>
+                  <dd className="mt-0.5 text-ink-secondary">{formatTime(chunk.created_at)}</dd>
                 </div>
               )}
               {chunk.heading_hierarchy.length > 0 && (
@@ -93,6 +153,10 @@ export default function RunSourceDetail() {
 
   const [url, setUrl] = useState('');
   const [lookupUrl, setLookupUrl] = useState<string | null>(null);
+  const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' }>({ key: 'position', dir: 'asc' });
+
+  const onSort = (key: SortKey) =>
+    setSort(prev => (prev.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: DEFAULT_DIR[key] }));
 
   const source = run?.stats?.sources?.[idx];
 
@@ -108,6 +172,17 @@ export default function RunSourceDetail() {
     enabled: run !== undefined && source !== undefined && lookupUrl !== null,
     retry: false,
   });
+
+  const sortedChunks = useMemo(
+    () => (chunkQuery.data ? [...chunkQuery.data.chunks].sort((a, b) => compareChunks(a, b, sort.key, sort.dir)) : []),
+    [chunkQuery.data, sort]
+  );
+  // A changed URL has all its chunks recreated together, so they share one
+  // date — surface the newest as the URL's created/updated date.
+  const urlDate = useMemo(() => {
+    const dates = (chunkQuery.data?.chunks ?? []).map(c => c.created_at).filter((d): d is string => !!d);
+    return dates.length > 0 ? dates.reduce((a, b) => (a > b ? a : b)) : null;
+  }, [chunkQuery.data]);
 
   if (error) return <p className="text-critical">{(error as ApiError).message}</p>;
   if (!run) return <p className="text-ink-muted">Loading…</p>;
@@ -193,7 +268,8 @@ export default function RunSourceDetail() {
       <div>
         <h2 className="mb-2 text-sm font-semibold text-ink-secondary">Chunk lookup</h2>
         <p className="mb-2 text-xs text-ink-muted">
-          Shows the chunks currently stored in this source's vector database for a URL (live view, newest first).
+          Shows the chunks currently stored in this source's vector database for a URL (live view, ordered by
+          position — click a column heading to sort).
         </p>
         <form onSubmit={onSubmit} className="flex gap-2">
           <input
@@ -215,28 +291,46 @@ export default function RunSourceDetail() {
         {chunkQuery.error && <p className="mt-3 text-sm text-critical">{chunkQuery.error.message}</p>}
 
         {chunkQuery.data && (
-          <div className="mt-4 space-y-2">
-            <p className="text-xs text-ink-muted">
-              {chunkQuery.data.chunks.length} chunk{chunkQuery.data.chunks.length === 1 ? '' : 's'} in{' '}
-              {chunkQuery.data.database.type === 'qdrant'
-                ? `Qdrant collection '${chunkQuery.data.database.collection}'`
-                : `SQLite database ${chunkQuery.data.database.path}`}
-            </p>
+          <div className="mt-4 space-y-3">
+            <dl className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
+              <div>
+                <dt className="text-xs uppercase tracking-wide text-ink-muted">Chunks</dt>
+                <dd className="mt-0.5 text-ink-secondary">{chunkQuery.data.chunks.length}</dd>
+              </div>
+              {chunkQuery.data.chunks.length > 0 && (
+                <div>
+                  <dt className="text-xs uppercase tracking-wide text-ink-muted">Created / Updated</dt>
+                  <dd
+                    className="mt-0.5 text-ink-secondary"
+                    title={urlDate ?? 'No date recorded: these chunks were stored before dates were tracked. A date is set when the page content changes and its chunks are recreated.'}
+                  >
+                    {urlDate ? formatTime(urlDate) : 'unknown (synced before dates were recorded)'}
+                  </dd>
+                </div>
+              )}
+              <div>
+                <dt className="text-xs uppercase tracking-wide text-ink-muted">Store</dt>
+                <dd className="mt-0.5 text-ink-secondary">
+                  {chunkQuery.data.database.type === 'qdrant'
+                    ? `Qdrant collection '${chunkQuery.data.database.collection}'`
+                    : `SQLite ${chunkQuery.data.database.path}`}
+                </dd>
+              </div>
+            </dl>
             {chunkQuery.data.chunks.length > 0 && (
               <div className="overflow-x-auto rounded-lg border border-edge bg-surface">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-edge text-left text-xs uppercase tracking-wide text-ink-muted">
-                      <th className="px-4 py-2 font-medium">Created</th>
-                      <th className="px-4 py-2 font-medium">Chunk</th>
-                      <th className="px-4 py-2 font-medium">Position</th>
-                      <th className="px-4 py-2 font-medium">Section</th>
-                      <th className="px-4 py-2 text-right font-medium">Size</th>
+                    <tr className="border-b border-edge text-xs text-ink-muted">
+                      <SortableHeader label="Chunk" sortKey="chunk_id" sort={sort} onSort={onSort} />
+                      <SortableHeader label="Position" sortKey="position" sort={sort} onSort={onSort} />
+                      <SortableHeader label="Section" sortKey="section" sort={sort} onSort={onSort} />
+                      <SortableHeader label="Size" sortKey="size" sort={sort} onSort={onSort} align="right" />
                       <th className="px-4 py-2" />
                     </tr>
                   </thead>
                   <tbody>
-                    {chunkQuery.data.chunks.map(chunk => (
+                    {sortedChunks.map(chunk => (
                       <ChunkRow key={chunk.chunk_id} chunk={chunk} />
                     ))}
                   </tbody>

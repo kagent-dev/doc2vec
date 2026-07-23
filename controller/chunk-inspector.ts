@@ -194,15 +194,13 @@ function parseHierarchy(value: unknown): string[] {
     return value ? [String(value)] : [];
 }
 
-// Newest first; chunks without a creation date (stored before this feature) sink
-// to the bottom, ordered by their position in the page.
+// Default order: position within the page. The UI offers per-column sorting
+// (including by creation date) on top of this.
 function sortChunks(chunks: ChunkRecord[]): ChunkRecord[] {
     return chunks.sort((a, b) => {
-        if (a.created_at && b.created_at && a.created_at !== b.created_at) {
-            return a.created_at < b.created_at ? 1 : -1;
-        }
-        if (a.created_at && !b.created_at) return -1;
-        if (!a.created_at && b.created_at) return 1;
-        return (a.chunk_index ?? 0) - (b.chunk_index ?? 0);
+        const ai = a.chunk_index ?? Number.MAX_SAFE_INTEGER;
+        const bi = b.chunk_index ?? Number.MAX_SAFE_INTEGER;
+        if (ai !== bi) return ai - bi;
+        return a.chunk_id.localeCompare(b.chunk_id);
     });
 }

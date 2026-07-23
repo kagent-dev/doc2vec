@@ -89,14 +89,14 @@ afterEach(() => {
 });
 
 describe('lookupChunks (sqlite)', () => {
-    it('returns the chunks stored for a URL, newest first, with content and metadata', async () => {
+    it('returns the chunks stored for a URL in page order, with creation dates and content', async () => {
         const db = createDbFile();
         const embedding = [0.1, 0.2, 0.3, 0.4];
-        DatabaseManager.insertVectorsSQLite(db, makeChunk({ chunk_id: 'chunk-old', content: 'Old chunk', chunk_index: 0, total_chunks: 2 }), embedding, testLogger);
-        DatabaseManager.insertVectorsSQLite(db, makeChunk({ chunk_id: 'chunk-new', content: 'New chunk', chunk_index: 1, total_chunks: 2 }), embedding, testLogger);
-        // Force distinct creation dates so ordering is deterministic
-        db.prepare(`UPDATE vec_chunk_dates SET created_at = ? WHERE chunk_id = ?`).run('2026-01-01T00:00:00.000Z', 'chunk-old');
-        db.prepare(`UPDATE vec_chunk_dates SET created_at = ? WHERE chunk_id = ?`).run('2026-06-01T00:00:00.000Z', 'chunk-new');
+        // Insert out of page order to prove the result is sorted by position
+        DatabaseManager.insertVectorsSQLite(db, makeChunk({ chunk_id: 'chunk-second', content: 'Second chunk', chunk_index: 1, total_chunks: 2 }), embedding, testLogger);
+        DatabaseManager.insertVectorsSQLite(db, makeChunk({ chunk_id: 'chunk-first', content: 'First chunk', chunk_index: 0, total_chunks: 2 }), embedding, testLogger);
+        db.prepare(`UPDATE vec_chunk_dates SET created_at = ? WHERE chunk_id = ?`).run('2026-01-01T00:00:00.000Z', 'chunk-first');
+        db.prepare(`UPDATE vec_chunk_dates SET created_at = ? WHERE chunk_id = ?`).run('2026-06-01T00:00:00.000Z', 'chunk-second');
         db.close();
 
         const result = await lookupChunks(
@@ -108,11 +108,12 @@ describe('lookupChunks (sqlite)', () => {
         expect(result.database).toEqual({ type: 'sqlite', path: dbPath });
         expect(result.source).toEqual({ product_name: 'TestSite', type: 'website', version: '1.0' });
         expect(result.chunks).toHaveLength(2);
-        expect(result.chunks[0].chunk_id).toBe('chunk-new');
-        expect(result.chunks[0].created_at).toBe('2026-06-01T00:00:00.000Z');
-        expect(result.chunks[0].content).toBe('New chunk');
+        expect(result.chunks[0].chunk_id).toBe('chunk-first');
+        expect(result.chunks[0].created_at).toBe('2026-01-01T00:00:00.000Z');
+        expect(result.chunks[0].content).toBe('First chunk');
         expect(result.chunks[0].heading_hierarchy).toEqual(['Guide', 'Install']);
-        expect(result.chunks[1].chunk_id).toBe('chunk-old');
+        expect(result.chunks[1].chunk_id).toBe('chunk-second');
+        expect(result.chunks[1].created_at).toBe('2026-06-01T00:00:00.000Z');
     });
 
     it('returns an empty list for a URL with no chunks', async () => {
