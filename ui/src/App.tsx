@@ -5,6 +5,7 @@ import { api } from './api';
 import Dashboard from './pages/Dashboard';
 import ConfigDetail from './pages/ConfigDetail';
 import RunDetail from './pages/RunDetail';
+import RunSourceDetail from './pages/RunSourceDetail';
 
 export default function App() {
   const queryClient = useQueryClient();
@@ -50,6 +51,7 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/configs/:id" element={<ConfigDetail />} />
           <Route path="/runs/:id" element={<RunDetail />} />
+          <Route path="/runs/:id/sources/:sourceIndex" element={<RunSourceDetail />} />
         </Routes>
       </main>
     </div>

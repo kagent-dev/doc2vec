@@ -53,6 +53,16 @@ export interface RunRecord {
     finished_at: string | null;
 }
 
+export interface SourceRunCounters {
+    items_kind: string;
+    items_new: number;
+    items_updated: number;
+    items_unchanged: number;
+    items_deleted: number;
+    chunks_added: number;
+    chunks_deleted: number;
+}
+
 export interface RunStatsPayload {
     sources?: Array<{
         product_name: string;
@@ -61,6 +71,7 @@ export interface RunStatsPayload {
         duration_ms: number;
         ok: boolean;
         error?: string;
+        counters?: SourceRunCounters;
     }>;
     warn_count?: number;
     error_count?: number;

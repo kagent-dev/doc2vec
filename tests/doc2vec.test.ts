@@ -66,12 +66,12 @@ vi.mock('../database', () => ({
         }),
         insertVectorsSQLite: vi.fn(),
         storeChunkInQdrant: vi.fn().mockResolvedValue(undefined),
-        removeObsoleteChunksSQLite: vi.fn(),
-        removeObsoleteChunksQdrant: vi.fn().mockResolvedValue(undefined),
-        removeObsoleteFilesSQLite: vi.fn(),
-        removeObsoleteFilesQdrant: vi.fn().mockResolvedValue(undefined),
-        removeChunksByUrlSQLite: vi.fn(),
-        removeChunksByUrlQdrant: vi.fn().mockResolvedValue(undefined),
+        removeObsoleteChunksSQLite: vi.fn().mockReturnValue({ items: 0, chunks: 0 }),
+        removeObsoleteChunksQdrant: vi.fn().mockResolvedValue({ items: 0, chunks: 0 }),
+        removeObsoleteFilesSQLite: vi.fn().mockReturnValue({ items: 0, chunks: 0 }),
+        removeObsoleteFilesQdrant: vi.fn().mockResolvedValue({ items: 0, chunks: 0 }),
+        removeChunksByUrlSQLite: vi.fn().mockReturnValue(0),
+        removeChunksByUrlQdrant: vi.fn().mockResolvedValue(0),
         getChunkHashesByUrlSQLite: vi.fn().mockReturnValue([]),
         getChunkHashesByUrlQdrant: vi.fn().mockResolvedValue([]),
         getStoredUrlsByPrefixSQLite: vi.fn().mockReturnValue([]),
@@ -1976,6 +1976,116 @@ sources:
                 issueUrl(42),
                 expect.anything(),
             );
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Source run counters (per-source stats surfaced in the controller UI)
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('source run counters', () => {
+        const url = 'https://example.com/page';
+        const dbConnection = { type: 'sqlite', db: {} };
+
+        function makeChunk(content: string, index = 0, total = 1) {
+            return {
+                content,
+                metadata: {
+                    product_name: 'TestSite',
+                    version: '1.0',
+                    heading_hierarchy: [],
+                    section: 'S',
+                    chunk_id: `chunk-${index}`,
+                    url,
+                    chunk_index: index,
+                    total_chunks: total,
+                },
+            };
+        }
+
+        async function makeInstanceWithEmbeddings() {
+            const { __mockEmbeddingsCreate } = await import('openai') as any;
+            __mockEmbeddingsCreate.mockResolvedValue({ data: [{ embedding: [0.1, 0.2] }] });
+            const configPath = writeTestConfig('counters.yaml', makeMinimalConfig());
+            return new Doc2Vec(configPath) as any;
+        }
+
+        it('counts a URL with no stored chunks as new and tallies added chunks', async () => {
+            const instance = await makeInstanceWithEmbeddings();
+            (DatabaseManager.getChunkHashesByUrlSQLite as any).mockReturnValue([]);
+
+            await instance.processChunksForUrl([makeChunk('a'), makeChunk('b', 1, 2)], url, dbConnection, instance.logger);
+
+            expect(instance.counters.items_new).toBe(1);
+            expect(instance.counters.items_updated).toBe(0);
+            expect(instance.counters.items_unchanged).toBe(0);
+            expect(instance.counters.chunks_added).toBe(2);
+            expect(instance.counters.chunks_deleted).toBe(0);
+        });
+
+        it('counts an identical URL as unchanged with no chunk churn', async () => {
+            const instance = await makeInstanceWithEmbeddings();
+            const { Utils } = await import('../utils');
+            (Utils.generateHash as any).mockImplementation((content: string) => `hash-${content}`);
+            (DatabaseManager.getChunkHashesByUrlSQLite as any).mockReturnValue(['hash-a']);
+
+            await instance.processChunksForUrl([makeChunk('a')], url, dbConnection, instance.logger);
+
+            expect(instance.counters.items_unchanged).toBe(1);
+            expect(instance.counters.items_new).toBe(0);
+            expect(instance.counters.chunks_added).toBe(0);
+            expect(instance.counters.chunks_deleted).toBe(0);
+        });
+
+        it('counts a changed URL as updated, deleting old chunks and adding new ones', async () => {
+            const instance = await makeInstanceWithEmbeddings();
+            const { Utils } = await import('../utils');
+            (Utils.generateHash as any).mockImplementation((content: string) => `hash-${content}`);
+            (DatabaseManager.getChunkHashesByUrlSQLite as any).mockReturnValue(['hash-old-1', 'hash-old-2', 'hash-old-3']);
+
+            await instance.processChunksForUrl([makeChunk('a')], url, dbConnection, instance.logger);
+
+            expect(instance.counters.items_updated).toBe(1);
+            expect(instance.counters.chunks_deleted).toBe(3);
+            expect(instance.counters.chunks_added).toBe(1);
+        });
+
+        it('attaches counters with the source-appropriate item kind to run() stats', async () => {
+            const configPath = writeTestConfig('counters-run.yaml', makeMinimalConfig());
+            const instance = new Doc2Vec(configPath);
+            (instance as any).contentProcessor.crawlWebsite = vi.fn().mockResolvedValue({
+                hasNetworkErrors: false,
+                brokenLinks: [],
+            });
+
+            const stats = await instance.run();
+
+            expect(stats).toHaveLength(1);
+            expect(stats[0].counters).toMatchObject({
+                items_kind: 'pages',
+                items_new: 0,
+                items_updated: 0,
+                items_unchanged: 0,
+                items_deleted: 0,
+                chunks_added: 0,
+                chunks_deleted: 0,
+            });
+        });
+
+        it('counts obsolete cleanup results as deleted items and chunks', async () => {
+            const configPath = writeTestConfig('counters-cleanup.yaml', makeMinimalConfig());
+            const instance = new Doc2Vec(configPath);
+            (instance as any).contentProcessor.crawlWebsite = vi.fn().mockResolvedValue({
+                hasNetworkErrors: false,
+                brokenLinks: [],
+            });
+            (DatabaseManager.removeObsoleteChunksSQLite as any).mockReturnValue({ items: 2, chunks: 7 });
+
+            const stats = await instance.run();
+
+            expect(stats[0].counters).toMatchObject({
+                items_deleted: 2,
+                chunks_deleted: 7,
+            });
         });
     });
 });

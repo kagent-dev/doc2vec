@@ -8,6 +8,26 @@ export interface SourceSummary {
 
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'canceled';
 
+export interface SourceRunCounters {
+  items_kind: string;
+  items_new: number;
+  items_updated: number;
+  items_unchanged: number;
+  items_deleted: number;
+  chunks_added: number;
+  chunks_deleted: number;
+}
+
+export interface SourceRunStats {
+  product_name: string;
+  type: string;
+  version: string;
+  duration_ms: number;
+  ok: boolean;
+  error?: string;
+  counters?: SourceRunCounters;
+}
+
 export interface RunRecord {
   id: number;
   config_id: number;
@@ -18,14 +38,7 @@ export interface RunRecord {
   exit_code: number | null;
   error: string | null;
   stats: {
-    sources?: Array<{
-      product_name: string;
-      type: string;
-      version: string;
-      duration_ms: number;
-      ok: boolean;
-      error?: string;
-    }>;
+    sources?: SourceRunStats[];
     warn_count?: number;
     error_count?: number;
   };
@@ -33,6 +46,26 @@ export interface RunRecord {
   started_at: string | null;
   finished_at: string | null;
   config_name?: string | null;
+}
+
+export interface ChunkRecord {
+  chunk_id: string;
+  url: string;
+  product_name: string | null;
+  version: string | null;
+  section: string | null;
+  heading_hierarchy: string[];
+  chunk_index: number | null;
+  total_chunks: number | null;
+  hash: string | null;
+  created_at: string | null;
+  content: string;
+}
+
+export interface ChunkLookupResult {
+  source: { product_name: string; type: string; version: string };
+  database: { type: 'sqlite'; path: string } | { type: 'qdrant'; url: string; collection: string };
+  chunks: ChunkRecord[];
 }
 
 export interface ConfigRecord {
@@ -112,6 +145,14 @@ export const api = {
   triggerRun: (configId: number) => request<RunRecord>(`/api/configs/${configId}/run`, { method: 'POST' }),
   configStats: (configId: number, days: number) =>
     request<ConfigStats>(`/api/configs/${configId}/stats?days=${days}`),
+  chunksForUrl: (configId: number, params: { product_name: string; type?: string; version?: string; url: string }) => {
+    const qs = new URLSearchParams();
+    qs.set('product_name', params.product_name);
+    if (params.type) qs.set('type', params.type);
+    if (params.version) qs.set('version', params.version);
+    qs.set('url', params.url);
+    return request<ChunkLookupResult>(`/api/configs/${configId}/chunks?${qs}`);
+  },
   runs: (params: { configId?: number; status?: string; limit?: number; before?: number } = {}) => {
     const qs = new URLSearchParams();
     if (params.configId !== undefined) qs.set('configId', String(params.configId));

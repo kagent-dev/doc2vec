@@ -29,7 +29,9 @@ import {
     BrokenLink,
     EmbeddingConfig,
     MarkdownStoreConfig,
-    SourceRunStats
+    SourceRunStats,
+    SourceRunCounters,
+    newSourceRunCounters
 } from './types';
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { MarkdownStore } from './markdown-store';
@@ -49,6 +51,9 @@ export class Doc2Vec {
     private configDir: string;
     private brokenLinksByWebsite: Record<string, BrokenLink[]> = {};
     private markdownStore: MarkdownStore | undefined;
+    // Change counters for the source currently being processed by run().
+    // Sources are processed sequentially, so a single slot is sufficient.
+    private counters: SourceRunCounters = newSourceRunCounters('items');
 
     constructor(configPath: string) {
         this.logger = new Logger('Doc2Vec', {
@@ -194,6 +199,16 @@ export class Doc2Vec {
             let ok = true;
             let errorMessage: string | undefined;
 
+            const itemsKindByType: Record<string, string> = {
+                website: 'pages',
+                github: 'issues',
+                local_directory: 'files',
+                code: 'files',
+                s3: 'objects',
+                zendesk: 'items',
+            };
+            this.counters = newSourceRunCounters(itemsKindByType[sourceConfig.type] ?? 'items');
+
             try {
                 if (sourceConfig.type === 'github') {
                     await this.processGithubRepo(sourceConfig, sourceLogger);
@@ -224,7 +239,8 @@ export class Doc2Vec {
                 version: sourceConfig.version,
                 duration_ms: Date.now() - startTime,
                 ok,
-                ...(errorMessage && { error: errorMessage })
+                ...(errorMessage && { error: errorMessage }),
+                counters: this.counters
             });
         }
 
@@ -406,10 +422,17 @@ export class Doc2Vec {
             // ones would otherwise linger — leaving stale state ("open") and missing
             // the latest comments in search results. All chunks for an issue share
             // its unique url, so delete-by-url reconciles them exactly.
+            let removedChunks = 0;
             if (dbConnection.type === 'sqlite') {
-                DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
             } else if (dbConnection.type === 'qdrant') {
-                await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+            }
+            if (removedChunks > 0) {
+                this.counters.items_updated++;
+                this.counters.chunks_deleted += removedChunks;
+            } else {
+                this.counters.items_new++;
             }
 
             // Process and store each chunk immediately
@@ -429,6 +452,7 @@ export class Doc2Vec {
                     const embeddings = await this.createEmbeddings([chunk.content]);
                     if (embeddings.length) {
                         DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
+                        this.counters.chunks_added++;
                         logger.debug(`Stored chunk ${chunkId} in SQLite`);
                     } else {
                         logger.error(`Embedding failed for chunk: ${chunkId}`);
@@ -459,6 +483,7 @@ export class Doc2Vec {
                         const embeddings = await this.createEmbeddings([chunk.content]);
                         if (embeddings.length) {
                             await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
+                            this.counters.chunks_added++;
                             logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
                         } else {
                             logger.error(`Embedding failed for chunk: ${chunkId}`);
@@ -631,10 +656,15 @@ export class Doc2Vec {
                 }
                 // Vector DB chunks
                 try {
+                    let removedChunks = 0;
                     if (dbConnection.type === 'sqlite') {
-                        DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                        removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
                     } else if (dbConnection.type === 'qdrant') {
-                        await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                    }
+                    if (removedChunks > 0) {
+                        this.counters.items_deleted++;
+                        this.counters.chunks_deleted += removedChunks;
                     }
                 } catch (dbError) {
                     logger.error(`Failed to delete chunks for 404 URL ${url}:`, dbError);
@@ -653,13 +683,16 @@ export class Doc2Vec {
                 await DatabaseManager.setMetadataValue(dbConnection, syncCompleteKey, 'true', logger, this.embeddingDimension);
                 logger.info('Full sync completed successfully — subsequent runs will use normal caching');
             }
+            let removed = { items: 0, chunks: 0 };
             if (dbConnection.type === 'sqlite') {
                 logger.info(`Running SQLite cleanup for ${urlPrefix}`);
-                DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);
+                removed = DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);
             } else if (dbConnection.type === 'qdrant') {
                 logger.info(`Running Qdrant cleanup for ${urlPrefix} in collection ${dbConnection.collectionName}`);
-                await DatabaseManager.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
+                removed = await DatabaseManager.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
             }
+            this.counters.items_deleted += removed.items;
+            this.counters.chunks_deleted += removed.chunks;
         }
 
         logger.info(`Finished processing website: ${config.url}`);
@@ -763,14 +796,17 @@ export class Doc2Vec {
         );
         
         logger.section('CLEANUP');
+        let removed = { items: 0, chunks: 0 };
         if (dbConnection.type === 'sqlite') {
             logger.info(`Running SQLite cleanup for local directory ${config.path}`);
-            DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config, logger);
+            removed = DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config, logger);
         } else if (dbConnection.type === 'qdrant') {
             logger.info(`Running Qdrant cleanup for local directory ${config.path} in collection ${dbConnection.collectionName}`);
-            await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, config, logger);
+            removed = await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, config, logger);
         }
-        
+        this.counters.items_deleted += removed.items;
+        this.counters.chunks_deleted += removed.chunks;
+
         logger.info(`Finished processing local directory: ${config.path}`);
     }
 
@@ -960,10 +996,15 @@ export class Doc2Vec {
                     fileUrl = `s3://${config.bucket}/${deletedKey}`;
                 }
 
+                let removedChunks = 0;
                 if (dbConnection.type === 'sqlite') {
-                    DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, fileUrl, logger);
+                    removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, fileUrl, logger);
                 } else if (dbConnection.type === 'qdrant') {
-                    await DatabaseManager.removeChunksByUrlQdrant(dbConnection, fileUrl, logger);
+                    removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, fileUrl, logger);
+                }
+                if (removedChunks > 0) {
+                    this.counters.items_deleted++;
+                    this.counters.chunks_deleted += removedChunks;
                 }
             }
         }
@@ -1124,10 +1165,15 @@ export class Doc2Vec {
                 if (deleteUrls.length > 0) {
                     logger.info(`Cleaning up ${deleteUrls.length} deleted/renamed files`);
                     for (const url of deleteUrls) {
+                        let removedChunks = 0;
                         if (dbConnection.type === 'sqlite') {
-                            DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                            removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
                         } else if (dbConnection.type === 'qdrant') {
-                            await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                            removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        }
+                        if (removedChunks > 0) {
+                            this.counters.items_deleted++;
+                            this.counters.chunks_deleted += removedChunks;
                         }
                     }
                 } else {
@@ -1142,10 +1188,15 @@ export class Doc2Vec {
 
                     for (const deletedFile of deletedFiles) {
                         const url = this.buildCodeFileUrl(deletedFile, basePath as string, config, repoUrlPrefix);
+                        let removedChunks = 0;
                         if (dbConnection.type === 'sqlite') {
-                            DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                            removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
                         } else if (dbConnection.type === 'qdrant') {
-                            await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                            removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        }
+                        if (removedChunks > 0) {
+                            this.counters.items_deleted++;
+                            this.counters.chunks_deleted += removedChunks;
                         }
                     }
 
@@ -1156,13 +1207,16 @@ export class Doc2Vec {
                     }
                 }
             } else {
+                let removed = { items: 0, chunks: 0 };
                 if (dbConnection.type === 'sqlite') {
                     logger.info(`Running SQLite cleanup for code source ${basePath}`);
-                    DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, cleanupPathConfig, logger);
+                    removed = DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, cleanupPathConfig, logger);
                 } else if (dbConnection.type === 'qdrant') {
                     logger.info(`Running Qdrant cleanup for code source ${basePath} in collection ${dbConnection.collectionName}`);
-                    await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, cleanupPathConfig, logger);
+                    removed = await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, cleanupPathConfig, logger);
                 }
+                this.counters.items_deleted += removed.items;
+                this.counters.chunks_deleted += removed.chunks;
             }
 
             if (config.source === 'github' && basePath && repoBranch) {
@@ -1475,10 +1529,15 @@ export class Doc2Vec {
             // Deleted tickets — remove their chunks and stop
             if (ticket.status === 'deleted') {
                 logger.info(`Ticket #${ticketId} was deleted in Zendesk — removing its chunks`);
+                let removedChunks = 0;
                 if (dbConnection.type === 'sqlite') {
-                    DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                    removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
                 } else {
-                    await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                    removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                }
+                if (removedChunks > 0) {
+                    this.counters.items_deleted++;
+                    this.counters.chunks_deleted += removedChunks;
                 }
                 return;
             }
@@ -1787,6 +1846,7 @@ export class Doc2Vec {
 
         if (unchanged) {
             logger.info(`Skipping unchanged URL (${chunks.length} chunks): ${url}`);
+            this.counters.items_unchanged++;
             return 0;
         }
 
@@ -1798,6 +1858,10 @@ export class Doc2Vec {
             } else {
                 await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
             }
+            this.counters.items_updated++;
+            this.counters.chunks_deleted += existingHashesSorted.length;
+        } else {
+            this.counters.items_new++;
         }
 
         // 5. Embed and insert all new chunks
@@ -1827,6 +1891,7 @@ export class Doc2Vec {
         }
 
         chunkProgress.complete();
+        this.counters.chunks_added += embeddedCount;
         return embeddedCount;
     }
 

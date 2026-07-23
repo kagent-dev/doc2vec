@@ -2,6 +2,7 @@ import express, { NextFunction, Request, Response } from 'express';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from '../logger';
+import { lookupChunks } from './chunk-inspector';
 import { ConfigRegistry, isValidCron, parseConfigMeta } from './config-registry';
 import { ControllerEvents } from './events';
 import { JobRunner } from './job-runner';
@@ -140,6 +141,31 @@ export function createServer(deps: ServerDeps): express.Express {
         if (!registry.get(id)) throw new NotFoundError('config not found');
         const days = Number(req.query.days) || 30;
         res.json(await store.getConfigStats(id, days));
+    });
+
+    // Inspect the chunks currently stored for a URL in one source's vector store.
+    // This reads the live store, so results reflect the present state, not a
+    // historical run.
+    app.get('/api/configs/:id/chunks', async (req, res) => {
+        const config = registry.get(parseId(String(req.params.id)));
+        if (!config) throw new NotFoundError('config not found');
+        const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+        const productName = typeof req.query.product_name === 'string' ? req.query.product_name : '';
+        if (!url) throw new ValidationError('url query parameter is required');
+        if (!productName) throw new ValidationError('product_name query parameter is required');
+
+        try {
+            res.json(await lookupChunks(config.content, {
+                product_name: productName,
+                type: typeof req.query.type === 'string' && req.query.type ? req.query.type : undefined,
+                version: typeof req.query.version === 'string' && req.query.version ? req.query.version : undefined,
+            }, url));
+        } catch (err) {
+            if (err instanceof NotFoundError || err instanceof ValidationError) throw err;
+            // Vector store unreachable (e.g. Qdrant down) — surface the reason
+            logger.error('Chunk lookup failed:', err);
+            res.status(502).json({ error: `chunk lookup failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
     });
 
     // ------------------------------------------------------------------ runs

@@ -152,6 +152,31 @@ export interface BrokenLink {
     target: string;
 }
 
+// Change counters accumulated while syncing a single source. "Items" are the
+// source's natural unit (pages for websites, files for directories/code,
+// issues for GitHub, objects for S3, tickets/articles for Zendesk).
+export interface SourceRunCounters {
+    items_kind: string;
+    items_new: number;       // items that had no chunks stored before this run
+    items_updated: number;   // items whose content changed and were re-embedded
+    items_unchanged: number; // items skipped because stored chunks were identical
+    items_deleted: number;   // items purged from the store (404s, obsolete files, deleted tickets…)
+    chunks_added: number;
+    chunks_deleted: number;
+}
+
+export function newSourceRunCounters(itemsKind: string): SourceRunCounters {
+    return {
+        items_kind: itemsKind,
+        items_new: 0,
+        items_updated: 0,
+        items_unchanged: 0,
+        items_deleted: 0,
+        chunks_added: 0,
+        chunks_deleted: 0,
+    };
+}
+
 // Per-source outcome of a sync run, emitted as the `run-summary` structured event
 // and consumed by the controller to build run statistics
 export interface SourceRunStats {
@@ -161,6 +186,7 @@ export interface SourceRunStats {
     duration_ms: number;
     ok: boolean;
     error?: string;
+    counters?: SourceRunCounters;
 }
 
 export interface SqliteDB {
