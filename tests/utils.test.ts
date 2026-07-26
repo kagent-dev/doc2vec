@@ -363,4 +363,117 @@ describe('Utils', () => {
             expect(uuid).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
         });
     });
+    // ─── parseNextLink ──────────────────────────────────────────────
+    // GitHub caps page-number pagination on the issues endpoint (HTTP 422 past
+    // its offset limit), so following these cursor URLs is the only way to walk
+    // a large result set.
+    describe('parseNextLink', () => {
+        it('extracts the rel="next" URL', () => {
+            const header = '<https://api.github.com/repositories/1/issues?per_page=100&after=CURSOR>; rel="next"';
+            expect(Utils.parseNextLink(header))
+                .toBe('https://api.github.com/repositories/1/issues?per_page=100&after=CURSOR');
+        });
+
+        it('picks next out of a multi-rel header', () => {
+            const header = '<https://api.example/prev>; rel="prev", <https://api.example/next>; rel="next", <https://api.example/last>; rel="last"';
+            expect(Utils.parseNextLink(header)).toBe('https://api.example/next');
+        });
+
+        it('returns null when there is no next page', () => {
+            const header = '<https://api.example/first>; rel="first", <https://api.example/prev>; rel="prev"';
+            expect(Utils.parseNextLink(header)).toBeNull();
+        });
+
+        it('returns null for empty, undefined or null headers', () => {
+            expect(Utils.parseNextLink(undefined)).toBeNull();
+            expect(Utils.parseNextLink(null)).toBeNull();
+            expect(Utils.parseNextLink('')).toBeNull();
+        });
+
+        it('preserves the cursor query string verbatim', () => {
+            const url = 'https://api.github.com/repositories/74175805/issues?per_page=100&state=all&since=2024-01-01T00%3A00%3A00Z&after=Y3Vyc29yOnYyOpLPAAAB';
+            expect(Utils.parseNextLink(`<${url}>; rel="next"`)).toBe(url);
+        });
+    });
+
+    // ─── stripLoneSurrogates ────────────────────────────────────────
+    // A lone surrogate is invalid UTF-8, so Qdrant rejects the whole JSON body
+    // ("lone leading surrogate in hex escape") and the chunk is lost.
+    describe('stripLoneSurrogates', () => {
+        it('removes a lone high surrogate', () => {
+            const text = 'before \ud83d after';
+            const cleaned = Utils.stripLoneSurrogates(text);
+            expect(cleaned).toBe('before  after');
+            expect(cleaned.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('removes a lone low surrogate', () => {
+            const cleaned = Utils.stripLoneSurrogates('before \ude00 after');
+            expect(cleaned).toBe('before  after');
+            expect(cleaned.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('keeps valid surrogate pairs intact', () => {
+            const emoji = 'ok \ud83d\ude00 done';
+            expect(Utils.stripLoneSurrogates(emoji)).toBe(emoji);
+        });
+
+        it('keeps plain text unchanged', () => {
+            expect(Utils.stripLoneSurrogates('plain ascii + accents éàü + 日本語')).toBe('plain ascii + accents éàü + 日本語');
+        });
+
+        it('handles a lone surrogate adjacent to a valid pair', () => {
+            const cleaned = Utils.stripLoneSurrogates('\ud83d\ud83d\ude00');
+            expect(cleaned).toBe('\ud83d\ude00');
+            expect(cleaned.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('produces JSON-safe output for content that broke the upsert', () => {
+            const broken = 'x'.repeat(10) + '\ud83d';
+            expect(JSON.parse(JSON.stringify({ c: Utils.stripLoneSurrogates(broken) })).c).toBe('x'.repeat(10));
+        });
+    });
+
+    // ─── sliceSafe ──────────────────────────────────────────────────
+    // The chunker splits oversized sections by character offset; a boundary
+    // landing inside a surrogate pair used to emit two broken chunks.
+    describe('sliceSafe', () => {
+        it('never splits a surrogate pair at the end boundary', () => {
+            // Pair straddles index 4/5
+            const text = 'abcd\ud83d\ude00efg';
+            const slice = Utils.sliceSafe(text, 0, 5);
+            expect(slice).toBe('abcd');
+            expect(slice.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('picks up the whole pair the previous slice left behind', () => {
+            const text = 'abcd\ud83d\ude00efg';
+            // Index 5 is the low half; the slice steps back so the pair is intact
+            const slice = Utils.sliceSafe(text, 5, text.length);
+            expect(slice).toBe('\ud83d\ude00efg');
+            expect(slice.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('behaves like slice when no pair is straddled', () => {
+            expect(Utils.sliceSafe('hello world', 0, 5)).toBe('hello');
+            expect(Utils.sliceSafe('hello world', 6, 11)).toBe('world');
+        });
+
+        it('keeps a pair whole when it sits fully inside the range', () => {
+            const text = 'ab\ud83d\ude00cd';
+            expect(Utils.sliceSafe(text, 0, text.length)).toBe(text);
+        });
+
+        it('clamps out-of-range bounds', () => {
+            expect(Utils.sliceSafe('abc', -5, 99)).toBe('abc');
+        });
+
+        it('reassembles the original text when slicing contiguously across a pair', () => {
+            const text = 'aaaa\ud83d\ude00bbbb';
+            const first = Utils.sliceSafe(text, 0, 5);
+            const second = Utils.sliceSafe(text, 5, text.length);
+            expect(first + second).toBe(text);
+            expect((first + second).isWellFormed?.()).not.toBe(false);
+        });
+    });
 });

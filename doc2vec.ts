@@ -268,22 +268,33 @@ export class Doc2Vec {
         const startDate = sourceConfig.start_date || '2025-01-01';
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, repo, `${startDate}T00:00:00Z`, logger);
 
-        const fetchWithRetry = async (url: string, params = {}, retries = 5, delay = 5000): Promise<any> => {
+        // Retryable: 5xx, 429, rate-limited 403s, and network/timeout errors.
+        // Everything else is deterministic — the same request fails identically,
+        // so retrying only burns wall-clock. In particular a 422 from deep
+        // page-number pagination used to cost ~75s of backoff before failing.
+        const isRetryableStatus = (status: number | undefined): boolean =>
+            status === undefined || status >= 500 || status === 429;
+
+        const requestWithRetry = async (url: string, params?: Record<string, any>, retries = 5, delay = 5000): Promise<any> => {
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
                     // Only log on retries to reduce noise during pagination
                     if (attempt > 0) {
                         logger.debug(`GitHub API retry: ${url} (attempt ${attempt + 1}/${retries})`);
                     }
+                    // Callers need the response headers (Link) for cursor
+                    // pagination, so the whole response is returned.
                     const response = await axios.get(url, {
                         headers: {
                             Authorization: `token ${GITHUB_TOKEN}`,
                             Accept: 'application/vnd.github.v3+json',
                         },
-                        params,
+                        // Subsequent pages come from a Link URL that already
+                        // carries its query string — adding params would duplicate it
+                        ...(params && { params }),
                         timeout: 30000, // 30 second timeout
                     });
-                    return response.data;
+                    return response;
                 } catch (error: any) {
                     // Enhanced error logging for debugging
                     const errorDetails = {
@@ -320,6 +331,14 @@ export class Doc2Vec {
                             logger.error(`GitHub API returned 403 (not rate limit): ${error.message}`);
                             throw error;
                         }
+                    } else if (!isRetryableStatus(error.response?.status)) {
+                        // Deterministic failure (422, 404, 401, ...) — surface the
+                        // API's own message, which explains what to do instead.
+                        const apiMessage = error.response?.data?.message;
+                        logger.error(
+                            `GitHub API returned ${error.response.status} (not retryable): ${apiMessage || error.message}`
+                        );
+                        throw error;
                     } else {
                         // For non-403 errors, wait before retrying (exponential backoff)
                         if (attempt < retries - 1) {
@@ -336,25 +355,47 @@ export class Doc2Vec {
             throw new Error('Max retries reached');
         };
 
+        /**
+         * Walk every issue updated since `sinceDate` by following GitHub's
+         * `Link: rel="next"` cursor URLs.
+         *
+         * Page-number pagination (`?page=N`) cannot be used here: GitHub caps it
+         * on this endpoint and answers HTTP 422 ("Pagination with the page
+         * parameter is not supported for large datasets, please use cursor based
+         * pagination") once the offset grows past its limit. That limit is well
+         * below the size of a full-window rebuild on a busy repo, so page-based
+         * paging aborted the whole source and left the collection empty. The
+         * Link URL already contains the opaque `after=` cursor and is passed
+         * through verbatim.
+         */
         const fetchAllIssues = async (sinceDate: string): Promise<any[]> => {
             let issues: any[] = [];
-            let page = 1;
-            const perPage = 100;
+            // sort=updated&direction=asc makes the walk stable: results are
+            // ordered by the same field `since` filters on, so a page boundary
+            // can't shuffle items in or out mid-walk.
+            let url: string | null = GITHUB_API_URL;
+            let params: Record<string, any> | undefined = {
+                per_page: 100,
+                state: 'all',
+                since: sinceDate,
+                sort: 'updated',
+                direction: 'asc',
+            };
+            let page = 0;
 
-            while (true) {
+            while (url) {
+                page++;
                 // Log progress every 10 pages to reduce noise
                 if (page === 1 || page % 10 === 0) {
                     logger.debug(`Fetching issues page ${page}... (${issues.length} issues so far)`);
                 }
 
-                const data = await fetchWithRetry(GITHUB_API_URL, {
-                    per_page: perPage,
-                    page,
-                    state: 'all',
-                    since: sinceDate,
-                });
-
-                if (data.length === 0) break;
+                const response = await requestWithRetry(url, params);
+                const data = response.data;
+                if (!Array.isArray(data)) {
+                    logger.warn(`Unexpected non-array response while paginating issues for ${repo}; stopping the walk`);
+                    break;
+                }
 
                 // The `since` param already scopes results to issues whose
                 // updated_at is after sinceDate — i.e. anything created, closed,
@@ -364,20 +405,47 @@ export class Doc2Vec {
                 // dropped, leaving its status and comments permanently stale.
                 issues = issues.concat(data);
 
-                if (data.length < perPage) break;
-                page++;
+                const nextUrl = Utils.parseNextLink(response.headers?.link ?? response.headers?.Link);
+                // Guard against a server echoing the same cursor forever
+                if (!nextUrl || nextUrl === url) break;
+                url = nextUrl;
+                params = undefined; // the cursor URL is already fully-formed
             }
+
+            logger.info(`Fetched ${issues.length} issues/PRs for ${repo} across ${page} page(s)`);
             return issues;
         };
 
         const fetchIssueComments = async (issueNumber: number): Promise<any[]> => {
-            const url = `${GITHUB_API_URL}/${issueNumber}/comments`;
-            return await fetchWithRetry(url);
+            // GitHub returns 30 comments per page by default and paginates the
+            // rest behind Link headers; requesting the first page only silently
+            // truncated long discussions, so the stored chunks were missing the
+            // newest comments.
+            const comments: any[] = [];
+            let url: string | null = `${GITHUB_API_URL}/${issueNumber}/comments`;
+            let params: Record<string, any> | undefined = { per_page: 100 };
+
+            while (url) {
+                const response = await requestWithRetry(url, params);
+                if (!Array.isArray(response.data)) break;
+                comments.push(...response.data);
+
+                const nextUrl = Utils.parseNextLink(response.headers?.link ?? response.headers?.Link);
+                if (!nextUrl || nextUrl === url) break;
+                url = nextUrl;
+                params = undefined;
+            }
+            return comments;
         };
 
         const generateMarkdownForIssue = async (issue: any): Promise<string> => {
             const comments = await fetchIssueComments(issue.number);
-            let md = `# Issue #${issue.number}: ${issue.title}\n\n`;
+            // This endpoint returns both issues and pull requests; only PRs carry
+            // a `pull_request` object. Labelling every item "Issue #N" made
+            // retrieved PR chunks read as issues, so use the real kind.
+            const itemLabel = issue.pull_request ? 'PR' : 'Issue';
+            let md = `# ${itemLabel} #${issue.number}: ${issue.title}\n\n`;
+            md += `- **Type:** ${issue.pull_request ? 'Pull request' : 'Issue'}\n`;
             md += `- **Author:** ${issue.user.login}\n`;
             md += `- **State:** ${issue.state}\n`;
             md += `- **Created on:** ${new Date(issue.created_at).toDateString()}\n`;
@@ -395,6 +463,10 @@ export class Doc2Vec {
 
             return md;
         };
+
+        // Chunks that could not be stored (e.g. a rejected Qdrant upsert).
+        // Tallied across all issues and escalated once the walk completes.
+        let failedChunks = 0;
 
         // Process a single issue and store its chunks
         const processIssue = async (issue: any): Promise<void> => {
@@ -489,7 +561,11 @@ export class Doc2Vec {
                             logger.error(`Embedding failed for chunk: ${chunkId}`);
                         }
                     } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
+                        // Keep going so one bad chunk can't cost the whole repo,
+                        // but remember it: the count is escalated below so the run
+                        // fails and the last-run date is not advanced.
+                        failedChunks++;
+                        logger.error(`Error processing chunk ${chunkId} for ${url} in Qdrant:`, error);
                     }
                 }
             }
@@ -505,9 +581,18 @@ export class Doc2Vec {
             await processIssue(issues[i]);
         }
 
+        // A chunk that failed to store is silent data loss, so refuse to advance
+        // the last-run date: the next run reprocesses this window instead of
+        // treating the gap as synced. Everything that did store is kept.
+        if (failedChunks > 0) {
+            throw new Error(
+                `${failedChunks} chunk(s) failed to store for ${repo}; not advancing the last-run date so the next run retries them`
+            );
+        }
+
         // Update the last run date in the database after processing all issues
         await DatabaseManager.updateLastRunDate(dbConnection, repo, logger, this.embeddingDimension, syncStartDate);
-        
+
         logger.info(`Successfully processed ${issues.length} issues`);
     }
 

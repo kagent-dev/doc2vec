@@ -89,4 +89,63 @@ export class Utils {
         return text.split(/(\s+)/).filter(token => token.length > 0);
     }
 
-} 
+    /**
+     * Extract the `rel="next"` URL from an RFC 5988 Link header.
+     *
+     * GitHub's list endpoints cap page-number pagination (`?page=N`) and reject
+     * deeper offsets with HTTP 422 ("please use cursor based pagination"), so
+     * walking a large result set requires following these URLs — they already
+     * carry the opaque `after=` cursor and must be passed through verbatim
+     * rather than rebuilt from parts.
+     */
+    static parseNextLink(linkHeader: string | undefined | null): string | null {
+        if (!linkHeader) return null;
+        for (const part of linkHeader.split(',')) {
+            const match = part.match(/<([^>]+)>\s*;\s*rel\s*=\s*"?next"?/i);
+            if (match) return match[1].trim();
+        }
+        return null;
+    }
+
+    /**
+     * Drop unpaired UTF-16 surrogates.
+     *
+     * A lone surrogate is not valid UTF-8, so strict JSON parsers reject the
+     * whole request body — Qdrant answers 400 "lone leading surrogate in hex
+     * escape" and the chunk is lost. Content can arrive this way from an
+     * upstream source, so sanitize before storing.
+     */
+    static stripLoneSurrogates(text: string): string {
+        // Node 20+ exposes toWellFormed(), which replaces lone surrogates with
+        // U+FFFD. Removing them outright keeps the text closer to the original.
+        return text
+            .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+            .replace(/(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g, '$1');
+    }
+
+    /**
+     * Slice a string without splitting a surrogate pair.
+     *
+     * Plain `slice()` works on UTF-16 code units, so a boundary landing inside
+     * a pair (emoji, some CJK) leaves a lone surrogate on each side. Both
+     * boundaries are nudged the same way — a straddled pair always travels with
+     * the *following* slice — so consecutive slices stay lossless: no pair falls
+     * into the gap between them, and none is duplicated.
+     */
+    static sliceSafe(text: string, start: number, end: number): string {
+        const isHigh = (code: number) => code >= 0xd800 && code <= 0xdbff;
+        const isLow = (code: number) => code >= 0xdc00 && code <= 0xdfff;
+        // True when the pair straddling `index` must move to the next slice
+        const straddles = (index: number) =>
+            index > 0 && index < text.length && isHigh(text.charCodeAt(index - 1)) && isLow(text.charCodeAt(index));
+
+        let from = Math.max(0, Math.min(start, text.length));
+        let to = Math.max(from, Math.min(text.length, end));
+        // Step back to pick up the high half the previous slice left behind
+        if (straddles(from)) from--;
+        // Leave the whole pair for the next slice
+        if (to > from && straddles(to)) to--;
+        return text.slice(from, to);
+    }
+
+}

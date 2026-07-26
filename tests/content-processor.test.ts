@@ -2197,6 +2197,36 @@ describe('ContentProcessor', () => {
                 expect(hasOverlap).toBe(true);
             }
         });
+
+        // A split boundary landing inside a surrogate pair used to emit chunks
+        // containing a lone surrogate. That body is invalid UTF-8, so Qdrant
+        // rejected the upsert ("lone leading surrogate in hex escape") and the
+        // chunk was silently dropped.
+        it('never emits a chunk containing a lone surrogate when splitting emoji-heavy content', async () => {
+            // Emoji at every offset maximises the chance of straddling a boundary
+            const emojiContent = '# Emoji Section\n\n' + 'padding 😀 text 🎉 more 👍 words '.repeat(600);
+            const chunks = await processor.chunkMarkdown(emojiContent, baseConfig, 'https://example.com/emoji');
+
+            expect(chunks.length).toBeGreaterThan(1);
+            for (const chunk of chunks) {
+                // isWellFormed() is false exactly when a lone surrogate is present
+                expect(chunk.content.isWellFormed?.() ?? true).toBe(true);
+                // And the content must survive a strict JSON round-trip
+                expect(() => JSON.parse(JSON.stringify({ c: chunk.content }))).not.toThrow();
+            }
+        });
+
+        it('strips a lone surrogate that arrives in the source content', async () => {
+            // A truncated pair straight from the upstream source, not the splitter
+            const content = '# Broken\n\nThis body has a stray half-emoji \ud83d in the middle.';
+            const chunks = await processor.chunkMarkdown(content, baseConfig, 'https://example.com/broken');
+
+            expect(chunks.length).toBeGreaterThan(0);
+            for (const chunk of chunks) {
+                expect(chunk.content.isWellFormed?.() ?? true).toBe(true);
+            }
+            expect(chunks[0].content).toContain('stray half-emoji');
+        });
     });
 
     // ─── chunkMarkdown safety valve ──────────────────────────────────

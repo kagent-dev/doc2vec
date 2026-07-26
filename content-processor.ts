@@ -2066,7 +2066,9 @@ export class ContentProcessor {
                 continue;
             }
 
-            const searchableText = contextPrefix + content;
+            // See chunkMarkdown: an unpaired surrogate makes the store's JSON
+            // body invalid, so sanitize before the id is derived from the text.
+            const searchableText = Utils.stripLoneSurrogates(contextPrefix + content);
             const chunkId = Utils.generateHash(`${url}::${searchableText}`);
 
             documentChunks.push({
@@ -2152,7 +2154,10 @@ export class ContentProcessor {
             // to searches for parent topics even if the body doesn't mention them.
             const breadcrumbs = hierarchy.filter(h => h).join(" > ");
             const contextPrefix = breadcrumbs ? `[Topic: ${breadcrumbs}]\n` : "";
-            const searchableText = contextPrefix + content.trim();
+            // Sanitize before hashing so the id and the stored text always agree:
+            // an unpaired surrogate (from a split pair, or straight from the
+            // source) makes the JSON body invalid and the write fails.
+            const searchableText = Utils.stripLoneSurrogates(contextPrefix + content.trim());
             const chunkId = Utils.generateHash(searchableText);
             
             const chunk: DocumentChunk = {
@@ -2199,7 +2204,11 @@ export class ContentProcessor {
                 const overlapSize = Math.floor(MAX_CHARS * OVERLAP_PERCENT);
 
                 for (let i = 0; i < trimmedBuffer.length; i += (MAX_CHARS - overlapSize)) {
-                    const subContent = trimmedBuffer.slice(i, i + MAX_CHARS);
+                    // Slice on code points, not code units: a boundary falling
+                    // inside a surrogate pair (emoji, some CJK) would leave a
+                    // lone surrogate, which Qdrant's JSON parser rejects — the
+                    // chunk then fails to store and is silently lost.
+                    const subContent = Utils.sliceSafe(trimmedBuffer, i, i + MAX_CHARS);
                     chunks.push(createDocumentChunk(subContent, topicHierarchy));
                 }
             } else {
