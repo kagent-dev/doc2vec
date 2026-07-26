@@ -147,15 +147,23 @@ vi.mock('../logger', () => {
     };
 });
 
-// Mock Utils
-vi.mock('../utils', () => ({
-    Utils: {
-        generateHash: vi.fn().mockReturnValue('mock-hash'),
-        isValidUuid: vi.fn().mockReturnValue(false),
-        hashToUuid: vi.fn().mockReturnValue('00000000-0000-0000-0000-000000000000'),
-        getUrlPrefix: vi.fn().mockReturnValue('https://example.com'),
-    },
-}));
+// Mock Utils. parseNextLink/stripLoneSurrogates/sliceSafe are pure string
+// helpers with their own unit tests, so delegate to the real implementations
+// rather than stubbing them — the pagination tests depend on real Link parsing.
+vi.mock('../utils', async (importOriginal) => {
+    const actual = await importOriginal() as any;
+    return {
+        Utils: {
+            generateHash: vi.fn().mockReturnValue('mock-hash'),
+            isValidUuid: vi.fn().mockReturnValue(false),
+            hashToUuid: vi.fn().mockReturnValue('00000000-0000-0000-0000-000000000000'),
+            getUrlPrefix: vi.fn().mockReturnValue('https://example.com'),
+            parseNextLink: actual.Utils.parseNextLink,
+            stripLoneSurrogates: actual.Utils.stripLoneSurrogates,
+            sliceSafe: actual.Utils.sliceSafe,
+        },
+    };
+});
 
 // ─── Import the class under test (AFTER mocks are set up) ────────────────────
 
@@ -1927,16 +1935,48 @@ sources:
             body: 'A long-standing bug.',
         };
 
+        // Single-page mock: no Link header, so the cursor walk stops after one page.
         function mockGitHubApi(issues: any[], comments: any[] = []) {
-            (axios.get as any).mockImplementation((url: string, opts?: any) => {
-                if (url.endsWith('/comments')) {
-                    return Promise.resolve({ data: comments });
+            (axios.get as any).mockImplementation((url: string) => {
+                if (url.includes('/comments')) {
+                    return Promise.resolve({ data: comments, headers: {} });
                 }
-                // Issues list: only page 1 carries data. Any page beyond the first
-                // returns empty so pagination terminates deterministically.
-                const page = opts?.params?.page ?? 1;
-                return Promise.resolve({ data: page === 1 ? issues : [] });
+                return Promise.resolve({ data: issues, headers: {} });
             });
+        }
+
+        /**
+         * Mock a paginated endpoint that only advertises `Link: rel="next"`
+         * cursors — requesting `?page=N` past the first page returns 422, which
+         * is how GitHub behaves on large result sets.
+         */
+        function mockCursorPaginatedApi(pages: any[][], comments: any[] = []) {
+            const requestedUrls: string[] = [];
+            (axios.get as any).mockImplementation((url: string, opts?: any) => {
+                if (url.includes('/comments')) {
+                    return Promise.resolve({ data: comments, headers: {} });
+                }
+                requestedUrls.push(url);
+
+                if (opts?.params?.page !== undefined || /[?&]page=/.test(url)) {
+                    const err: any = new Error('Request failed with status code 422');
+                    err.response = {
+                        status: 422,
+                        headers: {},
+                        data: { message: 'Pagination with the page parameter is not supported for large datasets, please use cursor based pagination (after/before)' },
+                    };
+                    return Promise.reject(err);
+                }
+
+                const cursorMatch = url.match(/after=cursor-(\d+)/);
+                const index = cursorMatch ? Number(cursorMatch[1]) : 0;
+                const isLast = index >= pages.length - 1;
+                return Promise.resolve({
+                    data: pages[index] ?? [],
+                    headers: isLast ? {} : { link: `<${issuesUrl}?per_page=100&after=cursor-${index + 1}>; rel="next"` },
+                });
+            });
+            return { requestedUrls };
         }
 
         it('processes an old issue closed since the last run (no created_at filtering)', async () => {
@@ -1976,6 +2016,210 @@ sources:
                 issueUrl(42),
                 expect.anything(),
             );
+        });
+
+        // ─── Cursor pagination ───────────────────────────────────────────
+        // GitHub caps page-number pagination on this endpoint and answers 422
+        // past its offset limit, which aborted the whole source and left the
+        // collection empty. The walk must follow Link: rel="next" instead.
+        describe('pagination', () => {
+            const makeIssue = (n: number) => ({
+                number: n,
+                title: `Issue ${n}`,
+                user: { login: 'alice' },
+                state: 'open',
+                created_at: '2025-02-01T00:00:00Z',
+                updated_at: '2025-02-02T00:00:00Z',
+                labels: [],
+                body: 'body',
+            });
+
+            it('follows Link rel="next" cursors across all pages', async () => {
+                const instance = makeInstance();
+                mockCursorPaginatedApi([
+                    [makeIssue(1), makeIssue(2)],
+                    [makeIssue(3)],
+                ]);
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                // All three issues across both pages must be processed
+                const chunkedUrls = instance.contentProcessor.chunkMarkdown.mock.calls.map((c: any[]) => c[2]);
+                expect(chunkedUrls).toEqual([issueUrl(1), issueUrl(2), issueUrl(3)]);
+            });
+
+            it('never sends a page parameter (page-number paging is rejected past the cap)', async () => {
+                const instance = makeInstance();
+                mockCursorPaginatedApi([[makeIssue(1)]]);
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                for (const call of (axios.get as any).mock.calls) {
+                    expect(call[1]?.params?.page).toBeUndefined();
+                }
+            });
+
+            it('requests a stable ordering so a mid-walk update cannot shuffle results', async () => {
+                const instance = makeInstance();
+                mockCursorPaginatedApi([[makeIssue(1)]]);
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                const firstCall = (axios.get as any).mock.calls[0];
+                expect(firstCall[1].params).toMatchObject({ sort: 'updated', direction: 'asc', state: 'all' });
+            });
+
+            it('passes the cursor URL through verbatim without re-appending params', async () => {
+                const instance = makeInstance();
+                mockCursorPaginatedApi([[makeIssue(1)], [makeIssue(2)]]);
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                const cursorCall = (axios.get as any).mock.calls.find((c: any[]) => c[0].includes('after=cursor-1'));
+                expect(cursorCall).toBeDefined();
+                // Re-adding params would duplicate the query string already in the URL
+                expect(cursorCall[1].params).toBeUndefined();
+            });
+
+            it('stops instead of looping when the next cursor repeats the current URL', async () => {
+                const instance = makeInstance();
+                (axios.get as any).mockImplementation((url: string) => {
+                    if (url.includes('/comments')) return Promise.resolve({ data: [], headers: {} });
+                    // Always advertises itself as the next page
+                    return Promise.resolve({ data: [makeIssue(1)], headers: { link: `<${url}>; rel="next"` } });
+                });
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                expect(instance.contentProcessor.chunkMarkdown.mock.calls.length).toBe(1);
+            });
+
+            it('paginates issue comments instead of silently keeping only the first page', async () => {
+                const instance = makeInstance();
+                const commentsUrl = `${issuesUrl}/7/comments`;
+                (axios.get as any).mockImplementation((url: string, opts?: any) => {
+                    if (url.includes('/comments')) {
+                        if (url.includes('after=c2')) {
+                            return Promise.resolve({ data: [{ user: { login: 'carol' }, created_at: '2025-02-03T00:00:00Z', body: 'third' }], headers: {} });
+                        }
+                        return Promise.resolve({
+                            data: [{ user: { login: 'bob' }, created_at: '2025-02-02T00:00:00Z', body: 'second' }],
+                            headers: { link: `<${commentsUrl}?after=c2>; rel="next"` },
+                        });
+                    }
+                    return Promise.resolve({ data: [makeIssue(7)], headers: {} });
+                });
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                const markdown = instance.contentProcessor.chunkMarkdown.mock.calls[0][0];
+                expect(markdown).toContain('second');
+                expect(markdown).toContain('third');
+            });
+        });
+
+        // ─── Retry classification ────────────────────────────────────────
+        describe('retry classification', () => {
+            function mockStatus(status: number, message = 'boom') {
+                (axios.get as any).mockImplementation(() => {
+                    const err: any = new Error(`Request failed with status code ${status}`);
+                    err.response = { status, headers: {}, data: { message } };
+                    return Promise.reject(err);
+                });
+            }
+
+            it('fails fast on 422 without burning retries', async () => {
+                const instance = makeInstance();
+                mockStatus(422, 'Pagination with the page parameter is not supported for large datasets');
+
+                await expect(instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                )).rejects.toThrow('422');
+
+                // A deterministic failure must be attempted exactly once
+                expect((axios.get as any).mock.calls.length).toBe(1);
+            });
+
+            it('fails fast on 404', async () => {
+                const instance = makeInstance();
+                mockStatus(404, 'Not Found');
+
+                await expect(instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                )).rejects.toThrow();
+                expect((axios.get as any).mock.calls.length).toBe(1);
+            });
+
+            it('still retries 500s', async () => {
+                const instance = makeInstance();
+                let attempts = 0;
+                (axios.get as any).mockImplementation((url: string) => {
+                    if (url.includes('/comments')) return Promise.resolve({ data: [], headers: {} });
+                    attempts++;
+                    if (attempts < 3) {
+                        const err: any = new Error('Request failed with status code 500');
+                        err.response = { status: 500, headers: {}, data: {} };
+                        return Promise.reject(err);
+                    }
+                    return Promise.resolve({ data: [], headers: {} });
+                });
+
+                await instance.fetchAndProcessGitHubIssues(
+                    repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+                );
+
+                expect(attempts).toBe(3);
+            }, 30000);
+        });
+
+        // ─── Pull requests ───────────────────────────────────────────────
+        it('labels pull requests as PRs rather than issues', async () => {
+            const instance = makeInstance();
+            mockGitHubApi([{
+                number: 1915,
+                title: 'chore(deps): bump the go-minor-patch group',
+                user: { login: 'dependabot[bot]' },
+                state: 'open',
+                created_at: '2025-02-01T00:00:00Z',
+                updated_at: '2025-02-02T00:00:00Z',
+                labels: [],
+                body: 'bumps',
+                pull_request: { url: 'https://api.github.com/repos/octo/repo/pulls/1915' },
+            }]);
+
+            await instance.fetchAndProcessGitHubIssues(
+                repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+            );
+
+            const markdown = instance.contentProcessor.chunkMarkdown.mock.calls[0][0];
+            expect(markdown).toContain('# PR #1915:');
+            expect(markdown).toContain('**Type:** Pull request');
+            expect(markdown).not.toContain('# Issue #1915:');
+        });
+
+        it('still labels plain issues as issues', async () => {
+            const instance = makeInstance();
+            mockGitHubApi([oldButRecentlyClosedIssue]);
+
+            await instance.fetchAndProcessGitHubIssues(
+                repo, { product_name: repo }, { type: 'sqlite', db: {} }, instance.logger,
+            );
+
+            const markdown = instance.contentProcessor.chunkMarkdown.mock.calls[0][0];
+            expect(markdown).toContain('# Issue #42:');
+            expect(markdown).toContain('**Type:** Issue');
         });
     });
 
