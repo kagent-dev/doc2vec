@@ -1138,6 +1138,10 @@ export class Doc2Vec {
         let lastMtimeKey: string | undefined;
         let trackedFiles: Set<string> | undefined;
         let maxObservedMtime = 0;
+        // Set when a directory could not be listed: the files we saw are only a
+        // subset of what is on disk, so nothing may be treated as deleted and no
+        // "last scanned" marker may advance past this run
+        let scanIncomplete = false;
 
         if (config.source === 'local_directory') {
             if (!config.path) {
@@ -1240,13 +1244,20 @@ export class Doc2Vec {
                 }
             );
 
+            scanIncomplete = scanResult.incomplete;
+            if (scanIncomplete) {
+                logger.error('Directory scan was incomplete — skipping cleanup so unscanned files keep their chunks');
+            }
+
             if (trackedFiles) {
                 maxObservedMtime = scanResult.maxMtime;
             }
         } finally {
             logger.section('CLEANUP');
 
-            if (incrementalMode) {
+            if (scanIncomplete) {
+                logger.warn('Skipping cleanup and last-scanned markers: the scan did not cover the whole tree');
+            } else if (incrementalMode) {
                 if (deleteUrls.length > 0) {
                     logger.info(`Cleaning up ${deleteUrls.length} deleted/renamed files`);
                     for (const url of deleteUrls) {
@@ -1304,7 +1315,9 @@ export class Doc2Vec {
                 this.counters.chunks_deleted += removed.chunks;
             }
 
-            if (config.source === 'github' && basePath && repoBranch) {
+            // Storing the SHA after an incomplete scan would make the next run
+            // diff from it and never revisit the files this run missed
+            if (config.source === 'github' && basePath && repoBranch && !scanIncomplete) {
                 const headSha = await this.getRepoHeadSha(basePath, logger);
                 if (headSha) {
                     const shaKey = this.buildCodeShaMetadataKey(config.repo as string, repoBranch);
@@ -1320,6 +1333,12 @@ export class Doc2Vec {
                     logger.warn(`Failed to remove temporary repo at ${tempDir}:`, error);
                 }
             }
+        }
+
+        // Fail the source rather than reporting a partial ingest as a success —
+        // the collection is still serving whatever it had for the unscanned files
+        if (scanIncomplete) {
+            throw new Error(`Code scan of ${basePath} was incomplete: at least one directory could not be read`);
         }
 
         logger.info(`Finished processing code source (${config.source})`);
