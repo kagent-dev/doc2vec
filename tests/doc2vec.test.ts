@@ -815,6 +815,60 @@ sources:
             });
         });
 
+        // An incomplete walk (a directory that couldn't be listed) means the set
+        // of files we saw is a subset of what's on disk. Treating that as the
+        // full picture deletes chunks for files that still exist.
+        describe('code source scan completeness', () => {
+            function makeLogger(): any {
+                const l: any = {
+                    info: vi.fn(), warn: vi.fn(), error: vi.fn(),
+                    debug: vi.fn(), section: vi.fn(), event: vi.fn(),
+                };
+                l.child = vi.fn(() => makeLogger());
+                return l;
+            }
+
+            const codeConfig = {
+                type: 'code',
+                product_name: 'TestCode',
+                version: 'v1.0',
+                source: 'local_directory',
+                path: '/code',
+                max_size: 50000,
+                database_config: { type: 'sqlite', params: { db_path: ':memory:' } },
+            } as any;
+
+            it('runs cleanup when the scan covered the whole tree', async () => {
+                const { DatabaseManager } = await import('../database');
+                instance = createInstanceWithSources([codeConfig]);
+                (instance as any).contentProcessor.processCodeDirectory = vi.fn().mockResolvedValue({
+                    processedFiles: 3, skippedFiles: 0, maxMtime: 123, incomplete: false,
+                });
+
+                await (instance as any).processCodeSource(codeConfig, makeLogger());
+
+                expect(DatabaseManager.setMetadataValue).toHaveBeenCalled();
+            });
+
+            it('skips cleanup and fails the source when the scan was incomplete', async () => {
+                const { DatabaseManager } = await import('../database');
+                instance = createInstanceWithSources([codeConfig]);
+                (instance as any).contentProcessor.processCodeDirectory = vi.fn().mockResolvedValue({
+                    processedFiles: 1, skippedFiles: 0, maxMtime: 123, incomplete: true,
+                });
+
+                await expect((instance as any).processCodeSource(codeConfig, makeLogger()))
+                    .rejects.toThrow(/incomplete/i);
+
+                // no chunk deletion of any kind
+                expect(DatabaseManager.removeObsoleteFilesSQLite).not.toHaveBeenCalled();
+                expect(DatabaseManager.removeObsoleteFilesQdrant).not.toHaveBeenCalled();
+                expect(DatabaseManager.removeChunksByUrlSQLite).not.toHaveBeenCalled();
+                // and no marker advances, so the next run rescans the whole tree
+                expect(DatabaseManager.setMetadataValue).not.toHaveBeenCalled();
+            });
+        });
+
         it('should route website source to processWebsite', async () => {
             instance = createInstanceWithSources([{
                 type: 'website',

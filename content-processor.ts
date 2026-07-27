@@ -34,6 +34,22 @@ export class BrowserLaunchError extends Error {
 }
 
 /**
+ * Outcome of walking a code source's directory tree.
+ *
+ * `incomplete` means at least one directory could not be listed, so the set of
+ * files the caller saw is only a subset of what is on disk. Callers must not
+ * treat the unseen files as deleted: cleanup and last-scanned markers have to
+ * be skipped, otherwise a transient I/O error silently purges chunks and the
+ * next run never revisits those files.
+ */
+export interface CodeScanResult {
+    processedFiles: number;
+    skippedFiles: number;
+    maxMtime: number;
+    incomplete: boolean;
+}
+
+/**
  * Resolve which browser binary to launch, in order of preference:
  *  1. PUPPETEER_EXECUTABLE_PATH (explicit override)
  *  2. Puppeteer's own downloaded Chrome for Testing (version-matched, the
@@ -500,8 +516,12 @@ export class ContentProcessor {
         // Restart the browser every N pages to prevent memory accumulation
         const PAGES_BETWEEN_RESTARTS = 50;
 
-        const restartBrowser = async (reason: string): Promise<void> => {
-            logger.warn(`Restarting browser: ${reason}`);
+        // Planned restarts (first launch, the every-N-pages recycle) are routine
+        // and would otherwise dominate a crawl's warning count; only unplanned
+        // ones — a disconnected or degraded browser — deserve a warning.
+        const restartBrowser = async (reason: string, planned = false): Promise<void> => {
+            if (planned) logger.info(`Restarting browser: ${reason}`);
+            else logger.warn(`Restarting browser: ${reason}`);
             if (browser) {
                 try { await browser.close(); } catch { /* ignore close errors on a degraded browser */ }
             }
@@ -522,10 +542,10 @@ export class ContentProcessor {
                 const reason = needsBrowserRestart
                     ? `protocol errors persisting after page recreation (${consecutiveProtocolErrors} consecutive)`
                     : browser ? 'browser disconnected' : 'initial launch';
-                await restartBrowser(reason);
+                await restartBrowser(reason, !browser && !needsBrowserRestart);
             } else if (pagesSinceRestart >= PAGES_BETWEEN_RESTARTS) {
                 // Periodic restart to prevent memory accumulation from long crawls
-                await restartBrowser(`periodic restart after ${pagesSinceRestart} pages`);
+                await restartBrowser(`periodic restart after ${pagesSinceRestart} pages`, true);
             } else if (pageNeedsRecreation) {
                 // The previous page.evaluate or navigation timed out / errored.
                 // Close the stale page and create a fresh one to avoid corrupted state.
@@ -1695,8 +1715,18 @@ export class ContentProcessor {
             
             for (const file of files) {
                 const filePath = path.join(dirPath, file);
-                const stat = fs.statSync(filePath);
-                
+
+                // A dangling symlink makes statSync throw ENOENT; skip the
+                // entry rather than abandoning the rest of the directory
+                let stat: fs.Stats;
+                try {
+                    stat = fs.statSync(filePath);
+                } catch (error) {
+                    logger.warn(`Skipping unreadable entry ${filePath}:`, error);
+                    skippedFiles++;
+                    continue;
+                }
+
                 // Skip already visited paths
                 if (visitedPaths.has(filePath)) {
                     logger.debug(`Skipping already visited path: ${filePath}`);
@@ -1790,7 +1820,7 @@ export class ContentProcessor {
             mtimeCutoff?: number;
             trackFiles?: Set<string>;
         }
-    ): Promise<{ processedFiles: number; skippedFiles: number; maxMtime: number }> {
+    ): Promise<CodeScanResult> {
         const logger = parentLogger.child('code-directory-processor');
         logger.info(`Processing code directory: ${dirPath}`);
 
@@ -1808,6 +1838,8 @@ export class ContentProcessor {
 
         let maxMtime = 0;
 
+        let incomplete = false;
+
         try {
             const files = fs.readdirSync(dirPath);
             let processedFiles = 0;
@@ -1819,7 +1851,19 @@ export class ContentProcessor {
 
             for (const file of files) {
                 const filePath = path.join(dirPath, file);
-                const stat = fs.statSync(filePath);
+
+                // statSync follows symlinks, so a dangling one (common in
+                // vendored forks) throws ENOENT. Skipping the entry keeps the
+                // rest of the directory — letting it throw used to abandon
+                // every sibling after it, and cleanup then deleted their chunks.
+                let stat: fs.Stats;
+                try {
+                    stat = fs.statSync(filePath);
+                } catch (error) {
+                    logger.warn(`Skipping unreadable entry ${filePath}:`, error);
+                    skippedFiles++;
+                    continue;
+                }
 
                 if (visitedPaths.has(filePath)) {
                     logger.debug(`Skipping already visited path: ${filePath}`);
@@ -1841,6 +1885,7 @@ export class ContentProcessor {
                         processedFiles += childResult.processedFiles;
                         skippedFiles += childResult.skippedFiles;
                         maxMtime = Math.max(maxMtime, childResult.maxMtime);
+                        incomplete = incomplete || childResult.incomplete;
                     } else {
                         logger.debug(`Skipping directory ${filePath} (recursive=false)`);
                     }
@@ -1891,10 +1936,13 @@ export class ContentProcessor {
             }
 
             logger.info(`Code directory processed. Processed: ${processedFiles}, Skipped: ${skippedFiles}`);
-            return { processedFiles, skippedFiles, maxMtime };
+            return { processedFiles, skippedFiles, maxMtime, incomplete };
         } catch (error) {
+            // The directory could not be listed at all — report the scan as
+            // incomplete so the caller skips cleanup instead of treating every
+            // file under this path as deleted
             logger.error(`Error reading code directory ${dirPath}:`, error);
-            return { processedFiles: 0, skippedFiles: 0, maxMtime };
+            return { processedFiles: 0, skippedFiles: 0, maxMtime, incomplete: true };
         }
     }
 

@@ -767,6 +767,12 @@ If you don't specify a config path, it will look for config.yaml in the current 
 
 ## Recent Changes
 
+### Code Scans: Dangling Symlinks and Incomplete Walks
+- **Dangling symlinks no longer abort a directory:** `statSync` follows symlinks, so a link whose target isn't in the clone (common in vendored forks, e.g. `crates/cel-fork/cel/README.md`) threw `ENOENT` and abandoned every remaining entry in that directory. Broken entries are now skipped with a warning and the walk continues
+- **Incomplete scans never delete chunks:** if a directory genuinely can't be listed, the scan is reported as incomplete — obsolete-file cleanup, the tracked-file list, the last-mtime marker, and the last-synced git SHA are all skipped, so unscanned files keep their chunks and the next run rescans them
+- **Incomplete scans fail the source:** a partial ingest is reported as a failed source instead of a silent success
+- **Quieter crawls:** planned browser restarts (initial launch, the every-50-pages recycle) log at `info`; only unplanned restarts (disconnected or degraded browser) warn
+
 ### Searchable Controller Run Logs
 - **Server-side log filtering:** Level chips and the keyword filter now query Postgres instead of the browser's in-memory buffer, so errors and warnings from the start of a long run are reachable (`GET /api/runs/:id/logs?levels=error,warn&q=...`, paged with **Load 2,000 more**)
 - **Whole-run level counts:** New `GET /api/runs/:id/logs/counts` endpoint backs the level chips, which previously only counted the lines still held in the browser

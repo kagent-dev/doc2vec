@@ -680,6 +680,133 @@ describe('ContentProcessor', () => {
 
             expect(processed.length).toBe(0);
         });
+
+        // Vendored forks carry symlinks whose target isn't in the clone; statSync
+        // follows them and throws ENOENT. That used to abandon the rest of the
+        // directory, and cleanup then deleted the chunks of every skipped file.
+        it('should skip a dangling symlink and still process its siblings', async () => {
+            fs.writeFileSync(path.join(testDir, 'a-before.ts'), 'const a = 1;');
+            fs.symlinkSync(path.join(testDir, 'missing-target.ts'), path.join(testDir, 'b-broken.ts'));
+            fs.writeFileSync(path.join(testDir, 'c-after.ts'), 'const c = 3;');
+
+            const processed: string[] = [];
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async (filePath) => { processed.push(filePath); },
+                testLogger
+            );
+
+            expect(processed.map(p => path.basename(p)).sort()).toEqual(['a-before.ts', 'c-after.ts']);
+            expect(result.processedFiles).toBe(2);
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('should not report a dangling symlink in a subdirectory as incomplete', async () => {
+            const subDir = path.join(testDir, 'sub');
+            fs.mkdirSync(subDir);
+            fs.symlinkSync(path.join(subDir, 'gone.ts'), path.join(subDir, 'broken.ts'));
+            fs.writeFileSync(path.join(subDir, 'real.ts'), 'const x = 1;');
+
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async () => {},
+                testLogger
+            );
+
+            expect(result.processedFiles).toBe(1);
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('should report incomplete when a directory cannot be listed', async () => {
+            const result = await processor.processCodeDirectory(
+                path.join(testDir, 'does-not-exist'),
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async () => {},
+                testLogger
+            );
+
+            expect(result.incomplete).toBe(true);
+            expect(result.processedFiles).toBe(0);
+        });
+
+        // chmod 000 doesn't stop root, so this can't assert anything in a
+        // root container (CI images often run as root)
+        const runningAsRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+        it.skipIf(runningAsRoot)('should propagate incomplete from a subdirectory that cannot be listed', async () => {
+            const subDir = path.join(testDir, 'unreadable');
+            fs.mkdirSync(subDir);
+            fs.writeFileSync(path.join(subDir, 'hidden.ts'), 'code');
+            fs.writeFileSync(path.join(testDir, 'visible.ts'), 'code');
+            fs.chmodSync(subDir, 0o000);
+
+            try {
+                const result = await processor.processCodeDirectory(
+                    testDir,
+                    { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                    async () => {},
+                    testLogger
+                );
+
+                expect(result.incomplete).toBe(true);
+                // the readable sibling is still ingested
+                expect(result.processedFiles).toBe(1);
+            } finally {
+                fs.chmodSync(subDir, 0o755);
+            }
+        });
+
+        it('should report a complete scan as complete', async () => {
+            fs.writeFileSync(path.join(testDir, 'ok.ts'), 'code');
+
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async () => {},
+                testLogger
+            );
+
+            expect(result.incomplete).toBe(false);
+        });
+    });
+
+    // ─── processDirectory: dangling symlinks ────────────────────────
+    describe('processDirectory with a dangling symlink', () => {
+        const testDir = path.join(__dirname, '__test_symlink_dir__');
+
+        beforeEach(() => {
+            if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+            fs.mkdirSync(testDir, { recursive: true });
+        });
+
+        afterEach(() => {
+            if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+        });
+
+        it('should skip the broken link and process the remaining files', async () => {
+            fs.writeFileSync(path.join(testDir, 'a.md'), '# A');
+            fs.symlinkSync(path.join(testDir, 'nope.md'), path.join(testDir, 'b.md'));
+            fs.writeFileSync(path.join(testDir, 'c.md'), '# C');
+
+            const processed: string[] = [];
+            await processor.processDirectory(
+                testDir,
+                {
+                    type: 'local_directory',
+                    path: testDir,
+                    product_name: 'Test',
+                    version: '1.0',
+                    max_size: 100000,
+                    include_extensions: ['.md'],
+                    database_config: { type: 'sqlite', params: {} }
+                } as any,
+                async (filePath) => { processed.push(filePath); },
+                testLogger
+            );
+
+            expect(processed.map(p => path.basename(p)).sort()).toEqual(['a.md', 'c.md']);
+        });
     });
 
     // ─── isNetworkError (accessed via crawlWebsite behavior) ────────
