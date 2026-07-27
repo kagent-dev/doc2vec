@@ -101,12 +101,13 @@ export default function Dashboard() {
             to={`/configs/${config.id}`}
             className="block rounded-lg border border-edge bg-surface p-4 transition hover:border-accent/50"
           >
-            <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
-              <div className="min-w-48 flex-1">
+            {/* Fixed column widths so schedule/last run/next run line up across cards */}
+            <div className="flex flex-col gap-3 md:grid md:grid-cols-[minmax(9rem,1fr)_12rem_15rem_8rem_auto] md:items-start md:gap-x-6">
+              <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <h2 className="font-semibold">{config.name}</h2>
+                  <h2 className="truncate font-semibold">{config.name}</h2>
                   {config.parse_error && (
-                    <span className="rounded-full border border-critical/40 px-2 py-0.5 text-xs text-critical" title={config.parse_error}>
+                    <span className="shrink-0 rounded-full border border-critical/40 px-2 py-0.5 text-xs text-critical" title={config.parse_error}>
                       invalid
                     </span>
                   )}
@@ -123,7 +124,7 @@ export default function Dashboard() {
               </div>
               <div className="text-sm">
                 <p className="text-xs uppercase tracking-wide text-ink-muted">Last run</p>
-                <div className="mt-0.5 flex items-center gap-2">
+                <div className="mt-0.5 flex flex-wrap items-center gap-2">
                   {config.last_run ? (
                     <>
                       <RunStatusBadge status={config.last_run.status} />
@@ -144,7 +145,7 @@ export default function Dashboard() {
                   {config.next_run ? relativeTime(config.next_run) : '—'}
                 </p>
               </div>
-              <div className="ml-auto self-center">
+              <div className="md:self-center">
                 <RunNowButton config={config} />
               </div>
             </div>

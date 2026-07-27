@@ -49,4 +49,10 @@ export const MIGRATIONS: string[] = [
         PRIMARY KEY (run_id, seq)
     );
     `,
+
+    // 2: index for server-side log filtering by level (error/warn lookups on
+    // long runs, where the client only keeps a trailing window in memory)
+    `
+    CREATE INDEX IF NOT EXISTS d2v_run_logs_level_idx ON d2v_run_logs (run_id, level, seq);
+    `,
 ];

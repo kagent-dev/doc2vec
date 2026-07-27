@@ -103,6 +103,22 @@ describe.skipIf(!TEST_DATABASE_URL)('ControllerStore (Postgres)', () => {
         expect(page2.map(l => l.seq)).toEqual([3]);
         expect(page2[0].message).toBe('three');
 
+        // Filtering is server-side so it reaches lines the UI no longer holds
+        const problems = await store.getLogs(run.id, 0, 10, { levels: ['warn', 'error'] });
+        expect(problems.map(l => l.seq)).toEqual([2, 3]);
+        const byKeyword = await store.getLogs(run.id, 0, 10, { keyword: 'THRE' });
+        expect(byKeyword.map(l => l.message)).toEqual(['three']);
+        const byModule = await store.getLogs(run.id, 0, 10, { keyword: 'm' });
+        expect(byModule.map(l => l.seq)).toEqual([1, 3]);
+        const combined = await store.getLogs(run.id, 0, 10, { levels: ['error'], keyword: 'three' });
+        expect(combined.map(l => l.seq)).toEqual([3]);
+
+        expect(await store.countLogsByLevel(run.id)).toEqual({ info: 1, warn: 1, error: 1 });
+
+        // Tail replay starts just before the requested number of trailing lines
+        expect(await store.getTailStartSeq(run.id, 2)).toBe(1);
+        expect(await store.getTailStartSeq(run.id, 10)).toBe(0);
+
         const finished = await store.finishRun(run.id, {
             status: 'succeeded',
             exitCode: 0,
