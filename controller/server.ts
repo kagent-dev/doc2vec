@@ -7,10 +7,21 @@ import { ConfigRegistry, isValidCron, parseConfigMeta } from './config-registry'
 import { ControllerEvents } from './events';
 import { JobRunner } from './job-runner';
 import { Scheduler } from './scheduler';
-import { ControllerStore } from './store';
+import { ControllerStore, LogFilter } from './store';
 import { ConflictError, LogRow, NotFoundError, RunRecord, RunStatus, ValidationError } from './types';
 
 const SSE_HEARTBEAT_MS = 15_000;
+const LOG_PAGE_SIZE = 5000;
+const LOG_LEVELS = new Set(['error', 'warn', 'info', 'debug']);
+
+/** Shared parsing for the `levels` (csv) and `q` log query parameters. */
+function parseLogFilter(req: Request): LogFilter {
+    const levels = typeof req.query.levels === 'string'
+        ? req.query.levels.split(',').map(l => l.trim().toLowerCase()).filter(l => LOG_LEVELS.has(l))
+        : [];
+    const keyword = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    return { levels, keyword: keyword || undefined };
+}
 
 export interface ServerDeps {
     store: ControllerStore;
@@ -191,7 +202,39 @@ export function createServer(deps: ServerDeps): express.Express {
         if (!await store.getRun(id)) throw new NotFoundError('run not found');
         const afterSeq = Number(req.query.afterSeq) || 0;
         const limit = Number(req.query.limit) || 1000;
-        res.json(await store.getLogs(id, afterSeq, limit));
+        res.json(await store.getLogs(id, afterSeq, limit, parseLogFilter(req)));
+    });
+
+    /** Whole-run line totals per level — the UI can only hold a trailing window. */
+    app.get('/api/runs/:id/logs/counts', async (req, res) => {
+        const id = parseId(String(req.params.id));
+        if (!await store.getRun(id)) throw new NotFoundError('run not found');
+        res.json(await store.countLogsByLevel(id));
+    });
+
+    // Full log as a plain-text download: the escape hatch when the viewer's
+    // in-memory window or filters aren't enough (grep it locally, attach it).
+    app.get('/api/runs/:id/logs/download', async (req, res) => {
+        const id = parseId(String(req.params.id));
+        if (!await store.getRun(id)) throw new NotFoundError('run not found');
+        const filter = parseLogFilter(req);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="run-${id}.log"`);
+
+        let afterSeq = 0;
+        let batch: LogRow[];
+        do {
+            batch = await store.getLogs(id, afterSeq, LOG_PAGE_SIZE, filter);
+            for (const row of batch) {
+                const module = row.module ? ` [${row.module}]` : '';
+                // pg hands back TIMESTAMPTZ as a Date; JSON responses serialise
+                // it for us, a text body has to do it explicitly
+                const ts = new Date(row.ts).toISOString();
+                res.write(`${ts} ${row.level.toUpperCase().padEnd(5)}${module} ${row.message}\n`);
+            }
+            if (batch.length > 0) afterSeq = batch[batch.length - 1].seq;
+        } while (batch.length === LOG_PAGE_SIZE);
+        res.end();
     });
 
     app.post('/api/runs/:id/cancel', async (req, res) => {
@@ -220,7 +263,11 @@ export function createServer(deps: ServerDeps): express.Express {
         if (!run) throw new NotFoundError('run not found');
 
         sseInit(res);
+        // `tail` keeps the replay to the trailing window the viewer can hold —
+        // older lines stay reachable through the filter/download endpoints.
+        const tail = Number(req.query.tail) || 0;
         let lastSeq = Number(req.query.afterSeq) || 0;
+        if (!lastSeq && tail > 0) lastSeq = await store.getTailStartSeq(id, tail);
         let replayDone = false;
         const pending: LogRow[] = [];
 
@@ -252,9 +299,9 @@ export function createServer(deps: ServerDeps): express.Express {
         try {
             let batch: LogRow[];
             do {
-                batch = await store.getLogs(id, lastSeq, 5000);
+                batch = await store.getLogs(id, lastSeq, LOG_PAGE_SIZE);
                 batch.forEach(sendRow);
-            } while (batch.length === 5000);
+            } while (batch.length === LOG_PAGE_SIZE);
         } finally {
             replayDone = true;
             pending.forEach(sendRow);

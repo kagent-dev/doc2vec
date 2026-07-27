@@ -6,7 +6,12 @@ This project provides a configurable tool (`doc2vec`) to crawl specified website
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
 
-> **⚠️ Version 2.0.0 Breaking Change:** Version 2.0.0 introduced enhanced chunking with new metadata fields (`chunk_index` and `total_chunks`) that enable page reconstruction and improved chunk ordering. The database schema has changed, and databases created with versions prior to 2.0.0 use a different format. **If you're upgrading to version 2.0.0 or later, you should start with fresh databases** to take advantage of the new features. While the MCP server maintains backward compatibility for querying old databases, doc2vec itself will create databases in the new format. If you need to migrate existing data, consider re-running doc2vec on your sources to regenerate the databases with the enhanced chunking format.
+Run it two ways:
+
+*   **One-shot sync** — `doc2vec run config.yaml` processes every source in a config file and exits. Ideal for a cron job or CI step.
+*   **[Controller mode](#controller-mode)** — `doc2vec controller ./configs/` stays running: it schedules each config on its own cron expression, keeps run history and per-source statistics in Postgres, and serves a web UI with live log streaming, searchable run logs, and chunk inspection. Deploy it once and manage all your sources from the browser.
+
+[![doc2vec controller dashboard](docs/images/controller-dashboard.png)](#controller-mode)
 
 ## Key Features
 
@@ -52,7 +57,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
-*   **[Controller Mode](#controller-mode):** Optionally runs as a long-lived controller that schedules sync jobs from multiple config files (cron `schedule` field), persists run history and statistics in Postgres, and serves a web UI with live log streaming — read-only (configs from files/ConfigMap) or read-write (create/edit configs from the UI).
+*   **[Controller Mode](#controller-mode):** Optionally runs as a long-lived controller that schedules sync jobs from multiple config files (cron `schedule` field), persists run history and statistics in Postgres, and serves a web UI with live log streaming, whole-run log search, and chunk inspection — read-only (configs from files/ConfigMap) or read-write (create/edit configs from the UI).
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
 
 ## Chunk Metadata & Page Reconstruction
@@ -446,7 +451,19 @@ Besides the one-shot sync, doc2vec can run as a **long-lived controller** that s
 doc2vec controller --database-url postgres://user:pass@host:5432/doc2vec ./configs/
 ```
 
-Open http://localhost:8080 to see the dashboard: configs with their schedule and next run, run history with per-source statistics, and live log streaming for running jobs.
+Open http://localhost:8080 to see the dashboard ([screenshot above](#doc2vec)): every config with its schedule, next run, and the outcome of its last run, plus a **Run now** button.
+
+Each config gets its own page with the full run history, per-source results, and the raw YAML:
+
+![Config run history](docs/images/controller-runs.png)
+
+…and a **Stats** tab with runs per day, success rate, and duration trend over the last 7/30/90 days:
+
+![Config statistics](docs/images/controller-stats.png)
+
+A run page shows what the sync did — duration, exit code, warning and error counts, per-source chunk counts and errors — above the run's logs.
+
+![Run detail with filtered logs](docs/images/controller-run-logs.png)
 
 ### Scheduling
 
@@ -461,6 +478,20 @@ sources:
 ```
 
 Configs without a `schedule` are still listed in the UI and can be triggered manually with **Run now**. Each run executes `doc2vec run <config.yaml>` as a child process; overlapping runs of the same config are skipped, and `--max-parallel` (default 1) caps how many sync jobs run at once — keep it low, since website sources launch a headless Chromium.
+
+### Logs
+
+Every line a sync job writes is stored in Postgres and streamed to the run page as it happens (`● live`), with follow-on-scroll and a `↓ Follow` button when you scroll away.
+
+Long runs produce a lot of output, so the browser only keeps the last 10,000 lines in memory — the header tells you when that is the case (`30,000 lines (showing last 10,000)`). Everything else stays one query away:
+
+*   **Level chips** (`ERROR 4`, `WARN 93`, …) count the whole run, not the visible window, and clicking one filters **server-side** — so the 4 errors from the first minute of a 50-minute run are one click away. Results page in with **Load 2,000 more**.
+*   **Keyword filter** matches the message or the module, case-insensitively, across the whole run.
+*   **↓ download log** streams the complete log as plain text (`run-<id>.log`) for grepping locally or attaching to an issue. With a filter active it becomes **↓ download matches** and applies the same filter.
+
+While a run is live, new lines matching the active filter keep arriving in the filtered view.
+
+Run logs are pruned after `--log-retention-days` (default 14); run history and statistics are kept indefinitely.
 
 ### Flags
 
@@ -533,7 +564,22 @@ The controller detects ConfigMap updates without a restart. Health endpoint: `GE
 
 ### API
 
-The UI is backed by a small REST API you can also use directly: `GET /api/configs`, `POST /api/configs/:id/run`, `GET /api/runs?configId=`, `GET /api/runs/:id/logs`, `POST /api/runs/:id/cancel`, `GET /api/configs/:id/stats?days=30`, plus server-sent events at `GET /api/events` and `GET /api/runs/:id/logs/stream`.
+The UI is backed by a small REST API you can also use directly:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/configs` | Configs with schedule, next run, and last run |
+| `POST /api/configs/:id/run` | Trigger a run now |
+| `GET /api/configs/:id/stats?days=30` | Run counts, success rate, duration history |
+| `GET /api/configs/:id/chunks?product_name=&url=` | Inspect the stored chunks for a URL |
+| `GET /api/runs?configId=&status=&limit=&before=` | Run history |
+| `GET /api/runs/:id/logs?afterSeq=&limit=&levels=&q=` | Log lines, filtered by level (csv) and/or keyword |
+| `GET /api/runs/:id/logs/counts` | Line totals per level for the whole run |
+| `GET /api/runs/:id/logs/download?levels=&q=` | Whole log (or the matching lines) as plain text |
+| `POST /api/runs/:id/cancel` | Cancel a running job |
+| `GET /api/health` | Status, mode, version |
+
+Server-sent events: `GET /api/events` (run and config updates) and `GET /api/runs/:id/logs/stream?tail=10000` (replays the last `tail` stored lines, then tails live output).
 
 ## Database Options
 
@@ -720,6 +766,13 @@ If you don't specify a config path, it will look for config.yaml in the current 
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Searchable Controller Run Logs
+- **Server-side log filtering:** Level chips and the keyword filter now query Postgres instead of the browser's in-memory buffer, so errors and warnings from the start of a long run are reachable (`GET /api/runs/:id/logs?levels=error,warn&q=...`, paged with **Load 2,000 more**)
+- **Whole-run level counts:** New `GET /api/runs/:id/logs/counts` endpoint backs the level chips, which previously only counted the lines still held in the browser
+- **Plain-text download:** `GET /api/runs/:id/logs/download` streams the full log (or just the matching lines) as `run-<id>.log`
+- **Bounded replay:** The log stream accepts `?tail=N` so opening a 30,000-line run replays only the trailing window instead of the entire history
+- **Index:** New `d2v_run_logs (run_id, level, seq)` index keeps level filtering fast on long runs
 
 ### Postgres Markdown Store
 - **New feature:** Optionally store the generated markdown for each crawled website URL in a Postgres table (`url`, `product_name`, `markdown`, `updated_at`)

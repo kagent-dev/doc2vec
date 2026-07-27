@@ -162,7 +162,21 @@ export const api = {
     return request<RunRecord[]>(`/api/runs?${qs}`);
   },
   run: (id: number) => request<RunRecord>(`/api/runs/${id}`),
-  runLogs: (id: number, afterSeq = 0, limit = 1000) =>
-    request<LogRow[]>(`/api/runs/${id}/logs?afterSeq=${afterSeq}&limit=${limit}`),
+  runLogs: (id: number, params: { afterSeq?: number; limit?: number; levels?: string[]; q?: string } = {}) =>
+    request<LogRow[]>(`/api/runs/${id}/logs?${logQuery(params)}`),
+  runLogCounts: (id: number) => request<Record<string, number>>(`/api/runs/${id}/logs/counts`),
+  runLogsDownloadUrl: (id: number, params: { levels?: string[]; q?: string } = {}) => {
+    const qs = logQuery(params);
+    return `/api/runs/${id}/logs/download${qs ? `?${qs}` : ''}`;
+  },
   cancelRun: (id: number) => request<RunRecord>(`/api/runs/${id}/cancel`, { method: 'POST' }),
 };
+
+function logQuery(params: { afterSeq?: number; limit?: number; levels?: string[]; q?: string }): string {
+  const qs = new URLSearchParams();
+  if (params.afterSeq !== undefined) qs.set('afterSeq', String(params.afterSeq));
+  if (params.limit !== undefined) qs.set('limit', String(params.limit));
+  if (params.levels?.length) qs.set('levels', params.levels.join(','));
+  if (params.q) qs.set('q', params.q);
+  return qs.toString();
+}

@@ -11,6 +11,18 @@ import {
     SourceSummary
 } from './types';
 
+export interface LogFilter {
+    /** Only these levels; empty/undefined means every level. */
+    levels?: string[];
+    /** Case-insensitive substring match on message or module. */
+    keyword?: string;
+}
+
+/** Neutralise LIKE wildcards so a keyword search stays a literal substring match. */
+function escapeLike(value: string): string {
+    return value.replace(/[\\%_]/g, ch => `\\${ch}`);
+}
+
 export interface UpsertConfigInput {
     path: string;
     name: string;
@@ -204,13 +216,58 @@ export class ControllerStore {
         );
     }
 
-    async getLogs(runId: number, afterSeq = 0, limit = 1000): Promise<LogRow[]> {
+    /**
+     * Page through a run's logs. Filtering happens here rather than in the
+     * browser so that a search covers the whole run: the UI only holds a
+     * trailing window of a long run's output in memory.
+     */
+    async getLogs(
+        runId: number,
+        afterSeq = 0,
+        limit = 1000,
+        filter: LogFilter = {}
+    ): Promise<LogRow[]> {
+        const values: any[] = [runId, afterSeq];
+        let where = 'run_id = $1 AND seq > $2';
+        if (filter.levels?.length) {
+            values.push(filter.levels);
+            where += ` AND level = ANY($${values.length})`;
+        }
+        if (filter.keyword) {
+            values.push(`%${escapeLike(filter.keyword)}%`);
+            where += ` AND (message ILIKE $${values.length} ESCAPE '\\' OR module ILIKE $${values.length} ESCAPE '\\')`;
+        }
+        values.push(Math.min(limit, 5000));
         const { rows } = await this.pool.query(
             `SELECT seq, ts, level, module, message FROM d2v_run_logs
-             WHERE run_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`,
-            [runId, afterSeq, Math.min(limit, 5000)]
+             WHERE ${where} ORDER BY seq LIMIT $${values.length}`,
+            values
         );
         return rows.map((r: any) => ({ ...r, seq: Number(r.seq) }));
+    }
+
+    /**
+     * Seq to replay from so that only the last `tail` lines follow, i.e. the
+     * seq of the (tail + 1)-th newest line — 0 when the run is shorter.
+     */
+    async getTailStartSeq(runId: number, tail: number): Promise<number> {
+        const { rows } = await this.pool.query(
+            `SELECT seq FROM d2v_run_logs WHERE run_id = $1 ORDER BY seq DESC OFFSET $2 LIMIT 1`,
+            [runId, Math.max(0, tail)]
+        );
+        return rows.length > 0 ? Number(rows[0].seq) : 0;
+    }
+
+    /** Per-level line totals for a whole run, for the log viewer's filter chips. */
+    async countLogsByLevel(runId: number): Promise<Record<string, number>> {
+        const { rows } = await this.pool.query(
+            `SELECT level, COUNT(*)::bigint AS count FROM d2v_run_logs
+             WHERE run_id = $1 GROUP BY level`,
+            [runId]
+        );
+        const counts: Record<string, number> = {};
+        for (const row of rows) counts[row.level] = Number(row.count);
+        return counts;
     }
 
     async pruneOldLogs(retentionDays: number): Promise<number> {
