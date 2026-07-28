@@ -102,6 +102,7 @@ ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/gloo-edge.db /app/build/glo
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/otel.db /app/build/otel.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/cilium.db /app/build/cilium.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/ambient.db /app/build/ambient.db
+ADD data/*.db /app/build
 
 #show cheksum for every db file
 RUN for file in /app/build/*.db; do echo "Checksum for $file:";sha256sum "$file";done
