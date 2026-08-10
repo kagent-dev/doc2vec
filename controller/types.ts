@@ -36,6 +36,16 @@ export interface ConfigRecord {
 }
 
 export type RunTrigger = 'scheduled' | 'manual';
+
+/** One config source entry targeted by a partial manual run. `index` is the
+ *  position in the config's sources list — the only unambiguous identifier,
+ *  since product names (even with type and version) can repeat. */
+export interface RequestedSource {
+    index: number;
+    product_name: string;
+    type: string;
+    version?: string;
+}
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'canceled';
 
 export interface RunRecord {
@@ -47,6 +57,7 @@ export interface RunRecord {
     pid: number | null;
     exit_code: number | null;
     error: string | null;
+    requested_sources: RequestedSource[] | null;  // manual source selection; null = all sources
     stats: RunStatsPayload;
     queued_at: string;
     started_at: string | null;

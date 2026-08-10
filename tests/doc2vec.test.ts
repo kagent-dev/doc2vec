@@ -298,6 +298,71 @@ describe('Doc2Vec class', () => {
     });
 
     // ─────────────────────────────────────────────────────────────────────────
+    // 1b. run() source filter
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('run source filter', () => {
+        function makeTwoSourceInstance() {
+            const config = {
+                sources: ['SiteA', 'SiteB'].map(name => ({
+                    type: 'website',
+                    product_name: name,
+                    version: '1.0',
+                    max_size: 50000,
+                    url: `https://example.com/${name}`,
+                    database_config: { type: 'sqlite', params: { db_path: ':memory:' } },
+                })),
+            };
+            const configPath = writeTestConfig('run-filter.yaml', config);
+            const instance = new Doc2Vec(configPath);
+            const processWebsite = vi.fn(async () => {});
+            (instance as any).processWebsite = processWebsite;
+            return { instance, processWebsite };
+        }
+
+        it('should only process the sources selected by name', async () => {
+            const { instance, processWebsite } = makeTwoSourceInstance();
+            const stats = await instance.run({ names: ['SiteB'] });
+            expect(processWebsite).toHaveBeenCalledTimes(1);
+            expect(processWebsite.mock.calls[0][0].product_name).toBe('SiteB');
+            expect(stats).toHaveLength(1);
+            expect(stats[0].product_name).toBe('SiteB');
+        });
+
+        it('should only process the sources selected by index', async () => {
+            const { instance, processWebsite } = makeTwoSourceInstance();
+            const stats = await instance.run({ indices: [0] });
+            expect(processWebsite).toHaveBeenCalledTimes(1);
+            expect(stats.map(s => s.product_name)).toEqual(['SiteA']);
+        });
+
+        it('should process the union of names and indices, in config order', async () => {
+            const { instance, processWebsite } = makeTwoSourceInstance();
+            const stats = await instance.run({ indices: [1], names: ['SiteA'] });
+            expect(processWebsite).toHaveBeenCalledTimes(2);
+            expect(stats.map(s => s.product_name)).toEqual(['SiteA', 'SiteB']);
+        });
+
+        it('should process all sources when no filter is given', async () => {
+            const { instance, processWebsite } = makeTwoSourceInstance();
+            const stats = await instance.run();
+            expect(processWebsite).toHaveBeenCalledTimes(2);
+            expect(stats.map(s => s.product_name)).toEqual(['SiteA', 'SiteB']);
+        });
+
+        it('should throw on unknown source names', async () => {
+            const { instance, processWebsite } = makeTwoSourceInstance();
+            await expect(instance.run({ names: ['SiteA', 'Nope'] })).rejects.toThrow(/Unknown source\(s\): Nope/);
+            expect(processWebsite).not.toHaveBeenCalled();
+        });
+
+        it('should throw on out-of-range source indices', async () => {
+            const { instance, processWebsite } = makeTwoSourceInstance();
+            await expect(instance.run({ indices: [5] })).rejects.toThrow(/index out of range: 5/);
+            expect(processWebsite).not.toHaveBeenCalled();
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
     // 2. loadConfig
     // ─────────────────────────────────────────────────────────────────────────
     describe('loadConfig', () => {

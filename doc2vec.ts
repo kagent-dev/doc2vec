@@ -180,7 +180,34 @@ export class Doc2Vec {
         return parsedValue;
     }
 
-    public async run(): Promise<SourceRunStats[]> {
+    /**
+     * Sync sources sequentially. An optional selection restricts the run to a
+     * subset of the config's sources: `indices` are 0-based positions in the
+     * config's sources list (exact — the only unambiguous identifier, since
+     * product names can repeat), and `names` match every source with that
+     * product_name. The union of both is processed, in config order.
+     */
+    public async run(selection?: { indices?: number[]; names?: string[] }): Promise<SourceRunStats[]> {
+        let sources = this.config.sources;
+        const wantedIndices = selection?.indices ?? [];
+        const wantedNames = selection?.names ?? [];
+        if (wantedIndices.length > 0 || wantedNames.length > 0) {
+            const badIndices = wantedIndices.filter(i => !Number.isInteger(i) || i < 0 || i >= this.config.sources.length);
+            if (badIndices.length > 0) {
+                throw new Error(`Source index out of range: ${badIndices.join(', ')} (config has ${this.config.sources.length} sources)`);
+            }
+            const known = new Set(this.config.sources.map(s => s.product_name));
+            const unknown = wantedNames.filter(name => !known.has(name));
+            if (unknown.length > 0) {
+                throw new Error(`Unknown source(s): ${unknown.join(', ')}. Available: ${[...known].join(', ')}`);
+            }
+            const nameSet = new Set(wantedNames);
+            const indexSet = new Set(wantedIndices);
+            sources = this.config.sources.filter((s, i) => indexSet.has(i) || nameSet.has(s.product_name));
+            const label = sources.map(s => `${s.product_name} (${s.type})`).join(', ');
+            this.logger.info(`Source filter active: syncing ${sources.length} of ${this.config.sources.length} sources: ${label}`);
+        }
+
         // Initialize Postgres markdown store table if configured
         if (this.markdownStore) {
             await this.markdownStore.init();
@@ -190,7 +217,7 @@ export class Doc2Vec {
 
         const runStats: SourceRunStats[] = [];
 
-        for (const sourceConfig of this.config.sources) {
+        for (const sourceConfig of sources) {
             const sourceLogger = this.logger.child(`source:${sourceConfig.product_name}`);
 
             sourceLogger.info(`Processing ${sourceConfig.type} source for ${sourceConfig.product_name}@${sourceConfig.version}`);
@@ -2041,15 +2068,15 @@ export class Doc2Vec {
     }
 }
 
-function runOneShot(configPath: string): void {
+function runOneShot(configPath: string, selection?: { indices?: number[]; names?: string[] }): void {
     if (!fs.existsSync(configPath)) {
         console.error('Please provide a valid path to a YAML config file.');
         process.exit(1);
     }
     const doc2Vec = new Doc2Vec(configPath);
-    doc2Vec.run()
+    doc2Vec.run(selection)
         .then((stats) => process.exit(stats.some(s => !s.ok) ? 1 : 0))
-        .catch((err) => { console.error(err); process.exit(1); });
+        .catch((err) => { console.error(err instanceof Error ? err.message : err); process.exit(1); });
 }
 
 if (require.main === module) {
@@ -2059,14 +2086,22 @@ if (require.main === module) {
     program
         .name('doc2vec')
         .description('Crawl documentation sources and store embeddings in vector databases')
-        // Legacy invocation: `doc2vec [config.yaml]` runs a one-shot sync
+        // Legacy invocation: `doc2vec [config.yaml]` runs a one-shot sync.
+        // The source-filter flags live only on the `run` subcommand: declaring
+        // them here too would swallow them at the program level before the
+        // subcommand's parser ever sees them.
         .argument('[config]', 'path to a YAML config file', 'config.yaml')
         .action((configPath: string) => runOneShot(configPath));
 
     program
         .command('run <config>')
         .description('Run a one-shot sync for a config file (what the controller spawns)')
-        .action((configPath: string) => runOneShot(configPath));
+        .option('--source <product_name>', 'only sync sources with this product_name (repeatable)',
+            (value: string, previous: string[]) => [...previous, value], [] as string[])
+        .option('--source-index <n>', 'only sync the source at this 0-based position in the config (repeatable, exact)',
+            (value: string, previous: number[]) => [...previous, parseInt(value, 10)], [] as number[])
+        .action((configPath: string, options: { source: string[]; sourceIndex: number[] }) =>
+            runOneShot(configPath, { names: options.source, indices: options.sourceIndex }));
 
     program
         .command('controller [configs...]')

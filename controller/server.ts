@@ -8,7 +8,7 @@ import { ControllerEvents } from './events';
 import { JobRunner } from './job-runner';
 import { Scheduler } from './scheduler';
 import { ControllerStore, LogFilter } from './store';
-import { ConflictError, LogRow, NotFoundError, RunRecord, RunStatus, ValidationError } from './types';
+import { ConflictError, LogRow, NotFoundError, RequestedSource, RunRecord, RunStatus, ValidationError } from './types';
 
 const SSE_HEARTBEAT_MS = 15_000;
 const LOG_PAGE_SIZE = 5000;
@@ -143,7 +143,33 @@ export function createServer(deps: ServerDeps): express.Express {
     app.post('/api/configs/:id/run', async (req, res) => {
         const config = registry.get(parseId(String(req.params.id)));
         if (!config) throw new NotFoundError('config not found');
-        const run = await runner.enqueue(config, 'manual');
+
+        // Optional source selection: 0-based positions in the config's sources
+        // list (exact — product names can repeat). Default: all sources.
+        let sources: RequestedSource[] | undefined;
+        const { sources: rawSources, baseHash } = (req.body ?? {}) as { sources?: unknown; baseHash?: unknown };
+        if (rawSources !== undefined) {
+            if (!Array.isArray(rawSources) || rawSources.some(i => !Number.isInteger(i))) {
+                throw new ValidationError('sources must be an array of source indices (integers)');
+            }
+            // Indices are only meaningful against the config revision the client
+            // saw — reject the run if the config changed underneath it.
+            if (baseHash !== undefined && baseHash !== config.content_hash) {
+                throw new ConflictError('config changed since the source list was loaded — reload and retry');
+            }
+            const total = config.source_summary.length;
+            const outOfRange = rawSources.filter((i: number) => i < 0 || i >= total);
+            if (outOfRange.length > 0) {
+                throw new ValidationError(`source index out of range: ${outOfRange.join(', ')} (config has ${total} sources)`);
+            }
+            // Deduplicate, keep config order; empty or full selection = full run
+            const indices = [...new Set(rawSources as number[])].sort((a, b) => a - b);
+            if (indices.length > 0 && indices.length < total) {
+                sources = indices.map(index => ({ index, ...config.source_summary[index] }));
+            }
+        }
+
+        const run = await runner.enqueue(config, 'manual', sources);
         res.status(202).json(run);
     });
 

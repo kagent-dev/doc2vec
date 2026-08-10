@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { JobRunner } from '../controller/job-runner';
-import { ConflictError, ConfigRecord, LogRow, RunRecord } from '../controller/types';
+import { ConflictError, ConfigRecord, LogRow, RequestedSource, RunRecord } from '../controller/types';
 
 function makeLogger(): any {
     const l: any = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), section: vi.fn(), event: vi.fn() };
@@ -34,7 +34,7 @@ function makeStore() {
     return {
         runs,
         logs,
-        createRun: vi.fn(async (configId: number, configHash: string, trigger: any, status: any, error?: string) => {
+        createRun: vi.fn(async (configId: number, configHash: string, trigger: any, status: any, error?: string, requestedSources?: RequestedSource[]) => {
             const run: RunRecord = {
                 id: nextRunId++,
                 config_id: configId,
@@ -44,6 +44,7 @@ function makeStore() {
                 pid: null,
                 exit_code: null,
                 error: error ?? null,
+                requested_sources: requestedSources ?? null,
                 stats: {},
                 queued_at: new Date().toISOString(),
                 started_at: null,
@@ -93,9 +94,13 @@ async function waitForRun(store: any, runId: number, timeoutMs = 10_000): Promis
     throw new Error(`run ${runId} did not finish in time (status: ${store.runs.get(runId)?.status})`);
 }
 
-/** commandFor stub: runs an inline node script instead of a real sync. */
+/**
+ * commandFor stub: runs an inline node script instead of a real sync. The
+ * trailing `--` makes node hand any appended flags (e.g. --source) to the
+ * script's argv, like a script-file invocation would.
+ */
 function inlineScript(script: string) {
-    return () => ({ cmd: process.execPath, args: ['-e', script] });
+    return () => ({ cmd: process.execPath, args: ['-e', script, '--'] });
 }
 
 describe('JobRunner', () => {
@@ -219,6 +224,34 @@ describe('JobRunner', () => {
         expect(finishedRunning.error).toBe('controller shutdown');
 
         await expect(runner.enqueue(makeConfig(3), 'manual')).rejects.toThrow(ConflictError);
+    });
+
+    it('passes a manual source selection to the spawned command and the run record', async () => {
+        // The inline script echoes its extra argv so we can assert the --source-index flags
+        const runner = makeRunner(`
+            console.log(JSON.stringify({ level: 'info', msg: 'argv: ' + process.argv.slice(1).join(' ') }));
+        `);
+        const selection = [
+            { index: 2, product_name: 'istio', type: 'code', version: 'master' },
+            { index: 7, product_name: 'argo', type: 'website', version: 'latest' },
+        ];
+        const run = await runner.enqueue(makeConfig(1), 'manual', selection);
+        expect(store.createRun).toHaveBeenCalledWith(1, 'hash-1', 'manual', 'queued', undefined, selection);
+        expect(run.requested_sources).toEqual(selection);
+
+        await waitForRun(store, run.id);
+        const logs = store.logs.get(run.id) ?? [];
+        expect(logs.some(l => l.message.includes('--source-index 2 --source-index 7'))).toBe(true);
+    });
+
+    it('spawns without --source-index flags when no selection is given', async () => {
+        const runner = makeRunner(`
+            console.log(JSON.stringify({ level: 'info', msg: 'argv: ' + process.argv.slice(1).join(' ') }));
+        `);
+        const run = await runner.enqueue(makeConfig(1), 'manual');
+        await waitForRun(store, run.id);
+        const logs = store.logs.get(run.id) ?? [];
+        expect(logs.some(l => l.message.includes('--source-index'))).toBe(false);
     });
 
     it('rejects runs for configs with parse errors', async () => {

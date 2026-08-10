@@ -8,7 +8,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 
 Run it two ways:
 
-*   **One-shot sync** — `doc2vec run config.yaml` processes every source in a config file and exits. Ideal for a cron job or CI step.
+*   **One-shot sync** — `doc2vec run config.yaml` processes every source in a config file and exits. Ideal for a cron job or CI step. Pass `--source <product_name>` (all entries with that name) or `--source-index <n>` (a single entry, by its 0-based position in the config) to sync only selected sources; both flags are repeatable.
 *   **[Controller mode](#controller-mode)** — `doc2vec controller ./configs/` stays running: it schedules each config on its own cron expression, keeps run history and per-source statistics in Postgres, and serves a web UI with live log streaming, searchable run logs, and chunk inspection. Deploy it once and manage all your sources from the browser.
 
 [![doc2vec controller dashboard](docs/images/controller-dashboard.png)](#controller-mode)
@@ -451,7 +451,7 @@ Besides the one-shot sync, doc2vec can run as a **long-lived controller** that s
 doc2vec controller --database-url postgres://user:pass@host:5432/doc2vec ./configs/
 ```
 
-Open http://localhost:8080 to see the dashboard ([screenshot above](#doc2vec)): every config with its schedule, next run, and the outcome of its last run, plus a **Run now** button.
+Open http://localhost:8080 to see the dashboard ([screenshot above](#doc2vec)): every config with its schedule, next run, and the outcome of its last run, plus a **Run now** button. The **▾** next to it opens a source picker to sync only a subset of the config's source entries — each entry is selectable individually, even when several share a product name (e.g. istio as github + code + website) — and the run history marks such partial runs with the selected sources.
 
 Each config gets its own page with the full run history, per-source results, and the raw YAML:
 
@@ -477,7 +477,7 @@ sources:
     ...
 ```
 
-Configs without a `schedule` are still listed in the UI and can be triggered manually with **Run now**. Each run executes `doc2vec run <config.yaml>` as a child process; overlapping runs of the same config are skipped, and `--max-parallel` (default 1) caps how many sync jobs run at once — keep it low, since website sources launch a headless Chromium.
+Configs without a `schedule` are still listed in the UI and can be triggered manually with **Run now** (optionally for a subset of sources via the **▾** picker). Each run executes `doc2vec run <config.yaml>` as a child process (with `--source-index <n>` flags when a subset was selected); overlapping runs of the same config are skipped, and `--max-parallel` (default 1) caps how many sync jobs run at once — keep it low, since website sources launch a headless Chromium.
 
 ### Logs
 

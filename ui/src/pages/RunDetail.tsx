@@ -1,9 +1,26 @@
+import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError } from '../api';
+import { api, ApiError, SourceRunStats } from '../api';
 import { formatDuration, formatTime, runDuration } from '../lib/format';
 import LogViewer from '../components/LogViewer';
 import RunStatusBadge from '../components/RunStatusBadge';
+
+type SourceSortKey = 'source' | 'type' | 'version' | 'duration' | 'changes' | 'result';
+
+function sourceSortValue(source: SourceRunStats, key: SourceSortKey): string | number {
+  switch (key) {
+    case 'source': return source.product_name;
+    case 'type': return source.type;
+    case 'version': return source.version ?? '';
+    case 'duration': return source.duration_ms;
+    case 'changes': {
+      const c = source.counters;
+      return c ? c.items_new + c.items_updated + c.items_deleted : -1;
+    }
+    case 'result': return source.ok ? 1 : 0;
+  }
+}
 
 export default function RunDetail() {
   const { id } = useParams();
@@ -23,11 +40,41 @@ export default function RunDetail() {
     onSettled: () => queryClient.invalidateQueries({ queryKey: ['runs', runId] }),
   });
 
+  const [sort, setSort] = useState<{ key: SourceSortKey; dir: 1 | -1 } | null>(null);
+  // Keep each source's original position: it's the key of the per-source detail
+  // route, which must not change when the table is re-sorted.
+  const sortedSources = useMemo(() => {
+    const rows = (run?.stats?.sources ?? []).map((source, index) => ({ source, index }));
+    if (!sort) return rows;
+    return [...rows].sort((a, b) => {
+      const va = sourceSortValue(a.source, sort.key);
+      const vb = sourceSortValue(b.source, sort.key);
+      const cmp = typeof va === 'string' && typeof vb === 'string' ? va.localeCompare(vb) : Number(va) - Number(vb);
+      return cmp * sort.dir;
+    });
+  }, [run, sort]);
+
   if (error) return <p className="text-critical">{(error as ApiError).message}</p>;
   if (!run) return <p className="text-ink-muted">Loading…</p>;
 
   const active = run.status === 'queued' || run.status === 'running';
-  const sources = run.stats?.sources ?? [];
+
+  // Clicking a header sorts ascending, again descending, a third time restores config order
+  const sortHeader = (label: string, key: SourceSortKey) => (
+    <th className="px-4 py-2 font-medium">
+      <button
+        onClick={() => setSort(prev =>
+          prev?.key !== key ? { key, dir: 1 } : prev.dir === 1 ? { key, dir: -1 } : null
+        )}
+        className={`inline-flex items-center gap-1 uppercase tracking-wide transition hover:text-ink-secondary ${
+          sort?.key === key ? 'text-ink-secondary' : ''
+        }`}
+      >
+        {label}
+        <span className="text-[10px]">{sort?.key === key ? (sort.dir === 1 ? '▲' : '▼') : ''}</span>
+      </button>
+    </th>
+  );
 
   return (
     <div className="space-y-6">
@@ -52,7 +99,7 @@ export default function RunDetail() {
         {cancel.error && <p className="mt-2 text-sm text-critical">{(cancel.error as ApiError).message}</p>}
         <dl className="mt-3 flex flex-wrap gap-x-8 gap-y-2 text-sm">
           {[
-            ['Trigger', run.trigger],
+            ['Trigger', run.requested_sources?.length ? `${run.trigger} (partial)` : run.trigger],
             ['Queued', formatTime(run.queued_at)],
             ['Started', formatTime(run.started_at)],
             ['Duration', active ? '…' : runDuration(run.started_at, run.finished_at)],
@@ -66,24 +113,37 @@ export default function RunDetail() {
             </div>
           ))}
         </dl>
+        {run.requested_sources && run.requested_sources.length > 0 && (
+          <p className="mt-2 text-sm text-ink-secondary">
+            <span className="text-xs uppercase tracking-wide text-ink-muted">Selected sources</span>{' '}
+            <span className="ml-1 inline-flex flex-wrap gap-1.5 align-middle">
+              {run.requested_sources.map(source => (
+                <span key={source.index} className="rounded-full border border-edge bg-page px-2 py-0.5 text-xs">
+                  {source.product_name}
+                  <span className="ml-1 text-ink-muted">{source.type}{source.version ? ` · ${source.version}` : ''}</span>
+                </span>
+              ))}
+            </span>
+          </p>
+        )}
       </div>
 
-      {sources.length > 0 && (
+      {sortedSources.length > 0 && (
         <div className="overflow-x-auto rounded-lg border border-edge bg-surface">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-edge text-left text-xs uppercase tracking-wide text-ink-muted">
-                <th className="px-4 py-2 font-medium">Source</th>
-                <th className="px-4 py-2 font-medium">Type</th>
-                <th className="px-4 py-2 font-medium">Version</th>
-                <th className="px-4 py-2 font-medium">Duration</th>
-                <th className="px-4 py-2 font-medium">Changes</th>
-                <th className="px-4 py-2 font-medium">Result</th>
+                {sortHeader('Source', 'source')}
+                {sortHeader('Type', 'type')}
+                {sortHeader('Version', 'version')}
+                {sortHeader('Duration', 'duration')}
+                {sortHeader('Changes', 'changes')}
+                {sortHeader('Result', 'result')}
                 <th className="px-4 py-2" />
               </tr>
             </thead>
             <tbody>
-              {sources.map((source, index) => (
+              {sortedSources.map(({ source, index }) => (
                 <tr
                   key={`${source.product_name}-${source.type}-${index}`}
                   onClick={() => navigate(`/runs/${run.id}/sources/${index}`)}

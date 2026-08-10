@@ -4,7 +4,7 @@ import * as readline from 'readline';
 import { Logger } from '../logger';
 import { ControllerEvents } from './events';
 import { ControllerStore } from './store';
-import { ConfigRecord, ConflictError, LogRow, RunRecord, RunTrigger } from './types';
+import { ConfigRecord, ConflictError, LogRow, RequestedSource, RunRecord, RunTrigger } from './types';
 
 const MAX_LOG_MESSAGE_BYTES = 8192;
 const LOG_FLUSH_LINES = 100;
@@ -16,6 +16,7 @@ interface QueuedJob {
     runId: number;
     configId: number;
     configPath: string;
+    sources?: RequestedSource[];   // manual source selection; undefined = all sources
 }
 
 interface ActiveJob {
@@ -68,7 +69,7 @@ export class JobRunner {
         return this.active.size;
     }
 
-    async enqueue(config: ConfigRecord, trigger: RunTrigger): Promise<RunRecord> {
+    async enqueue(config: ConfigRecord, trigger: RunTrigger, sources?: RequestedSource[]): Promise<RunRecord> {
         if (this.shuttingDown) {
             throw new ConflictError('controller is shutting down');
         }
@@ -86,9 +87,9 @@ export class JobRunner {
             throw new ConflictError(`config is invalid: ${config.parse_error}`);
         }
 
-        const run = await this.store.createRun(config.id, config.content_hash, trigger, 'queued');
+        const run = await this.store.createRun(config.id, config.content_hash, trigger, 'queued', undefined, sources);
         this.queuedConfigs.add(config.id);
-        this.queue.push({ runId: run.id, configId: config.id, configPath: config.path });
+        this.queue.push({ runId: run.id, configId: config.id, configPath: config.path, sources });
         this.events.emitRunUpdate(run);
         this.pump();
         return run;
@@ -122,6 +123,9 @@ export class JobRunner {
 
     private async start(job: QueuedJob): Promise<void> {
         const { cmd, args } = this.commandFor(job.configPath);
+        for (const source of job.sources ?? []) {
+            args.push('--source-index', String(source.index));
+        }
         this.logger.info(`Starting run ${job.runId}: ${cmd} ${args.join(' ')}`);
 
         const child = spawn(cmd, args, {
