@@ -74,6 +74,22 @@ describe.skipIf(!TEST_DATABASE_URL)('ControllerStore (Postgres)', () => {
         expect((await store.listConfigs()).find(c => c.id === config.id)).toBeDefined();
     });
 
+    it('round-trips a manual source selection on runs', async () => {
+        const config = await store.upsertConfig({
+            path: '/test/store-sources.yaml', name: 'store-sources', content: 'x', contentHash: 'h',
+            schedule: null, sourceSummary: [], parseError: null,
+        });
+        const selection = [
+            { index: 1, product_name: 'istio', type: 'code', version: 'master' },
+            { index: 4, product_name: 'argo', type: 'website', version: 'latest' },
+        ];
+        const run = await store.createRun(config.id, 'h', 'manual', 'queued', undefined, selection);
+        expect(run.requested_sources).toEqual(selection);
+        expect((await store.getRun(run.id))!.requested_sources).toEqual(selection);
+        await store.finishRun(run.id, { status: 'succeeded', exitCode: 0 });
+        expect((await store.getRun(run.id))!.requested_sources).toEqual(selection);
+    });
+
     it('covers the run lifecycle and log paging', async () => {
         const config = await store.upsertConfig({
             path: '/test/store-c.yaml', name: 'store-c', content: 'x', contentHash: 'h',
@@ -82,6 +98,7 @@ describe.skipIf(!TEST_DATABASE_URL)('ControllerStore (Postgres)', () => {
 
         const run = await store.createRun(config.id, 'h', 'manual', 'queued');
         expect(run.status).toBe('queued');
+        expect(run.requested_sources).toBeNull();
 
         const started = await store.markRunStarted(run.id, 12345);
         expect(started.status).toBe('running');

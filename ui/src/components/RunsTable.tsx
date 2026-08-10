@@ -41,7 +41,17 @@ export default function RunsTable({ runs, showConfig = false, configNames }: {
                 </td>
               )}
               <td className="py-2.5 pr-4"><RunStatusBadge status={run.status} /></td>
-              <td className="py-2.5 pr-4 text-ink-secondary">{run.trigger}</td>
+              <td className="py-2.5 pr-4 text-ink-secondary">
+                {run.trigger}
+                {run.requested_sources && run.requested_sources.length > 0 && (
+                  <span
+                    className="ml-1.5 rounded-full border border-edge px-1.5 py-0.5 text-xs text-ink-muted"
+                    title={`Selected sources: ${run.requested_sources.map(s => `${s.product_name} (${s.type})`).join(', ')}`}
+                  >
+                    {run.requested_sources.length} source{run.requested_sources.length > 1 ? 's' : ''}
+                  </span>
+                )}
+              </td>
               <td className="py-2.5 pr-4 text-ink-secondary">{formatTime(run.started_at ?? run.queued_at)}</td>
               <td className="py-2.5 pr-4 text-ink-secondary">
                 {run.status === 'running' || run.status === 'queued' ? '…' : runDuration(run.started_at, run.finished_at)}

@@ -55,4 +55,10 @@ export const MIGRATIONS: string[] = [
     `
     CREATE INDEX IF NOT EXISTS d2v_run_logs_level_idx ON d2v_run_logs (run_id, level, seq);
     `,
+
+    // 3: manual runs can target a subset of a config's source entries (stored as
+    // [{index, product_name, type, version}]); NULL means the run covers all sources
+    `
+    ALTER TABLE d2v_runs ADD COLUMN IF NOT EXISTS requested_sources JSONB;
+    `,
 ];

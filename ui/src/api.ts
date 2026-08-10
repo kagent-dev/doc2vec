@@ -18,6 +18,14 @@ export interface SourceRunCounters {
   chunks_deleted: number;
 }
 
+/** One config source entry targeted by a partial manual run. */
+export interface RequestedSource {
+  index: number;
+  product_name: string;
+  type: string;
+  version?: string;
+}
+
 export interface SourceRunStats {
   product_name: string;
   type: string;
@@ -37,6 +45,8 @@ export interface RunRecord {
   pid: number | null;
   exit_code: number | null;
   error: string | null;
+  /** Manual source selection; null = all sources */
+  requested_sources: RequestedSource[] | null;
   stats: {
     sources?: SourceRunStats[];
     warn_count?: number;
@@ -142,7 +152,11 @@ export const api = {
       '/api/configs/validate',
       { method: 'POST', body: JSON.stringify({ content }) }
     ),
-  triggerRun: (configId: number) => request<RunRecord>(`/api/configs/${configId}/run`, { method: 'POST' }),
+  triggerRun: (configId: number, sources?: number[], baseHash?: string) =>
+    request<RunRecord>(`/api/configs/${configId}/run`, {
+      method: 'POST',
+      ...(sources?.length ? { body: JSON.stringify({ sources, baseHash }) } : {}),
+    }),
   configStats: (configId: number, days: number) =>
     request<ConfigStats>(`/api/configs/${configId}/stats?days=${days}`),
   chunksForUrl: (configId: number, params: { product_name: string; type?: string; version?: string; url: string }) => {

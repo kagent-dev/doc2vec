@@ -5,6 +5,7 @@ import { api, ApiError } from '../api';
 import { formatTime, humanizeCron, relativeTime } from '../lib/format';
 import ConfigEditor from '../components/ConfigEditor';
 import ConfigForm from '../components/ConfigForm';
+import RunButton from '../components/RunButton';
 import RunsTable from '../components/RunsTable';
 import SourceBadges from '../components/SourceBadges';
 import StatsCharts from '../components/StatsCharts';
@@ -35,10 +36,6 @@ export default function ConfigDetail() {
     enabled: tab === 'stats',
   });
 
-  const trigger = useMutation({
-    mutationFn: () => api.triggerRun(configId),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
-  });
   const remove = useMutation({
     mutationFn: () => api.deleteConfig(configId),
     onSuccess: () => {
@@ -64,13 +61,7 @@ export default function ConfigDetail() {
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
-            <button
-              onClick={() => trigger.mutate()}
-              disabled={config.busy || !!config.parse_error || trigger.isPending}
-              className="rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {config.busy ? 'Running…' : 'Run now'}
-            </button>
+            <RunButton config={config} variant="primary" />
             {readWrite && (
               <button
                 onClick={() => {
@@ -85,7 +76,6 @@ export default function ConfigDetail() {
             )}
           </div>
         </div>
-        {trigger.error && <p className="mt-2 text-sm text-critical">{(trigger.error as ApiError).message}</p>}
         {remove.error && <p className="mt-2 text-sm text-critical">{(remove.error as ApiError).message}</p>}
         <dl className="mt-3 flex flex-wrap gap-x-8 gap-y-2 text-sm">
           <div>

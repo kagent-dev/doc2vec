@@ -4,6 +4,7 @@ import { MIGRATIONS } from './migrations';
 import {
     ConfigRecord,
     LogRow,
+    RequestedSource,
     RunRecord,
     RunStatsPayload,
     RunStatus,
@@ -133,13 +134,13 @@ export class ControllerStore {
 
     // ------------------------------------------------------------------ runs
 
-    async createRun(configId: number, configHash: string, trigger: RunTrigger, status: RunStatus, error?: string): Promise<RunRecord> {
+    async createRun(configId: number, configHash: string, trigger: RunTrigger, status: RunStatus, error?: string, requestedSources?: RequestedSource[]): Promise<RunRecord> {
         const terminal = status === 'skipped';
         const { rows } = await this.pool.query(
-            `INSERT INTO d2v_runs (config_id, config_hash, trigger, status, error, finished_at)
-             VALUES ($1, $2, $3, $4, $5, ${terminal ? 'NOW()' : 'NULL'})
+            `INSERT INTO d2v_runs (config_id, config_hash, trigger, status, error, requested_sources, finished_at)
+             VALUES ($1, $2, $3, $4, $5, $6, ${terminal ? 'NOW()' : 'NULL'})
              RETURNING *`,
-            [configId, configHash, trigger, status, error ?? null]
+            [configId, configHash, trigger, status, error ?? null, requestedSources?.length ? JSON.stringify(requestedSources) : null]
         );
         return rows[0];
     }

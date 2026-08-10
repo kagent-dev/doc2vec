@@ -1,37 +1,12 @@
 import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
-import { api, ApiError, ConfigRecord } from '../api';
+import { api } from '../api';
 import { formatTime, humanizeCron, relativeTime, runDuration } from '../lib/format';
 import RunStatusBadge from '../components/RunStatusBadge';
 import ConfigForm from '../components/ConfigForm';
+import RunButton from '../components/RunButton';
 import SourceBadges from '../components/SourceBadges';
-
-function RunNowButton({ config }: { config: ConfigRecord }) {
-  const queryClient = useQueryClient();
-  const mutation = useMutation({
-    mutationFn: () => api.triggerRun(config.id),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
-  });
-  const disabled = config.busy || !!config.parse_error || mutation.isPending;
-  return (
-    <div className="flex items-center gap-2">
-      <button
-        onClick={e => {
-          e.preventDefault();
-          mutation.mutate();
-        }}
-        disabled={disabled}
-        className="rounded-md border border-edge bg-surface px-3 py-1 text-xs font-medium text-ink-secondary transition hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {config.busy ? 'Running…' : 'Run now'}
-      </button>
-      {mutation.error && (
-        <span className="text-xs text-critical">{(mutation.error as ApiError).message}</span>
-      )}
-    </div>
-  );
-}
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -146,7 +121,7 @@ export default function Dashboard() {
                 </p>
               </div>
               <div className="md:self-center">
-                <RunNowButton config={config} />
+                <RunButton config={config} />
               </div>
             </div>
           </Link>
