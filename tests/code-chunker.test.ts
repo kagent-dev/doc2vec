@@ -1697,4 +1697,36 @@ function b() { return 2; }
             chunks.forEach(c => expect(c.text.trim().length).toBeGreaterThan(0));
         });
     });
+
+    // ─── WASM heap is released between parses ───────────────────────
+    describe('WASM heap release', () => {
+        it('should not grow the WASM heap across repeated parses', async () => {
+            const chunker = await CodeChunker.create({ lang: 'go', chunkSize: 512 });
+
+            // ~40k chars, the size at which a leaked tree costs ~1.5MB of WASM
+            // heap. Without tree.delete() 100 parses leak >100MB and the heap
+            // eventually dies with "memory access out of bounds".
+            let code = 'package v1alpha1\n\nimport "testing"\n\n';
+            for (let i = 0; code.length < 40000; i++) {
+                code += `func TestValidate${i}(t *testing.T) {\n` +
+                    `\tcases := []struct{ name string; wantErr bool }{\n` +
+                    `\t\t{name: "a-${i}", wantErr: false},\n` +
+                    `\t\t{name: "b-${i}", wantErr: true},\n` +
+                    `\t}\n` +
+                    `\tfor _, tc := range cases {\n` +
+                    `\t\tt.Run(tc.name, func(t *testing.T) {\n` +
+                    `\t\t\tif tc.wantErr {\n\t\t\t\tt.Fatalf("boom %s", tc.name)\n\t\t\t}\n` +
+                    `\t\t})\n\t}\n}\n\n`;
+            }
+
+            await chunker.chunk(code);
+            const baseline = process.memoryUsage().external;
+            for (let i = 0; i < 100; i++) {
+                await chunker.chunk(code);
+            }
+            const growth = process.memoryUsage().external - baseline;
+
+            expect(growth).toBeLessThan(50 * 1024 * 1024);
+        }, 60000);
+    });
 });

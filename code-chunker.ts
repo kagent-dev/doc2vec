@@ -55,14 +55,22 @@ export class CodeChunker {
         }
 
         const parser = await CodeChunker.getParser(this.lang);
-        const originalTextBytes = Buffer.from(text, 'utf-8');
-        const tree = parser.parse(originalTextBytes.toString());
+        const source = Buffer.from(text, 'utf-8').toString();
+        const tree = parser.parse(source);
         if (!tree) {
             throw new Error('Failed to parse code');
         }
-        const chunks: CodeChunk[] = [];
-        await this.recursiveChunk(tree.rootNode, originalTextBytes.toString(), chunks);
-        return this.mergeChunks(chunks);
+        // The syntax tree lives in the tree-sitter WASM heap, which the JS
+        // garbage collector cannot reach. Without this delete the heap grows by
+        // the size of every tree we ever parse, until an allocation fails with
+        // "memory access out of bounds" on some unrelated file.
+        try {
+            const chunks: CodeChunk[] = [];
+            await this.recursiveChunk(tree.rootNode, source, chunks);
+            return this.mergeChunks(chunks);
+        } finally {
+            tree.delete();
+        }
     }
 
     private static async getParser(lang: string): Promise<Parser> {
