@@ -57,6 +57,7 @@ export interface CodeSourceConfig extends BaseSourceConfig {
     branch?: string;               // Optional branch to clone (github only)
     include_extensions?: string[]; // File extensions to include (e.g., ['.ts', '.py'])
     exclude_extensions?: string[]; // File extensions to exclude
+    exclude_paths?: string[];      // Glob patterns, relative to the source root, to skip (e.g., ['vendor/**', '**/*_test.go'])
     recursive?: boolean;           // Whether to traverse subdirectories
     encoding?: BufferEncoding;     // File encoding (default: 'utf8')
     url_rewrite_prefix?: string;   // Optional URL prefix to rewrite file:// URLs

@@ -476,4 +476,100 @@ describe('Utils', () => {
             expect((first + second).isWellFormed?.()).not.toBe(false);
         });
     });
+
+    // \u2500\u2500\u2500 matchesAnyGlob \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    describe('matchesAnyGlob', () => {
+        it('returns false for an empty pattern list', () => {
+            expect(Utils.matchesAnyGlob('vendor/a.go', [])).toBe(false);
+        });
+
+        it('matches an exact path', () => {
+            expect(Utils.matchesAnyGlob('go.mod', ['go.mod'])).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/go.mod', ['go.mod'])).toBe(false);
+        });
+
+        it('matches everything below a globstar directory', () => {
+            const patterns = ['vendor/**'];
+            expect(Utils.matchesAnyGlob('vendor/a.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('vendor/x/y/z.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('vendored/a.go', patterns)).toBe(false);
+            expect(Utils.matchesAnyGlob('pkg/vendor/a.go', patterns)).toBe(false);
+        });
+
+        it('matches a leading globstar at any depth, including the root', () => {
+            const patterns = ['**/*_test.go'];
+            expect(Utils.matchesAnyGlob('main_test.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/a/main_test.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/a/main.go', patterns)).toBe(false);
+        });
+
+        it('keeps a single star inside one path segment', () => {
+            const patterns = ['pkg/*.go'];
+            expect(Utils.matchesAnyGlob('pkg/a.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/sub/a.go', patterns)).toBe(false);
+        });
+
+        it('matches a star in the middle of a name', () => {
+            const patterns = ['**/zz_generated.*.go'];
+            expect(Utils.matchesAnyGlob('api/v1/zz_generated.deepcopy.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('api/v1/zz_generated.go', patterns)).toBe(false);
+        });
+
+        it('matches one character with a question mark', () => {
+            expect(Utils.matchesAnyGlob('v1/a.go', ['v?/a.go'])).toBe(true);
+            expect(Utils.matchesAnyGlob('v12/a.go', ['v?/a.go'])).toBe(false);
+        });
+
+        it('matches when any pattern in the list matches', () => {
+            const patterns = ['vendor/**', '**/*.pb.go'];
+            expect(Utils.matchesAnyGlob('api/v1/types.pb.go', patterns)).toBe(true);
+        });
+
+        it('treats a dot in the pattern as a literal', () => {
+            expect(Utils.matchesAnyGlob('axgo', ['a.go'])).toBe(false);
+        });
+
+        it('normalizes backslashes, leading ./ and trailing slashes', () => {
+            expect(Utils.matchesAnyGlob('vendor\\a.go', ['vendor/**'])).toBe(true);
+            expect(Utils.matchesAnyGlob('./vendor/a.go', ['./vendor/**'])).toBe(true);
+            expect(Utils.matchesAnyGlob('vendor', ['vendor/'])).toBe(true);
+        });
+
+        it('ignores an empty path or an empty pattern', () => {
+            expect(Utils.matchesAnyGlob('', ['**'])).toBe(false);
+            expect(Utils.matchesAnyGlob('a.go', [''])).toBe(false);
+        });
+
+        it('is case-sensitive', () => {
+            expect(Utils.matchesAnyGlob('Vendor/a.go', ['vendor/**'])).toBe(false);
+        });
+    });
+
+    // \u2500\u2500\u2500 isDirectoryExcluded \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    describe('isDirectoryExcluded', () => {
+        it('excludes a directory named by a globstar pattern', () => {
+            expect(Utils.isDirectoryExcluded('vendor', ['vendor/**'])).toBe(true);
+            expect(Utils.isDirectoryExcluded('pkg/client', ['pkg/client/**'])).toBe(true);
+        });
+
+        it('excludes a directory named directly', () => {
+            expect(Utils.isDirectoryExcluded('vendor', ['vendor'])).toBe(true);
+        });
+
+        it('excludes a nested directory that a globstar prefix matches', () => {
+            expect(Utils.isDirectoryExcluded('a/build', ['**/build/**'])).toBe(true);
+        });
+
+        it('does not exclude a directory when the pattern selects only some files', () => {
+            expect(Utils.isDirectoryExcluded('pkg', ['**/*_test.go'])).toBe(false);
+        });
+
+        it('does not exclude a parent of an excluded directory', () => {
+            expect(Utils.isDirectoryExcluded('pkg', ['pkg/client/**'])).toBe(false);
+        });
+
+        it('returns false for an empty pattern list', () => {
+            expect(Utils.isDirectoryExcluded('vendor', [])).toBe(false);
+        });
+    });
 });

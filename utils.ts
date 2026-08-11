@@ -148,4 +148,87 @@ export class Utils {
         return text.slice(from, to);
     }
 
+    /**
+     * Normalize a glob pattern or a relative path to the form the matcher uses:
+     * forward slashes, no leading `./`, no leading or trailing `/`.
+     */
+    private static normalizeGlobPath(value: string): string {
+        return value
+            .replace(/\\/g, '/')
+            .replace(/^\.\//, '')
+            .replace(/^\/+/, '')
+            .replace(/\/+$/, '');
+    }
+
+    /**
+     * Build a regular expression from a glob pattern.
+     *
+     * `**` crosses directory separators, `*` and `?` do not. A globstar
+     * followed by a slash also matches zero directories, so a pattern like
+     * `**` + `/*_test.go` matches `main_test.go`
+     * at the root as well as `pkg/a/main_test.go`.
+     */
+    private static globToRegExp(pattern: string): RegExp {
+        let source = '';
+        let i = 0;
+        while (i < pattern.length) {
+            const char = pattern[i];
+            if (char === '*') {
+                let end = i;
+                while (pattern[end] === '*') end++;
+                const isGlobstar = end - i > 1;
+                if (!isGlobstar) {
+                    source += '[^/]*';
+                    i = end;
+                } else if (pattern[end] === '/') {
+                    source += '(?:.*/)?';
+                    i = end + 1;
+                } else {
+                    source += '.*';
+                    i = end;
+                }
+            } else if (char === '?') {
+                source += '[^/]';
+                i++;
+            } else {
+                source += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                i++;
+            }
+        }
+        return new RegExp(`^${source}$`);
+    }
+
+    /**
+     * Report whether a relative path matches one of the glob patterns.
+     */
+    static matchesAnyGlob(relativePath: string, patterns: string[]): boolean {
+        if (!patterns || patterns.length === 0) return false;
+        const normalizedPath = Utils.normalizeGlobPath(relativePath);
+        if (normalizedPath === '') return false;
+        return patterns.some((pattern) => {
+            const normalizedPattern = Utils.normalizeGlobPath(pattern);
+            if (normalizedPattern === '') return false;
+            return Utils.globToRegExp(normalizedPattern).test(normalizedPath);
+        });
+    }
+
+    /**
+     * Report whether a directory is excluded, so the caller can skip the whole
+     * subtree instead of walking it.
+     *
+     * A directory is excluded when a pattern matches the directory itself
+     * (`vendor`) or when a pattern excludes everything below it (`vendor/**`).
+     * Patterns that only select some descendants (a test-file pattern, for
+     * example) do not exclude the directory — the walk must continue and
+     * filter each file.
+     */
+    static isDirectoryExcluded(relativePath: string, patterns: string[]): boolean {
+        if (!patterns || patterns.length === 0) return false;
+        const prefixes = patterns
+            .map((pattern) => Utils.normalizeGlobPath(pattern))
+            .filter((pattern) => pattern.endsWith('/**'))
+            .map((pattern) => pattern.slice(0, -3));
+        return Utils.matchesAnyGlob(relativePath, patterns) || Utils.matchesAnyGlob(relativePath, prefixes);
+    }
+
 }

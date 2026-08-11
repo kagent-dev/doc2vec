@@ -771,6 +771,200 @@ describe('ContentProcessor', () => {
         });
     });
 
+    // ─── processCodeDirectory: exclude_paths ────────────────────────
+    describe('processCodeDirectory with exclude_paths', () => {
+        const testDir = path.join(__dirname, '__test_exclude_dir__');
+
+        const codeConfig: CodeSourceConfig = {
+            type: 'code',
+            source: 'local_directory',
+            path: '',
+            product_name: 'Test',
+            version: '1.0',
+            max_size: 100000,
+            database_config: { type: 'sqlite', params: {} }
+        };
+
+        // Builds a small tree that looks like a Go repo with vendored and
+        // generated code:
+        //   main.go, main_test.go
+        //   api/types.pb.go, api/types.go, api/zz_generated.deepcopy.go
+        //   pkg/client/clientset.go
+        //   pkg/svc/svc.go, pkg/svc/svc_test.go
+        //   vendor/dep/dep.go
+        //   vendor.go
+        const writeTree = () => {
+            const files = [
+                'main.go',
+                'main_test.go',
+                'api/types.pb.go',
+                'api/types.go',
+                'api/zz_generated.deepcopy.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'pkg/svc/svc_test.go',
+                'vendor/dep/dep.go',
+                'vendor.go'
+            ];
+            for (const file of files) {
+                const target = path.join(testDir, file);
+                fs.mkdirSync(path.dirname(target), { recursive: true });
+                fs.writeFileSync(target, 'package main');
+            }
+        };
+
+        const scan = async (excludePaths: string[] | undefined, options?: Parameters<typeof processor.processCodeDirectory>[5]) => {
+            const processed: string[] = [];
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.go'], exclude_paths: excludePaths },
+                async (filePath) => { processed.push(filePath); },
+                testLogger,
+                undefined,
+                options
+            );
+            const relative = processed.map((filePath) => path.relative(testDir, filePath).replace(/\\/g, '/')).sort();
+            return { relative, result };
+        };
+
+        beforeEach(() => {
+            if (fs.existsSync(testDir)) {
+                fs.rmSync(testDir, { recursive: true });
+            }
+            fs.mkdirSync(testDir, { recursive: true });
+            writeTree();
+        });
+
+        afterEach(() => {
+            if (fs.existsSync(testDir)) {
+                fs.rmSync(testDir, { recursive: true });
+            }
+        });
+
+        it('processes every file when exclude_paths is absent', async () => {
+            const { relative } = await scan(undefined);
+
+            expect(relative).toEqual([
+                'api/types.go',
+                'api/types.pb.go',
+                'api/zz_generated.deepcopy.go',
+                'main.go',
+                'main_test.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'pkg/svc/svc_test.go',
+                'vendor.go',
+                'vendor/dep/dep.go'
+            ]);
+        });
+
+        it('prunes a directory subtree', async () => {
+            const { relative } = await scan(['vendor/**']);
+
+            expect(relative).not.toContain('vendor/dep/dep.go');
+            // a file whose name only starts with the pattern stays
+            expect(relative).toContain('vendor.go');
+        });
+
+        it('prunes a nested directory subtree', async () => {
+            const { relative } = await scan(['pkg/client/**']);
+
+            expect(relative).not.toContain('pkg/client/clientset.go');
+            expect(relative).toContain('pkg/svc/svc.go');
+        });
+
+        it('excludes files at any depth with a leading globstar', async () => {
+            const { relative } = await scan(['**/*_test.go']);
+
+            expect(relative).not.toContain('main_test.go');
+            expect(relative).not.toContain('pkg/svc/svc_test.go');
+            expect(relative).toContain('pkg/svc/svc.go');
+        });
+
+        it('excludes generated files by suffix and by name pattern', async () => {
+            const { relative } = await scan(['**/*.pb.go', '**/zz_generated.*.go']);
+
+            expect(relative).toEqual([
+                'main.go',
+                'main_test.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'pkg/svc/svc_test.go',
+                'vendor.go',
+                'vendor/dep/dep.go',
+                'api/types.go'
+            ].sort());
+        });
+
+        it('applies several patterns together', async () => {
+            const { relative, result } = await scan([
+                'vendor/**',
+                'pkg/client/**',
+                '**/*.pb.go',
+                '**/zz_generated.*.go',
+                '**/*_test.go'
+            ]);
+
+            expect(relative).toEqual(['api/types.go', 'main.go', 'pkg/svc/svc.go', 'vendor.go']);
+            expect(result.processedFiles).toBe(4);
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('matches patterns against the source root, not the current subdirectory', async () => {
+            // 'client/**' names no directory at the root, so nothing is pruned;
+            // only 'pkg/client/**' removes the nested one
+            const { relative } = await scan(['client/**']);
+
+            expect(relative).toContain('pkg/client/clientset.go');
+        });
+
+        it('keeps excluded files out of trackFiles so the caller deletes their chunks', async () => {
+            const trackFiles = new Set<string>();
+            await scan(['vendor/**', '**/*_test.go'], { trackFiles });
+
+            const tracked = Array.from(trackFiles)
+                .map((filePath) => path.relative(testDir, filePath).replace(/\\/g, '/'))
+                .sort();
+            expect(tracked).toEqual([
+                'api/types.go',
+                'api/types.pb.go',
+                'api/zz_generated.deepcopy.go',
+                'main.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'vendor.go'
+            ]);
+        });
+
+        it('does not let an excluded file raise maxMtime', async () => {
+            const future = new Date(Date.now() + 60_000);
+            fs.utimesSync(path.join(testDir, 'vendor/dep/dep.go'), future, future);
+
+            const { result } = await scan(['vendor/**']);
+
+            expect(result.maxMtime).toBeLessThan(future.getTime());
+        });
+
+        it('counts an excluded file as skipped', async () => {
+            const { result } = await scan(['**/*_test.go']);
+
+            expect(result.processedFiles).toBe(8);
+            expect(result.skippedFiles).toBe(2);
+        });
+
+        it('reports a scan with exclusions as complete', async () => {
+            const { result } = await scan(['vendor/**']);
+
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('ignores an empty pattern list', async () => {
+            const { relative } = await scan([]);
+
+            expect(relative).toContain('vendor/dep/dep.go');
+        });
+    });
+
     // ─── processDirectory: dangling symlinks ────────────────────────
     describe('processDirectory with a dangling symlink', () => {
         const testDir = path.join(__dirname, '__test_symlink_dir__');
