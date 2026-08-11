@@ -218,6 +218,7 @@ Configuration is managed through two files:
         *   `branch`: (Optional) Branch to clone for GitHub sources.
         *   `include_extensions`: (Optional) Array of file extensions to include (defaults to common code extensions).
         *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
+        *   `exclude_paths`: (Optional) Array of glob patterns, relative to the source root, that the scanner skips. See [Excluding paths from code sources](#excluding-paths-from-code-sources).
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix`: (Optional) URL prefix to rewrite `file://` URLs for local sources.
         *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`).
@@ -359,6 +360,10 @@ Configuration is managed through two files:
         repo: 'kagent-dev/doc2vec'
         branch: 'main'
         include_extensions: ['.ts', '.tsx', '.md']
+        exclude_paths:
+          - 'node_modules/**'
+          - 'dist/**'
+          - '**/*.test.ts'
         max_size: 1048576
         chunk_size: 2048
         database_config:
@@ -414,6 +419,43 @@ Configuration is managed through two files:
             collection_name: 'istio_docs_latest'
       # ... more sources
     ```
+
+### Excluding paths from code sources
+
+Code sources (`type: 'code'`) accept `exclude_paths`. Each entry is a glob pattern that the scanner matches against the path of the file, relative to the source root. The root is the `path` directory for a local source, or the clone root for a GitHub source. Use it to keep vendored trees, generated code, and test files out of the index.
+
+```yaml
+      - type: 'code'
+        source: 'github'
+        product_name: 'my-product'
+        repo: 'my-org/my-repo'
+        branch: 'main'
+        include_extensions: ['.go', '.md', '.yaml', '.sh', '.py', '.proto']
+        exclude_paths:
+          - 'vendor/**'                 # vendored dependencies
+          - 'LICENSES/**'               # go-licenses output
+          - 'pkg/client/**'             # k8s code-generator output
+          - '**/*.pb.go'                # protobuf output
+          - '**/zz_generated.*.go'      # controller-gen output
+          - '**/*_test.go'              # tests
+          - 'hack/tools/**'
+        max_size: 1048576
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './my-product-code.db'
+```
+
+Pattern rules:
+
+*   `*` matches any characters inside one path segment. It does not cross a `/`.
+*   `**` matches any characters, and it crosses `/`. `vendor/**` therefore matches every file below `vendor/`.
+*   A leading `**/` also matches zero directories, so `**/*_test.go` matches `main_test.go` at the root and `pkg/a/main_test.go` below it.
+*   `?` matches one character inside a segment.
+*   A pattern that names a directory (`vendor` or `vendor/**`) prunes the whole subtree. The scanner does not walk it.
+*   Matching is case-sensitive, and a pattern must match the whole relative path. Use `**/build/**`, not `build`, to exclude a directory at any depth.
+
+The scanner treats an excluded file as if it does not exist. A full scan therefore removes the chunks of files you newly excluded. For GitHub sources in incremental mode, the removal happens on the next full scan.
 
 ## Usage
 

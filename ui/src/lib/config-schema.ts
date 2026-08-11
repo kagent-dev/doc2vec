@@ -73,6 +73,7 @@ export const SOURCE_TYPES: Record<string, { label: string; fields: FieldDef[] }>
       { key: 'path', label: 'Directory path', type: 'string', placeholder: '/data/src', help: 'When source is local_directory' },
       { key: 'include_extensions', label: 'Include extensions', type: 'string_list', placeholder: '.ts, .go, .py' },
       { key: 'exclude_extensions', label: 'Exclude extensions', type: 'string_list' },
+      { key: 'exclude_paths', label: 'Exclude paths', type: 'string_list', placeholder: 'vendor/**, **/*_test.go', help: 'Glob patterns relative to the source root' },
       { key: 'recursive', label: 'Recurse into subdirectories', type: 'boolean' },
       { key: 'chunk_size', label: 'Chunk size (tokens)', type: 'number', placeholder: '1500' },
       { key: 'url_rewrite_prefix', label: 'URL rewrite prefix', type: 'string' },

@@ -1819,6 +1819,10 @@ export class ContentProcessor {
             allowedFiles?: Set<string>;
             mtimeCutoff?: number;
             trackFiles?: Set<string>;
+            // The directory the scan started from. Recursive calls pass it down
+            // so `exclude_paths` patterns keep matching against the source root
+            // and not against the current subdirectory.
+            rootPath?: string;
         }
     ): Promise<CodeScanResult> {
         const logger = parentLogger.child('code-directory-processor');
@@ -1834,7 +1838,10 @@ export class ContentProcessor {
             '.json', '.yaml', '.yml', '.md'
         ];
         const excludeExtensions = config.exclude_extensions || [];
+        const excludePaths = config.exclude_paths || [];
         const encoding = config.encoding || ('utf8' as BufferEncoding);
+        const rootPath = options?.rootPath ?? dirPath;
+        const childOptions = { ...options, rootPath };
 
         let maxMtime = 0;
 
@@ -1872,6 +1879,22 @@ export class ContentProcessor {
 
                 visitedPaths.add(filePath);
 
+                // An excluded path never reaches trackFiles or maxMtime, so the
+                // caller treats it like a deleted file and removes its chunks
+                if (excludePaths.length > 0) {
+                    const relativePath = path.relative(rootPath, filePath).replace(/\\/g, '/');
+                    const excluded = stat.isDirectory()
+                        ? Utils.isDirectoryExcluded(relativePath, excludePaths)
+                        : Utils.matchesAnyGlob(relativePath, excludePaths);
+                    if (excluded) {
+                        logger.debug(`Skipping excluded path: ${relativePath}`);
+                        if (!stat.isDirectory()) {
+                            skippedFiles++;
+                        }
+                        continue;
+                    }
+                }
+
                 if (stat.isDirectory()) {
                     if (recursive) {
                         const childResult = await this.processCodeDirectory(
@@ -1880,7 +1903,7 @@ export class ContentProcessor {
                             processFileContent,
                             logger,
                             visitedPaths,
-                            options
+                            childOptions
                         );
                         processedFiles += childResult.processedFiles;
                         skippedFiles += childResult.skippedFiles;
