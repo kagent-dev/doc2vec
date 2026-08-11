@@ -1698,6 +1698,61 @@ function b() { return 2; }
         });
     });
 
+    // ─── Grammars that cannot link are refused before they load ─────
+    describe('grammar link check', () => {
+        // These grammars import C symbols the installed web-tree-sitter does
+        // not export. Emscripten binds them lazily, so without this check the
+        // call traps mid-parse and damages the module for every language.
+        it.each([
+            ['bash', 'isalpha'],
+            ['yaml', '_Znwm'],
+        ])('should refuse the %s grammar and name the unresolved import', async (lang, symbol) => {
+            const chunker = await CodeChunker.create({ lang });
+            await expect(chunker.chunk('x')).rejects.toThrow(
+                new RegExp(`grammar "${lang}" is incompatible.*${symbol.replace(/\$/g, '\\$')}`)
+            );
+        });
+
+        // Every one of these imports __assert_fail, which only runs when the
+        // grammar is already aborting. Blocking them would be a regression.
+        it.each([
+            ['python', 'def f():\n    return 1\n'],
+            ['ruby', 'def f\n  1\nend\n'],
+            ['cpp', 'int f() { return 1; }\n'],
+        ])('should still load the %s grammar', async (lang, code) => {
+            const chunker = await CodeChunker.create({ lang });
+            const chunks = await chunker.chunk(code);
+            expect(chunks.length).toBeGreaterThan(0);
+        });
+    });
+
+    // ─── A trapped parse stops further use of the module ────────────
+    describe('damaged module guard', () => {
+        it('should refuse to parse after a parse throws', async () => {
+            const chunker = await CodeChunker.create({ lang: 'go' });
+            await chunker.chunk('package main\n');
+
+            const statics = CodeChunker as any;
+            const cached = await statics.parserCache.get('go');
+            const realParse = cached.parse.bind(cached);
+            cached.parse = () => { throw new Error('memory access out of bounds'); };
+
+            try {
+                await expect(chunker.chunk('package main\n')).rejects.toThrow('memory access out of bounds');
+                // The module is now damaged, so the next parse must not run.
+                cached.parse = realParse;
+                await expect(chunker.chunk('package main\n')).rejects.toThrow('damaged');
+            } finally {
+                cached.parse = realParse;
+                statics.moduleDamaged = false;
+            }
+
+            // The guard lifts once the flag is cleared.
+            const chunks = await chunker.chunk('package main\n');
+            expect(chunks.length).toBeGreaterThan(0);
+        });
+    });
+
     // ─── WASM heap is released between parses ───────────────────────
     describe('WASM heap release', () => {
         it('should not grow the WASM heap across repeated parses', async () => {
