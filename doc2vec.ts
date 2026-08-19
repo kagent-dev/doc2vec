@@ -31,7 +31,8 @@ import {
     MarkdownStoreConfig,
     SourceRunStats,
     SourceRunCounters,
-    newSourceRunCounters
+    newSourceRunCounters,
+    FatalEmbeddingError
 } from './types';
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { MarkdownStore } from './markdown-store';
@@ -515,6 +516,32 @@ export class Doc2Vec {
             const chunks = await this.contentProcessor.chunkMarkdown(markdown, issueConfig, url);
             logger.info(`Issue #${issueNumber}: Created ${chunks.length} chunks`);
 
+            // Embed every chunk BEFORE touching stored data, so an embedding
+            // failure can't purge the issue's existing chunks and store nothing
+            // back. A FatalEmbeddingError (bad API key) propagates and aborts
+            // the source; transient failures skip this issue but count toward
+            // failedChunks so the last-run date is not advanced.
+            const embedded: number[][] = [];
+            let failedEmbeddings = 0;
+            for (const chunk of chunks) {
+                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+                const embeddings = await this.createEmbeddings([chunk.content]);
+                if (embeddings.length) {
+                    embedded.push(embeddings[0]);
+                } else {
+                    failedEmbeddings++;
+                    logger.error(`Embedding failed for chunk: ${chunkId}`);
+                }
+            }
+            if (failedEmbeddings > 0) {
+                failedChunks += failedEmbeddings;
+                logger.error(
+                    `Issue #${issueNumber}: ${failedEmbeddings}/${chunks.length} chunks failed to embed; ` +
+                    `keeping its existing chunks so the next run retries`
+                );
+                return;
+            }
+
             // Purge the issue's existing chunks before inserting the fresh set.
             // chunk_id is a content hash, so when an issue changes (closed/reopened,
             // edited, new comments) the regenerated chunks get new ids and the old
@@ -534,59 +561,21 @@ export class Doc2Vec {
                 this.counters.items_new++;
             }
 
-            // Process and store each chunk immediately
-            for (const chunk of chunks) {
+            // Store each chunk
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
                 const chunkHash = Utils.generateHash(chunk.content);
                 const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
 
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        this.counters.chunks_added++;
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
+                if (dbConnection.type === 'sqlite') {
+                    DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedded[i], logger, chunkHash);
+                    this.counters.chunks_added++;
+                    logger.debug(`Stored chunk ${chunkId} in SQLite`);
                 } else if (dbConnection.type === 'qdrant') {
                     try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
-
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            this.counters.chunks_added++;
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
+                        await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedded[i], chunkHash);
+                        this.counters.chunks_added++;
+                        logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
                     } catch (error) {
                         // Keep going so one bad chunk can't cost the whole repo,
                         // but remember it: the count is escalated below so the run
@@ -738,6 +727,7 @@ export class Doc2Vec {
 
                 return true;
             } catch (error) {
+                if (error instanceof FatalEmbeddingError) throw error;
                 logger.error(`Error during chunking or embedding for ${url}:`, error);
                 return false;
             }
@@ -901,9 +891,10 @@ export class Doc2Vec {
 
                     await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
                 } catch (error) {
+                    if (error instanceof FatalEmbeddingError) throw error;
                     logger.error(`Error during chunking or embedding for ${filePath}:`, error);
                 }
-            }, 
+            },
             logger
         );
         
@@ -1080,6 +1071,7 @@ export class Doc2Vec {
                 await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
                 processedCount++;
             } catch (error) {
+                if (error instanceof FatalEmbeddingError) throw error;
                 logger.error(`Error processing S3 object ${obj.key}:`, error);
             }
         }
@@ -1259,6 +1251,7 @@ export class Doc2Vec {
 
                         await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
                     } catch (error) {
+                        if (error instanceof FatalEmbeddingError) throw error;
                         logger.error(`Error during code chunking or embedding for ${filePath}:`, error);
                     }
                 },
@@ -1757,6 +1750,7 @@ export class Doc2Vec {
                     await processTicket(ticket);
                     totalTickets++;
                 } catch (error: any) {
+                    if (error instanceof FatalEmbeddingError) throw error;
                     failedTickets++;
                     logger.error(`Failed to process ticket #${ticket.id}, will retry next run: ${error.message}`);
                 }
@@ -1981,9 +1975,41 @@ export class Doc2Vec {
             return 0;
         }
 
-        // 4. Content changed — delete all existing chunks for this URL
+        // 4. Content changed — embed all new chunks BEFORE touching stored
+        // data, so an embedding failure (e.g. a bad API key) can't delete the
+        // existing chunks and then store nothing back. Throwing here also
+        // signals the caller that the item failed: for websites that means the
+        // ETag/lastmod is not stored and the page is retried next run.
+        const chunkProgress = logger.progress(`Embedding chunks for ${url}`, chunks.length);
+        const embedded: number[][] = [];
+        let failedEmbeddings = 0;
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
+
+            const embeddings = await this.createEmbeddings([chunk.content]);
+            if (embeddings.length > 0) {
+                embedded[i] = embeddings[0];
+                chunkProgress.update(1, `Embedded chunk ${chunkId}`);
+            } else {
+                failedEmbeddings++;
+                logger.error(`Embedding failed for chunk: ${chunkId}`);
+                chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
+            }
+        }
+
+        if (failedEmbeddings > 0) {
+            chunkProgress.complete();
+            throw new Error(
+                `embedding failed for ${failedEmbeddings}/${chunks.length} chunks of ${url}; ` +
+                `keeping the ${existingHashesSorted.length} existing chunks so the next run retries`
+            );
+        }
+
+        // 5. All embeddings succeeded — delete the old chunks and insert the new set
         if (existingHashesSorted.length > 0) {
-            logger.info(`Content changed for ${url} (${existingHashesSorted.length} old chunks → ${chunks.length} new chunks), re-embedding all`);
+            logger.info(`Content changed for ${url} (${existingHashesSorted.length} old chunks → ${chunks.length} new chunks), replacing all`);
             if (dbConnection.type === 'sqlite') {
                 DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
             } else {
@@ -1995,35 +2021,23 @@ export class Doc2Vec {
             this.counters.items_new++;
         }
 
-        // 5. Embed and insert all new chunks
-        let embeddedCount = 0;
-        const chunkProgress = logger.progress(`Embedding chunks for ${url}`, chunks.length);
-
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const chunkHash = newHashes[i];
             const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
 
-            const embeddings = await this.createEmbeddings([chunk.content]);
-            if (embeddings.length > 0) {
-                const embedding = embeddings[0];
-                if (dbConnection.type === 'sqlite') {
-                    DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedding, logger, chunkHash);
-                    chunkProgress.update(1, `Stored chunk ${chunkId} in SQLite`);
-                } else if (dbConnection.type === 'qdrant') {
-                    await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedding, chunkHash);
-                    chunkProgress.update(1, `Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                }
-                embeddedCount++;
-            } else {
-                logger.error(`Embedding failed for chunk: ${chunkId}`);
-                chunkProgress.update(1, `Failed to embed chunk ${chunkId}`);
+            if (dbConnection.type === 'sqlite') {
+                DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embedded[i], logger, chunkHash);
+                logger.debug(`Stored chunk ${chunkId} in SQLite`);
+            } else if (dbConnection.type === 'qdrant') {
+                await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embedded[i], chunkHash);
+                logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
             }
         }
 
         chunkProgress.complete();
-        this.counters.chunks_added += embeddedCount;
-        return embeddedCount;
+        this.counters.chunks_added += chunks.length;
+        return chunks.length;
     }
 
     // Embedding model token limit and character-based estimate.
@@ -2061,8 +2075,16 @@ export class Doc2Vec {
             }, { timeout: 60000 });
             logger.debug(`Successfully created ${response.data.length} embeddings`);
             return response.data.map(d => d.embedding);
-        } catch (error) {
+        } catch (error: any) {
             logger.error('Failed to create embeddings:', error);
+            // An auth rejection is permanent: every later request in this run
+            // fails the same way, so abort the source instead of returning []
+            // and letting each chunk degrade into a logged-and-skipped failure.
+            if (error?.status === 401 || error?.status === 403) {
+                throw new FatalEmbeddingError(
+                    `embedding request rejected with HTTP ${error.status}: ${error?.message ?? error}`
+                );
+            }
             return [];
         }
     }

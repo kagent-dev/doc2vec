@@ -193,6 +193,7 @@ const serverVersion = "1.0.0"; // Store version for logging
 const server = new McpServer({
     name: serverName,
     version: serverVersion,
+}, {
     capabilities: {},
 });
 
