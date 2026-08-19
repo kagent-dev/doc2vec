@@ -837,7 +837,9 @@ export class ContentProcessor {
                     // A browser that cannot launch is fatal for the whole crawl —
                     // rethrow so the source (and the run) is reported as failed
                     // rather than logging an error per URL and finishing "green".
-                    if (error instanceof BrowserLaunchError) {
+                    // Same for a permanent embedding failure (bad API key):
+                    // every remaining page would fail identically.
+                    if (error instanceof BrowserLaunchError || error?.name === 'FatalEmbeddingError') {
                         logger.error(`Aborting crawl of ${baseUrl}: ${error.message}`);
                         throw error;
                     }

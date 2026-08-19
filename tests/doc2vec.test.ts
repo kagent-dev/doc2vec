@@ -169,6 +169,7 @@ vi.mock('../utils', async (importOriginal) => {
 
 import { Doc2Vec } from '../doc2vec';
 import { DatabaseManager } from '../database';
+import { FatalEmbeddingError } from '../types';
 import { ContentProcessor } from '../content-processor';
 import { Logger } from '../logger';
 import axios from 'axios';
@@ -755,6 +756,33 @@ sources:
             expect(result).toEqual([]);
         });
 
+        it('should throw FatalEmbeddingError on 401 (invalid API key)', async () => {
+            mockEmbeddingsCreate.mockRejectedValue(
+                Object.assign(new Error('Incorrect API key provided'), { status: 401 })
+            );
+
+            await expect((instance as any).createEmbeddings(['test text']))
+                .rejects.toThrow(FatalEmbeddingError);
+        });
+
+        it('should throw FatalEmbeddingError on 403', async () => {
+            mockEmbeddingsCreate.mockRejectedValue(
+                Object.assign(new Error('Forbidden'), { status: 403 })
+            );
+
+            await expect((instance as any).createEmbeddings(['test text']))
+                .rejects.toThrow(FatalEmbeddingError);
+        });
+
+        it('should still return empty array on transient 429', async () => {
+            mockEmbeddingsCreate.mockRejectedValue(
+                Object.assign(new Error('Rate limited'), { status: 429 })
+            );
+
+            const result = await (instance as any).createEmbeddings(['test text']);
+            expect(result).toEqual([]);
+        });
+
         it('should truncate text exceeding MAX_EMBEDDING_CHARS', async () => {
             const maxChars = (Doc2Vec as any).MAX_EMBEDDING_CHARS; // 8191 * 4 = 32764
             const oversizedText = 'x'.repeat(maxChars + 1000);
@@ -809,6 +837,73 @@ sources:
 
     // ─────────────────────────────────────────────────────────────────────────
     // 7. run() — source type routing
+    // ─────────────────────────────────────────────────────────────────────────
+    // processChunksForUrl: embedding failures must never destroy stored chunks
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('processChunksForUrl embedding failure safety', () => {
+        let instance: Doc2Vec;
+        let mockEmbeddingsCreate: ReturnType<typeof vi.fn>;
+        const dbConnection = { type: 'sqlite', db: {} };
+        const makeChunk = (id: string, content: string) => ({
+            content,
+            metadata: { chunk_id: id, product_name: 'p', version: 'v', heading_hierarchy: [], section: '', chunk_index: 0, total_chunks: 1, url: 'https://example.com/page' },
+        });
+
+        beforeEach(() => {
+            const configPath = writeTestConfig('chunks-url.yaml', makeMinimalConfig());
+            instance = new Doc2Vec(configPath);
+            mockEmbeddingsCreate = (instance as any).openai.embeddings.create;
+            vi.mocked(DatabaseManager.getChunkHashesByUrlSQLite).mockReturnValue(['stale-hash']);
+            vi.mocked(DatabaseManager.removeChunksByUrlSQLite).mockClear();
+            vi.mocked(DatabaseManager.insertVectorsSQLite).mockClear();
+        });
+
+        it('throws and keeps existing chunks when an embedding fails', async () => {
+            mockEmbeddingsCreate.mockRejectedValue(new Error('boom'));
+
+            await expect((instance as any).processChunksForUrl(
+                [makeChunk('chunk-aaaaaaaa', 'new content')],
+                'https://example.com/page',
+                dbConnection,
+                (instance as any).logger
+            )).rejects.toThrow(/embedding failed for 1\/1 chunks/);
+
+            expect(DatabaseManager.removeChunksByUrlSQLite).not.toHaveBeenCalled();
+            expect(DatabaseManager.insertVectorsSQLite).not.toHaveBeenCalled();
+        });
+
+        it('propagates FatalEmbeddingError without deleting existing chunks', async () => {
+            mockEmbeddingsCreate.mockRejectedValue(
+                Object.assign(new Error('Incorrect API key provided'), { status: 401 })
+            );
+
+            await expect((instance as any).processChunksForUrl(
+                [makeChunk('chunk-aaaaaaaa', 'new content')],
+                'https://example.com/page',
+                dbConnection,
+                (instance as any).logger
+            )).rejects.toThrow(FatalEmbeddingError);
+
+            expect(DatabaseManager.removeChunksByUrlSQLite).not.toHaveBeenCalled();
+            expect(DatabaseManager.insertVectorsSQLite).not.toHaveBeenCalled();
+        });
+
+        it('replaces old chunks only after every embedding succeeded', async () => {
+            mockEmbeddingsCreate.mockResolvedValue({ data: [{ embedding: [0.1, 0.2] }] });
+
+            const stored = await (instance as any).processChunksForUrl(
+                [makeChunk('chunk-aaaaaaaa', 'new content'), makeChunk('chunk-bbbbbbbb', 'more content')],
+                'https://example.com/page',
+                dbConnection,
+                (instance as any).logger
+            );
+
+            expect(stored).toBe(2);
+            expect(DatabaseManager.removeChunksByUrlSQLite).toHaveBeenCalledTimes(1);
+            expect(DatabaseManager.insertVectorsSQLite).toHaveBeenCalledTimes(2);
+        });
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     describe('run()', () => {
         let instance: Doc2Vec;

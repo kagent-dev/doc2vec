@@ -1,3 +1,14 @@
+// A permanent embedding failure (e.g. an invalid API key): every subsequent
+// request in the run would fail identically, so callers must abort the source
+// instead of degrading each chunk into a logged-and-skipped failure.
+export class FatalEmbeddingError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'FatalEmbeddingError';
+        Object.setPrototypeOf(this, FatalEmbeddingError.prototype);
+    }
+}
+
 // Base configuration that applies to all source types
 export interface BaseSourceConfig {
     type: 'website' | 'github' | 'local_directory' | 'zendesk' | 'code' | 's3';
