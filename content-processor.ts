@@ -1144,7 +1144,7 @@ export class ContentProcessor {
             });
             const article = reader.parse();
 
-            if (!article) {
+            if (!article || article.content == null) {
                 logger.warn(`Failed to parse article content with Readability for ${url}`);
                 return { content: null, links, finalUrl, etag };
             }
