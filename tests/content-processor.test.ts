@@ -1253,6 +1253,9 @@ describe('ContentProcessor', () => {
     // ─── crawlWebsite ────────────────────────────────────────────────
     describe('crawlWebsite', () => {
         afterEach(() => {
+            // Restore real timers even if a test failed midway, so leaked fake
+            // timers can't cascade into every following test in this block.
+            vi.useRealTimers();
             vi.restoreAllMocks();
         });
 
@@ -1269,6 +1272,11 @@ describe('ContentProcessor', () => {
             const puppeteerModule = await import('puppeteer');
             const launchSpy = vi.spyOn(puppeteerModule.default, 'launch')
                 .mockRejectedValue(new Error('Failed to launch the browser process!'));
+            // executablePath() is async (and does real I/O) since puppeteer 25;
+            // stub it so the crawl reaches its retry setTimeout while the fake
+            // timers below are being advanced, not after.
+            vi.spyOn(puppeteerModule.default, 'executablePath')
+                .mockResolvedValue('/nonexistent/chrome' as any);
 
             const visited = new Set<string>();
             const processContent = vi.fn().mockResolvedValue(true);
@@ -1391,9 +1399,11 @@ describe('ContentProcessor', () => {
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
                 close: vi.fn().mockResolvedValue(undefined),
-                isConnected: vi.fn().mockReturnValue(true),
+                connected: true,
             };
             vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+            vi.spyOn(puppeteerModule.default, 'executablePath')
+                .mockResolvedValue('/nonexistent/chrome' as any);
 
             const error429 = new Error('Failed to load page: HTTP 429');
             (error429 as any).status = 429;
@@ -1426,9 +1436,11 @@ describe('ContentProcessor', () => {
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
                 close: vi.fn().mockResolvedValue(undefined),
-                isConnected: vi.fn().mockReturnValue(true),
+                connected: true,
             };
             vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+            vi.spyOn(puppeteerModule.default, 'executablePath')
+                .mockResolvedValue('/nonexistent/chrome' as any);
 
             const make429 = () => {
                 const e = new Error('Failed to load page: HTTP 429');
@@ -1468,9 +1480,11 @@ describe('ContentProcessor', () => {
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
                 close: vi.fn().mockResolvedValue(undefined),
-                isConnected: vi.fn().mockReturnValue(true),
+                connected: true,
             };
             vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+            vi.spyOn(puppeteerModule.default, 'executablePath')
+                .mockResolvedValue('/nonexistent/chrome' as any);
 
             const error429 = new Error('Failed to load page: HTTP 429');
             (error429 as any).status = 429;
@@ -2259,7 +2273,7 @@ describe('ContentProcessor', () => {
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
                 close: vi.fn().mockResolvedValue(undefined),
-                isConnected: vi.fn().mockReturnValue(true),
+                connected: true,
             };
             vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
 
@@ -2282,7 +2296,7 @@ describe('ContentProcessor', () => {
             const mockBrowser = {
                 newPage: vi.fn().mockResolvedValue(mockPage),
                 close: vi.fn().mockResolvedValue(undefined),
-                isConnected: vi.fn().mockReturnValue(true),
+                connected: true,
             };
             vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
 

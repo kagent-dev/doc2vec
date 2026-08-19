@@ -59,11 +59,11 @@ export interface CodeScanResult {
  *     Chrome for Testing is not published)
  *  4. undefined — let puppeteer decide
  */
-export function resolveBrowserExecutablePath(): string | undefined {
+export async function resolveBrowserExecutablePath(): Promise<string | undefined> {
     const override = process.env.PUPPETEER_EXECUTABLE_PATH;
     if (override) return override;
     try {
-        const bundled = puppeteer.executablePath();
+        const bundled = await puppeteer.executablePath();
         if (bundled && fs.existsSync(bundled)) return bundled;
     } catch {
         // no browser downloaded for this platform
@@ -473,7 +473,7 @@ export class ContentProcessor {
         let page: Page | null = null;
 
         const launchBrowser = async (): Promise<{ browser: Browser; page: Page }> => {
-            const executablePath = resolveBrowserExecutablePath();
+            const executablePath = await resolveBrowserExecutablePath();
             const launchOptions = {
                 executablePath,
                 args: [
@@ -538,7 +538,7 @@ export class ContentProcessor {
             // process itself is degraded — a full restart is needed.
             const needsBrowserRestart = pageNeedsRecreation && consecutiveProtocolErrors >= 1;
 
-            if (!browser || !browser.isConnected() || needsBrowserRestart) {
+            if (!browser || !browser.connected || needsBrowserRestart) {
                 const reason = needsBrowserRestart
                     ? `protocol errors persisting after page recreation (${consecutiveProtocolErrors} consecutive)`
                     : browser ? 'browser disconnected' : 'initial launch';
@@ -917,7 +917,7 @@ export class ContentProcessor {
         } finally {
             // Close the shared browser instance when the crawl is done
             const browserToClose = browser as Browser | null;
-            if (browserToClose && browserToClose.isConnected()) {
+            if (browserToClose && browserToClose.connected) {
                 await browserToClose.close();
                 logger.debug('Shared browser closed after crawl completed');
             }
@@ -1030,7 +1030,7 @@ export class ContentProcessor {
             } else {
                 // Standalone mode: launch a browser for this single page
                 browser = await puppeteer.launch({
-                    executablePath: resolveBrowserExecutablePath(),
+                    executablePath: await resolveBrowserExecutablePath(),
                     args: [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
@@ -1229,7 +1229,7 @@ export class ContentProcessor {
             return { content: null, links: [], finalUrl: url };
         } finally {
             // Only close the browser if we launched it ourselves (standalone mode)
-            if (ownsTheBrowser && browser && browser.isConnected()) {
+            if (ownsTheBrowser && browser && browser.connected) {
                  await browser.close();
                  logger.debug(`Browser closed for ${url}`);
             }
