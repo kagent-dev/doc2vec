@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-sandbox \
     fonts-freefont-ttf \
     fonts-ipafont-gothic \
-    fonts-kacst \
     fonts-liberation \
     fonts-noto-color-emoji \
     fonts-thai-tlwg \
