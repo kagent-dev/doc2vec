@@ -50,6 +50,7 @@ export class DatabaseManager {
                     total_chunks INTEGER
                 );
             `);
+            this.ensureChunkDatesTable(db);
             logger.info(`SQLite database initialized successfully`);
             return { db, type: 'sqlite' };
         } else if (dbConfig.type === 'qdrant') {
@@ -213,7 +214,13 @@ export class DatabaseManager {
                 logger.debug(`Updated metadata value for ${key}`);
             }
         } catch (error) {
-            logger.error(`Failed to update metadata value for ${key}:`, error);
+            // Best-effort by design: a failed metadata write errs toward the
+            // safe direction (redundant reprocessing next run — etag/lastmod/
+            // watermark stay behind, never skip ahead), so we warn rather than
+            // fail the job. Genuine disk/connection failures surface earlier at
+            // the chunk-write stage (storeChunkInQdrant), which shares this
+            // collection and throws.
+            logger.warn(`Failed to update metadata value for ${key} (continuing; will retry next run):`, error);
         }
     }
 
@@ -263,9 +270,10 @@ export class DatabaseManager {
         dbConnection: DatabaseConnection,
         repo: string,
         logger: Logger,
-        embeddingDimension: number
+        embeddingDimension: number,
+        date: string
     ): Promise<void> {
-        const now = new Date().toISOString();
+        const now = date;
         
         try {
             if (dbConnection.type === 'sqlite') {
@@ -313,9 +321,25 @@ export class DatabaseManager {
         }
     }
 
+    /**
+     * Chunk creation timestamps live in a companion table because vec_items is
+     * a vec0 virtual table that cannot be ALTERed to add a column. Rows are
+     * written on every chunk insert/update; stale rows for deleted chunks are
+     * harmless (lookups always join against vec_items).
+     */
+    static ensureChunkDatesTable(db: Database): void {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS vec_chunk_dates (
+                chunk_id   TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
+        `);
+    }
+
     static prepareSQLiteStatements(db: Database) {
         let cached = this.columnCache.get(db);
         if (!cached) {
+            this.ensureChunkDatesTable(db);
             cached = {
                 hasBranch: this.hasColumn(db, 'branch'),
                 hasRepo: this.hasColumn(db, 'repo')
@@ -367,15 +391,19 @@ export class DatabaseManager {
             `),
             getAllChunkIdsStmt: db.prepare(`SELECT chunk_id FROM vec_items`),
             deleteChunkStmt: db.prepare(`DELETE FROM vec_items WHERE chunk_id = ?`),
+            touchDateStmt: db.prepare(`
+                INSERT INTO vec_chunk_dates (chunk_id, created_at) VALUES (?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET created_at = excluded.created_at
+            `),
             hasBranchColumn,
             hasRepoColumn
         };
     }
 
     static insertVectorsSQLite(db: Database, chunk: DocumentChunk, embedding: number[], logger: Logger, chunkHash?: string) {
-        const { insertStmt, updateStmt, hasBranchColumn, hasRepoColumn } = this.prepareSQLiteStatements(db);
+        const { insertStmt, updateStmt, touchDateStmt, hasBranchColumn, hasRepoColumn } = this.prepareSQLiteStatements(db);
         const hash = chunkHash || Utils.generateHash(chunk.content);
-        
+
         const transaction = db.transaction(() => {
             // Use BigInt for true integer representation in SQLite vec0
             const chunkIndex = BigInt(chunk.metadata.chunk_index | 0);
@@ -436,6 +464,8 @@ export class DatabaseManager {
 
                 updateStmt.run(...updateValues);
             }
+
+            touchDateStmt.run(chunk.metadata.chunk_id, new Date().toISOString());
         });
 
         transaction();
@@ -472,6 +502,7 @@ export class DatabaseManager {
                     original_chunk_id: chunk.metadata.chunk_id,
                     chunk_index: chunk.metadata.chunk_index,
                     total_chunks: chunk.metadata.total_chunks,
+                    created_at: new Date().toISOString(),
                 },
             };
 
@@ -480,11 +511,15 @@ export class DatabaseManager {
                 points: [pointItem],
             });
         } catch (error) {
-            console.error("Error storing chunk in Qdrant:", error);
+            // Rethrow so the failure propagates to the top-level handler and the
+            // job exits non-zero. Swallowing here previously let a sync "succeed"
+            // while chunks silently failed to store (e.g. Qdrant disk full).
+            console.error(`Error storing chunk in Qdrant (collection ${collectionName}, url ${chunk.metadata.url}):`, error);
+            throw error;
         }
     }
 
-    static removeObsoleteChunksSQLite(db: Database, visitedUrls: Set<string>, urlPrefix: string, logger: Logger) {
+    static removeObsoleteChunksSQLite(db: Database, visitedUrls: Set<string>, urlPrefix: string, logger: Logger): { items: number; chunks: number } {
         const getChunksForUrlStmt = db.prepare(`
             SELECT chunk_id, url FROM vec_items
             WHERE url LIKE ? || '%'
@@ -493,6 +528,7 @@ export class DatabaseManager {
 
         const existingChunks = getChunksForUrlStmt.all(urlPrefix) as { chunk_id: string; url: string }[];
         let deletedCount = 0;
+        const deletedUrls = new Set<string>();
 
         const transaction = db.transaction(() => {
             for (const { chunk_id, url } of existingChunks) {
@@ -500,52 +536,69 @@ export class DatabaseManager {
                     logger.debug(`Deleting obsolete chunk from SQLite: ${chunk_id.substring(0, 8)}... (URL not visited)`);
                     deleteChunkStmt.run(chunk_id);
                     deletedCount++;
+                    deletedUrls.add(url);
                 }
             }
         });
         transaction();
 
         logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for URL ${urlPrefix}`);
+        return { items: deletedUrls.size, chunks: deletedCount };
     }
 
-    static async removeObsoleteChunksQdrant(db: QdrantDB, visitedUrls: Set<string>, urlPrefix: string, logger: Logger) {
+    static async removeObsoleteChunksQdrant(db: QdrantDB, visitedUrls: Set<string>, urlPrefix: string, logger: Logger): Promise<{ items: number; chunks: number }> {
         const { client, collectionName } = db;
         try {
-            // Get all points that match the URL prefix but are not metadata points
-            const response = await client.scroll(collectionName, {
-                limit: 10000,
-                with_payload: true,
-                with_vector: false,
-                filter: {
-                    must: [
-                        {
-                            key: "url",
-                            match: {
-                                text: urlPrefix
-                            }
+            // Scroll through ALL points that match the URL prefix but are not
+            // metadata points. Qdrant caps a single scroll at its page limit, so
+            // we must paginate via next_page_offset — otherwise large collections
+            // (e.g. tens of thousands of chunks) would only have their first page
+            // examined and obsolete chunks beyond it would never be removed.
+            const filter = {
+                must: [
+                    {
+                        key: "url",
+                        match: {
+                            text: urlPrefix
                         }
-                    ],
-                    must_not: [
-                        {
-                            key: "is_metadata",
-                            match: {
-                                value: true
-                            }
+                    }
+                ],
+                must_not: [
+                    {
+                        key: "is_metadata",
+                        match: {
+                            value: true
                         }
-                    ]
-                }
-            });
+                    }
+                ]
+            };
 
-            const obsoletePointIds = response.points
-                .filter((point: any) => {
+            const obsoletePointIds: any[] = [];
+            const obsoleteUrls = new Set<string>();
+            let offset: any = undefined;
+            do {
+                const response = await client.scroll(collectionName, {
+                    limit: 1000,
+                    offset,
+                    with_payload: true,
+                    with_vector: false,
+                    filter
+                });
+
+                for (const point of response.points) {
                     const url = point.payload?.url;
                     // Double check it's not a metadata record
                     if (point.payload?.is_metadata === true) {
-                        return false;
+                        continue;
                     }
-                    return url && !visitedUrls.has(url);
-                })
-                .map((point: any) => point.id);
+                    if (url && !visitedUrls.has(url)) {
+                        obsoletePointIds.push(point.id);
+                        obsoleteUrls.add(url);
+                    }
+                }
+
+                offset = response.next_page_offset;
+            } while (offset !== null && offset !== undefined);
 
             if (obsoletePointIds.length > 0) {
                 await client.delete(collectionName, {
@@ -555,8 +608,13 @@ export class DatabaseManager {
             } else {
                 logger.info(`No obsolete chunks to delete from Qdrant for URL ${urlPrefix}`);
             }
+            return { items: obsoleteUrls.size, chunks: obsoletePointIds.length };
         } catch (error) {
+            // Rethrow so a failed cleanup fails the job instead of silently
+            // leaving orphans behind. This is idempotent and recomputed each
+            // run, so a rerun retries it cleanly.
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+            throw error;
         }
     }
 
@@ -569,38 +627,53 @@ export class DatabaseManager {
         }
     }
 
-    static removeChunksByUrlSQLite(db: Database, url: string, logger: Logger) {
+    static removeChunksByUrlSQLite(db: Database, url: string, logger: Logger): number {
         const deleteStmt = db.prepare(`DELETE FROM vec_items WHERE url = ?`);
         const result = deleteStmt.run(url);
         logger.info(`Deleted ${result.changes} chunks from SQLite for URL ${url}`);
+        return result.changes;
     }
 
-    static async removeChunksByUrlQdrant(db: QdrantDB, url: string, logger: Logger) {
+    static async removeChunksByUrlQdrant(db: QdrantDB, url: string, logger: Logger): Promise<number> {
         const { client, collectionName } = db;
         try {
-            await client.delete(collectionName, {
-                filter: {
-                    must: [
-                        {
-                            key: 'url',
-                            match: {
-                                value: url  // Exact match — must match getChunkHashesByUrlQdrant's filter
-                            }
+            const filter = {
+                must: [
+                    {
+                        key: 'url',
+                        match: {
+                            value: url  // Exact match — must match getChunkHashesByUrlQdrant's filter
                         }
-                    ],
-                    must_not: [
-                        {
-                            key: 'is_metadata',
-                            match: {
-                                value: true
-                            }
+                    }
+                ],
+                must_not: [
+                    {
+                        key: 'is_metadata',
+                        match: {
+                            value: true
                         }
-                    ]
-                }
-            });
+                    }
+                ]
+            };
+            // Count first so callers can report how many chunks the delete removed
+            // (Qdrant's delete-by-filter response doesn't include a count).
+            let deletedCount = 0;
+            try {
+                const countResult = await client.count(collectionName, { filter, exact: true });
+                deletedCount = countResult?.count ?? 0;
+            } catch {
+                // Count is informational only — never fail the delete over it
+            }
+            await client.delete(collectionName, { filter });
             logger.info(`Deleted chunks from Qdrant for URL ${url}`);
+            return deletedCount;
         } catch (error) {
+            // Rethrow so the failure propagates and the job exits non-zero.
+            // A swallowed delete leaves stale chunks behind while the sync
+            // reports success. Callers that treat deletion as best-effort
+            // (e.g. 404 cleanup) wrap this call in their own try/catch.
             logger.error(`Error deleting chunks from Qdrant for URL ${url}:`, error);
+            throw error;
         }
     }
 
@@ -697,11 +770,11 @@ export class DatabaseManager {
     }
 
     static removeObsoleteFilesSQLite(
-        db: Database, 
-        processedFiles: Set<string>, 
-        pathConfig: { path: string; url_rewrite_prefix?: string } | string, 
+        db: Database,
+        processedFiles: Set<string>,
+        pathConfig: { path: string; url_rewrite_prefix?: string } | string,
         logger: Logger
-    ) {
+    ): { items: number; chunks: number } {
         const getChunksForPathStmt = db.prepare(`
             SELECT chunk_id, url FROM vec_items
             WHERE url LIKE ? || '%'
@@ -727,7 +800,8 @@ export class DatabaseManager {
         logger.debug(`Searching for chunks with URL prefix: ${urlPrefix}`);
         const existingChunks = getChunksForPathStmt.all(urlPrefix) as { chunk_id: string; url: string }[];
         let deletedCount = 0;
-        
+        const deletedUrls = new Set<string>();
+
         const transaction = db.transaction(() => {
             for (const { chunk_id, url } of existingChunks) {
                 // Skip if it's not from our URL prefix (safety check)
@@ -752,20 +826,22 @@ export class DatabaseManager {
                     logger.debug(`Deleting obsolete chunk from SQLite: ${chunk_id.substring(0, 8)}... (File not processed: ${filePath})`);
                     deleteChunkStmt.run(chunk_id);
                     deletedCount++;
+                    deletedUrls.add(url);
                 }
             }
         });
         transaction();
-        
+
         logger.info(`Deleted ${deletedCount} obsolete chunks from SQLite for URL prefix ${urlPrefix}`);
+        return { items: deletedUrls.size, chunks: deletedCount };
     }
 
     static async removeObsoleteFilesQdrant(
-        db: QdrantDB, 
-        processedFiles: Set<string>, 
-        pathConfig: { path: string; url_rewrite_prefix?: string } | string, 
+        db: QdrantDB,
+        processedFiles: Set<string>,
+        pathConfig: { path: string; url_rewrite_prefix?: string } | string,
         logger: Logger
-    ) {
+    ): Promise<{ items: number; chunks: number }> {
         const { client, collectionName } = db;
         try {
             // Determine if we're using URL rewriting or direct file paths
@@ -785,44 +861,55 @@ export class DatabaseManager {
             }
             
             logger.debug(`Checking for obsolete chunks with URL prefix: ${urlPrefix}`);
-            const response = await client.scroll(collectionName, {
-                limit: 10000,
-                with_payload: true,
-                with_vector: false,
-                filter: {
-                    must: [
-                        {
-                            key: "url",
-                            match: {
-                                text: urlPrefix
-                            }
+
+            // Scroll through ALL matching points via next_page_offset. A single
+            // capped scroll would only examine the first page, so obsolete
+            // chunks beyond it (in collections larger than the page limit) would
+            // never be removed.
+            const filter = {
+                must: [
+                    {
+                        key: "url",
+                        match: {
+                            text: urlPrefix
                         }
-                    ],
-                    must_not: [
-                        {
-                            key: "is_metadata",
-                            match: {
-                                value: true
-                            }
+                    }
+                ],
+                must_not: [
+                    {
+                        key: "is_metadata",
+                        match: {
+                            value: true
                         }
-                    ]
-                }
-            });
-            
-            const obsoletePointIds = response.points
-                .filter((point: any) => {
+                    }
+                ]
+            };
+
+            const obsoletePointIds: any[] = [];
+            const obsoleteUrls = new Set<string>();
+            let offset: any = undefined;
+            do {
+                const response = await client.scroll(collectionName, {
+                    limit: 1000,
+                    offset,
+                    with_payload: true,
+                    with_vector: false,
+                    filter
+                });
+
+                for (const point of response.points) {
                     const url = point.payload?.url;
                     // Double check it's not a metadata record
                     if (point.payload?.is_metadata === true) {
-                        return false;
+                        continue;
                     }
-                    
+
                     if (!url || !url.startsWith(urlPrefix)) {
-                        return false;
+                        continue;
                     }
-                    
+
                     let filePath: string;
-                    
+
                     if (isRewriteMode) {
                         // URL rewrite mode: extract relative path and construct full file path
                         const config = pathConfig as { path: string; url_rewrite_prefix?: string };
@@ -832,11 +919,16 @@ export class DatabaseManager {
                         // Direct file path mode: remove file:// prefix to match with processedFiles
                         filePath = url.startsWith('file://') ? url.substring(7) : '';
                     }
-                    
-                    return filePath && !processedFiles.has(filePath);
-                })
-                .map((point: any) => point.id);
-            
+
+                    if (filePath && !processedFiles.has(filePath)) {
+                        obsoletePointIds.push(point.id);
+                        obsoleteUrls.add(url);
+                    }
+                }
+
+                offset = response.next_page_offset;
+            } while (offset !== null && offset !== undefined);
+
             if (obsoletePointIds.length > 0) {
                 await client.delete(collectionName, {
                     points: obsoletePointIds,
@@ -845,8 +937,12 @@ export class DatabaseManager {
             } else {
                 logger.info(`No obsolete chunks to delete from Qdrant for URL prefix ${urlPrefix}`);
             }
+            return { items: obsoleteUrls.size, chunks: obsoletePointIds.length };
         } catch (error) {
+            // Rethrow so a failed cleanup fails the job instead of silently
+            // leaving orphans behind (idempotent — retried cleanly next run).
             logger.error(`Error removing obsolete chunks from Qdrant:`, error);
+            throw error;
         }
     }
-} 
+}

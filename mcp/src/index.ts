@@ -34,6 +34,7 @@ const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'openai';
 // OpenAI configuration
 const openAIApiKey = process.env.OPENAI_API_KEY;
 const openAIModel = process.env.OPENAI_MODEL || 'text-embedding-3-large';
+const openAIBaseURL = process.env.OPENAI_BASE_URL;  // Optional: override API base URL for Ollama / other OpenAI-compatible endpoints
 
 // Azure OpenAI configuration
 const azureApiKey = process.env.AZURE_OPENAI_KEY;
@@ -110,6 +111,7 @@ async function createEmbeddings(text: string): Promise<number[]> {
             case 'openai': {
                 const openai = new OpenAI({
                     apiKey: openAIApiKey,
+                    ...(openAIBaseURL && { baseURL: openAIBaseURL }),
                 });
                 const response = await openai.embeddings.create({
                     model: openAIModel,

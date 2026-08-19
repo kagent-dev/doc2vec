@@ -680,6 +680,327 @@ describe('ContentProcessor', () => {
 
             expect(processed.length).toBe(0);
         });
+
+        // Vendored forks carry symlinks whose target isn't in the clone; statSync
+        // follows them and throws ENOENT. That used to abandon the rest of the
+        // directory, and cleanup then deleted the chunks of every skipped file.
+        it('should skip a dangling symlink and still process its siblings', async () => {
+            fs.writeFileSync(path.join(testDir, 'a-before.ts'), 'const a = 1;');
+            fs.symlinkSync(path.join(testDir, 'missing-target.ts'), path.join(testDir, 'b-broken.ts'));
+            fs.writeFileSync(path.join(testDir, 'c-after.ts'), 'const c = 3;');
+
+            const processed: string[] = [];
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async (filePath) => { processed.push(filePath); },
+                testLogger
+            );
+
+            expect(processed.map(p => path.basename(p)).sort()).toEqual(['a-before.ts', 'c-after.ts']);
+            expect(result.processedFiles).toBe(2);
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('should not report a dangling symlink in a subdirectory as incomplete', async () => {
+            const subDir = path.join(testDir, 'sub');
+            fs.mkdirSync(subDir);
+            fs.symlinkSync(path.join(subDir, 'gone.ts'), path.join(subDir, 'broken.ts'));
+            fs.writeFileSync(path.join(subDir, 'real.ts'), 'const x = 1;');
+
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async () => {},
+                testLogger
+            );
+
+            expect(result.processedFiles).toBe(1);
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('should report incomplete when a directory cannot be listed', async () => {
+            const result = await processor.processCodeDirectory(
+                path.join(testDir, 'does-not-exist'),
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async () => {},
+                testLogger
+            );
+
+            expect(result.incomplete).toBe(true);
+            expect(result.processedFiles).toBe(0);
+        });
+
+        // chmod 000 doesn't stop root, so this can't assert anything in a
+        // root container (CI images often run as root)
+        const runningAsRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+        it.skipIf(runningAsRoot)('should propagate incomplete from a subdirectory that cannot be listed', async () => {
+            const subDir = path.join(testDir, 'unreadable');
+            fs.mkdirSync(subDir);
+            fs.writeFileSync(path.join(subDir, 'hidden.ts'), 'code');
+            fs.writeFileSync(path.join(testDir, 'visible.ts'), 'code');
+            fs.chmodSync(subDir, 0o000);
+
+            try {
+                const result = await processor.processCodeDirectory(
+                    testDir,
+                    { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                    async () => {},
+                    testLogger
+                );
+
+                expect(result.incomplete).toBe(true);
+                // the readable sibling is still ingested
+                expect(result.processedFiles).toBe(1);
+            } finally {
+                fs.chmodSync(subDir, 0o755);
+            }
+        });
+
+        it('should report a complete scan as complete', async () => {
+            fs.writeFileSync(path.join(testDir, 'ok.ts'), 'code');
+
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.ts'] },
+                async () => {},
+                testLogger
+            );
+
+            expect(result.incomplete).toBe(false);
+        });
+    });
+
+    // ─── processCodeDirectory: exclude_paths ────────────────────────
+    describe('processCodeDirectory with exclude_paths', () => {
+        const testDir = path.join(__dirname, '__test_exclude_dir__');
+
+        const codeConfig: CodeSourceConfig = {
+            type: 'code',
+            source: 'local_directory',
+            path: '',
+            product_name: 'Test',
+            version: '1.0',
+            max_size: 100000,
+            database_config: { type: 'sqlite', params: {} }
+        };
+
+        // Builds a small tree that looks like a Go repo with vendored and
+        // generated code:
+        //   main.go, main_test.go
+        //   api/types.pb.go, api/types.go, api/zz_generated.deepcopy.go
+        //   pkg/client/clientset.go
+        //   pkg/svc/svc.go, pkg/svc/svc_test.go
+        //   vendor/dep/dep.go
+        //   vendor.go
+        const writeTree = () => {
+            const files = [
+                'main.go',
+                'main_test.go',
+                'api/types.pb.go',
+                'api/types.go',
+                'api/zz_generated.deepcopy.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'pkg/svc/svc_test.go',
+                'vendor/dep/dep.go',
+                'vendor.go'
+            ];
+            for (const file of files) {
+                const target = path.join(testDir, file);
+                fs.mkdirSync(path.dirname(target), { recursive: true });
+                fs.writeFileSync(target, 'package main');
+            }
+        };
+
+        const scan = async (excludePaths: string[] | undefined, options?: Parameters<typeof processor.processCodeDirectory>[5]) => {
+            const processed: string[] = [];
+            const result = await processor.processCodeDirectory(
+                testDir,
+                { ...codeConfig, path: testDir, include_extensions: ['.go'], exclude_paths: excludePaths },
+                async (filePath) => { processed.push(filePath); },
+                testLogger,
+                undefined,
+                options
+            );
+            const relative = processed.map((filePath) => path.relative(testDir, filePath).replace(/\\/g, '/')).sort();
+            return { relative, result };
+        };
+
+        beforeEach(() => {
+            if (fs.existsSync(testDir)) {
+                fs.rmSync(testDir, { recursive: true });
+            }
+            fs.mkdirSync(testDir, { recursive: true });
+            writeTree();
+        });
+
+        afterEach(() => {
+            if (fs.existsSync(testDir)) {
+                fs.rmSync(testDir, { recursive: true });
+            }
+        });
+
+        it('processes every file when exclude_paths is absent', async () => {
+            const { relative } = await scan(undefined);
+
+            expect(relative).toEqual([
+                'api/types.go',
+                'api/types.pb.go',
+                'api/zz_generated.deepcopy.go',
+                'main.go',
+                'main_test.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'pkg/svc/svc_test.go',
+                'vendor.go',
+                'vendor/dep/dep.go'
+            ]);
+        });
+
+        it('prunes a directory subtree', async () => {
+            const { relative } = await scan(['vendor/**']);
+
+            expect(relative).not.toContain('vendor/dep/dep.go');
+            // a file whose name only starts with the pattern stays
+            expect(relative).toContain('vendor.go');
+        });
+
+        it('prunes a nested directory subtree', async () => {
+            const { relative } = await scan(['pkg/client/**']);
+
+            expect(relative).not.toContain('pkg/client/clientset.go');
+            expect(relative).toContain('pkg/svc/svc.go');
+        });
+
+        it('excludes files at any depth with a leading globstar', async () => {
+            const { relative } = await scan(['**/*_test.go']);
+
+            expect(relative).not.toContain('main_test.go');
+            expect(relative).not.toContain('pkg/svc/svc_test.go');
+            expect(relative).toContain('pkg/svc/svc.go');
+        });
+
+        it('excludes generated files by suffix and by name pattern', async () => {
+            const { relative } = await scan(['**/*.pb.go', '**/zz_generated.*.go']);
+
+            expect(relative).toEqual([
+                'main.go',
+                'main_test.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'pkg/svc/svc_test.go',
+                'vendor.go',
+                'vendor/dep/dep.go',
+                'api/types.go'
+            ].sort());
+        });
+
+        it('applies several patterns together', async () => {
+            const { relative, result } = await scan([
+                'vendor/**',
+                'pkg/client/**',
+                '**/*.pb.go',
+                '**/zz_generated.*.go',
+                '**/*_test.go'
+            ]);
+
+            expect(relative).toEqual(['api/types.go', 'main.go', 'pkg/svc/svc.go', 'vendor.go']);
+            expect(result.processedFiles).toBe(4);
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('matches patterns against the source root, not the current subdirectory', async () => {
+            // 'client/**' names no directory at the root, so nothing is pruned;
+            // only 'pkg/client/**' removes the nested one
+            const { relative } = await scan(['client/**']);
+
+            expect(relative).toContain('pkg/client/clientset.go');
+        });
+
+        it('keeps excluded files out of trackFiles so the caller deletes their chunks', async () => {
+            const trackFiles = new Set<string>();
+            await scan(['vendor/**', '**/*_test.go'], { trackFiles });
+
+            const tracked = Array.from(trackFiles)
+                .map((filePath) => path.relative(testDir, filePath).replace(/\\/g, '/'))
+                .sort();
+            expect(tracked).toEqual([
+                'api/types.go',
+                'api/types.pb.go',
+                'api/zz_generated.deepcopy.go',
+                'main.go',
+                'pkg/client/clientset.go',
+                'pkg/svc/svc.go',
+                'vendor.go'
+            ]);
+        });
+
+        it('does not let an excluded file raise maxMtime', async () => {
+            const future = new Date(Date.now() + 60_000);
+            fs.utimesSync(path.join(testDir, 'vendor/dep/dep.go'), future, future);
+
+            const { result } = await scan(['vendor/**']);
+
+            expect(result.maxMtime).toBeLessThan(future.getTime());
+        });
+
+        it('counts an excluded file as skipped', async () => {
+            const { result } = await scan(['**/*_test.go']);
+
+            expect(result.processedFiles).toBe(8);
+            expect(result.skippedFiles).toBe(2);
+        });
+
+        it('reports a scan with exclusions as complete', async () => {
+            const { result } = await scan(['vendor/**']);
+
+            expect(result.incomplete).toBe(false);
+        });
+
+        it('ignores an empty pattern list', async () => {
+            const { relative } = await scan([]);
+
+            expect(relative).toContain('vendor/dep/dep.go');
+        });
+    });
+
+    // ─── processDirectory: dangling symlinks ────────────────────────
+    describe('processDirectory with a dangling symlink', () => {
+        const testDir = path.join(__dirname, '__test_symlink_dir__');
+
+        beforeEach(() => {
+            if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+            fs.mkdirSync(testDir, { recursive: true });
+        });
+
+        afterEach(() => {
+            if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+        });
+
+        it('should skip the broken link and process the remaining files', async () => {
+            fs.writeFileSync(path.join(testDir, 'a.md'), '# A');
+            fs.symlinkSync(path.join(testDir, 'nope.md'), path.join(testDir, 'b.md'));
+            fs.writeFileSync(path.join(testDir, 'c.md'), '# C');
+
+            const processed: string[] = [];
+            await processor.processDirectory(
+                testDir,
+                {
+                    type: 'local_directory',
+                    path: testDir,
+                    product_name: 'Test',
+                    version: '1.0',
+                    max_size: 100000,
+                    include_extensions: ['.md'],
+                    database_config: { type: 'sqlite', params: {} }
+                } as any,
+                async (filePath) => { processed.push(filePath); },
+                testLogger
+            );
+
+            expect(processed.map(p => path.basename(p)).sort()).toEqual(['a.md', 'c.md']);
+        });
     });
 
     // ─── isNetworkError (accessed via crawlWebsite behavior) ────────
@@ -943,6 +1264,29 @@ describe('ContentProcessor', () => {
             url: 'https://example.com',
             database_config: { type: 'sqlite', params: {} }
         };
+
+        it('should abort the whole crawl when the browser cannot launch (after one retry)', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const launchSpy = vi.spyOn(puppeteerModule.default, 'launch')
+                .mockRejectedValue(new Error('Failed to launch the browser process!'));
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            // Fake timers to skip the 5s pause between the two launch attempts
+            vi.useFakeTimers();
+            const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
+            // Attach the rejection expectation before advancing time so the
+            // rejection isn't treated as unhandled
+            const assertion = expect(crawlPromise).rejects.toThrow(/browser failed to launch twice/);
+            await vi.advanceTimersByTimeAsync(6000);
+            await assertion;
+            vi.useRealTimers();
+
+            // Exactly two attempts (initial + one retry), not one per queued URL
+            expect(launchSpy).toHaveBeenCalledTimes(2);
+            expect(processContent).not.toHaveBeenCalled();
+        });
 
         it('should skip already visited URLs', async () => {
             vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
@@ -1245,6 +1589,31 @@ describe('ContentProcessor', () => {
             // Should skip — no processPage, no processContent
             expect(processPageSpy).not.toHaveBeenCalled();
             expect(processContent).not.toHaveBeenCalled();
+        });
+
+        it('should remove a 404 URL from visitedUrls and record it in notFoundUrls', async () => {
+            const axiosModule = await import('axios');
+            vi.spyOn(axiosModule.default, 'head').mockRejectedValue(
+                Object.assign(new Error('Request failed with status code 404'), {
+                    response: { status: 404 },
+                })
+            );
+
+            const etagStore = {
+                get: vi.fn(),
+                set: vi.fn().mockResolvedValue(undefined),
+            };
+
+            const visited = new Set<string>();
+            const processContent = vi.fn().mockResolvedValue(true);
+            const result = await processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited, { etagStore });
+
+            // The dead URL must be recorded as not-found...
+            expect([...result.notFoundUrls].some(u => u.startsWith('https://example.com'))).toBe(true);
+            // ...and must NOT linger in visitedUrls. It was optimistically added
+            // when dequeued; leaving it there would make the obsolete-chunk
+            // cleanup treat the deleted page as still-live and never purge it.
+            expect(visited.size).toBe(0);
         });
 
         it('should skip URL when HEAD returns 403', async () => {
@@ -2148,6 +2517,36 @@ describe('ContentProcessor', () => {
                     overlapWords.some(w => w.length > 5 && nextContent.includes(w));
                 expect(hasOverlap).toBe(true);
             }
+        });
+
+        // A split boundary landing inside a surrogate pair used to emit chunks
+        // containing a lone surrogate. That body is invalid UTF-8, so Qdrant
+        // rejected the upsert ("lone leading surrogate in hex escape") and the
+        // chunk was silently dropped.
+        it('never emits a chunk containing a lone surrogate when splitting emoji-heavy content', async () => {
+            // Emoji at every offset maximises the chance of straddling a boundary
+            const emojiContent = '# Emoji Section\n\n' + 'padding 😀 text 🎉 more 👍 words '.repeat(600);
+            const chunks = await processor.chunkMarkdown(emojiContent, baseConfig, 'https://example.com/emoji');
+
+            expect(chunks.length).toBeGreaterThan(1);
+            for (const chunk of chunks) {
+                // isWellFormed() is false exactly when a lone surrogate is present
+                expect(chunk.content.isWellFormed?.() ?? true).toBe(true);
+                // And the content must survive a strict JSON round-trip
+                expect(() => JSON.parse(JSON.stringify({ c: chunk.content }))).not.toThrow();
+            }
+        });
+
+        it('strips a lone surrogate that arrives in the source content', async () => {
+            // A truncated pair straight from the upstream source, not the splitter
+            const content = '# Broken\n\nThis body has a stray half-emoji \ud83d in the middle.';
+            const chunks = await processor.chunkMarkdown(content, baseConfig, 'https://example.com/broken');
+
+            expect(chunks.length).toBeGreaterThan(0);
+            for (const chunk of chunks) {
+                expect(chunk.content.isWellFormed?.() ?? true).toBe(true);
+            }
+            expect(chunks[0].content).toContain('stray half-emoji');
         });
     });
 

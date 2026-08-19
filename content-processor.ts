@@ -20,6 +20,106 @@ import {
 import type { TokenChunker, Tokenizer } from '@chonkiejs/core';
 import { CodeChunker } from './code-chunker';
 
+/**
+ * Thrown when the browser cannot be launched at all (even after a retry).
+ * Without a browser no page in the crawl can be processed, so this aborts the
+ * whole website source — the run is then reported as failed instead of
+ * "succeeding" with an error on every URL.
+ */
+export class BrowserLaunchError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'BrowserLaunchError';
+    }
+}
+
+/**
+ * Outcome of walking a code source's directory tree.
+ *
+ * `incomplete` means at least one directory could not be listed, so the set of
+ * files the caller saw is only a subset of what is on disk. Callers must not
+ * treat the unseen files as deleted: cleanup and last-scanned markers have to
+ * be skipped, otherwise a transient I/O error silently purges chunks and the
+ * next run never revisits those files.
+ */
+export interface CodeScanResult {
+    processedFiles: number;
+    skippedFiles: number;
+    maxMtime: number;
+    incomplete: boolean;
+}
+
+/**
+ * Resolve which browser binary to launch, in order of preference:
+ *  1. PUPPETEER_EXECUTABLE_PATH (explicit override)
+ *  2. Puppeteer's own downloaded Chrome for Testing (version-matched, the
+ *     reliable choice — Debian's chromium package has shipped builds that
+ *     crash at startup in containers, e.g. 150.0.7871 SIGTRAPs immediately)
+ *  3. A system chromium, as the fallback (also covers linux/arm64, where
+ *     Chrome for Testing is not published)
+ *  4. undefined — let puppeteer decide
+ */
+export function resolveBrowserExecutablePath(): string | undefined {
+    const override = process.env.PUPPETEER_EXECUTABLE_PATH;
+    if (override) return override;
+    try {
+        const bundled = puppeteer.executablePath();
+        if (bundled && fs.existsSync(bundled)) return bundled;
+    } catch {
+        // no browser downloaded for this platform
+    }
+    if (fs.existsSync('/usr/bin/chromium')) return '/usr/bin/chromium';
+    if (fs.existsSync('/usr/bin/chromium-browser')) return '/usr/bin/chromium-browser';
+    return undefined;
+}
+
+/**
+ * Best-effort snapshot of process + container memory, for diagnosing browser
+ * launch failures (the usual cause in Kubernetes is the pod's memory cgroup —
+ * Chromium forks, then its renderers are immediately OOM-killed).
+ */
+function memoryDiagnostics(): string {
+    const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(2)}GiB`;
+    const parts: string[] = [`node rss ${gib(process.memoryUsage().rss)}`];
+    try {
+        // cgroup v2, else v1 — absent entirely outside Linux/containers
+        let current: string | undefined;
+        let max: string | undefined;
+        if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
+            current = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim();
+            max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+        } else if (fs.existsSync('/sys/fs/cgroup/memory/memory.usage_in_bytes')) {
+            current = fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim();
+            max = fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim();
+        }
+        if (current !== undefined && max !== undefined) {
+            const unlimited = max === 'max' || Number(max) > 2 ** 60;
+            parts.push(`cgroup ${gib(Number(current))} used / ${unlimited ? 'no limit' : gib(Number(max))}`);
+        }
+    } catch {
+        // diagnostics only — never fail because of them
+    }
+    try {
+        // /proc/meminfo reflects the NODE in Kubernetes — catches host-level pressure
+        const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+        const available = meminfo.match(/^MemAvailable:\s+(\d+) kB/m);
+        if (available) {
+            parts.push(`node available ${gib(Number(available[1]) * 1024)}`);
+        }
+    } catch {
+        // not Linux
+    }
+    try {
+        // Chromium writes its profile and (with --disable-dev-shm-usage) its
+        // shared memory under /tmp — a full disk breaks launches
+        const stat = fs.statfsSync('/tmp');
+        parts.push(`/tmp free ${gib(stat.bavail * stat.bsize)}`);
+    } catch {
+        // statfs unavailable
+    }
+    return parts.join(', ');
+}
+
 export class ContentProcessor {
     private turndownService: TurndownService;
     private logger: Logger;
@@ -373,15 +473,8 @@ export class ContentProcessor {
         let page: Page | null = null;
 
         const launchBrowser = async (): Promise<{ browser: Browser; page: Page }> => {
-            let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
-            if (!executablePath) {
-                if (fs.existsSync('/usr/bin/chromium')) {
-                    executablePath = '/usr/bin/chromium';
-                } else if (fs.existsSync('/usr/bin/chromium-browser')) {
-                    executablePath = '/usr/bin/chromium-browser';
-                }
-            }
-            const b = await puppeteer.launch({
+            const executablePath = resolveBrowserExecutablePath();
+            const launchOptions = {
                 executablePath,
                 args: [
                     '--no-sandbox',
@@ -391,7 +484,25 @@ export class ContentProcessor {
                     '--disable-extensions',
                 ],
                 protocolTimeout: 60000,
-            });
+            };
+            let b: Browser;
+            try {
+                b = await puppeteer.launch(launchOptions);
+            } catch (firstError) {
+                // One retry after a pause — the failure may be transient (e.g.
+                // memory pressure from a page that just closed). If the browser
+                // cannot launch at all, no page in this crawl can be processed,
+                // so escalate as fatal instead of failing every URL one by one.
+                logger.warn(`Browser launch failed (${memoryDiagnostics()}), retrying once in 5s...`, firstError);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                try {
+                    b = await puppeteer.launch(launchOptions);
+                } catch (secondError) {
+                    throw new BrowserLaunchError(
+                        `browser failed to launch twice (${memoryDiagnostics()}): ${secondError instanceof Error ? secondError.message : String(secondError)}`
+                    );
+                }
+            }
             const p = await b.newPage();
             return { browser: b, page: p };
         };
@@ -405,8 +516,12 @@ export class ContentProcessor {
         // Restart the browser every N pages to prevent memory accumulation
         const PAGES_BETWEEN_RESTARTS = 50;
 
-        const restartBrowser = async (reason: string): Promise<void> => {
-            logger.warn(`Restarting browser: ${reason}`);
+        // Planned restarts (first launch, the every-N-pages recycle) are routine
+        // and would otherwise dominate a crawl's warning count; only unplanned
+        // ones — a disconnected or degraded browser — deserve a warning.
+        const restartBrowser = async (reason: string, planned = false): Promise<void> => {
+            if (planned) logger.info(`Restarting browser: ${reason}`);
+            else logger.warn(`Restarting browser: ${reason}`);
             if (browser) {
                 try { await browser.close(); } catch { /* ignore close errors on a degraded browser */ }
             }
@@ -427,10 +542,10 @@ export class ContentProcessor {
                 const reason = needsBrowserRestart
                     ? `protocol errors persisting after page recreation (${consecutiveProtocolErrors} consecutive)`
                     : browser ? 'browser disconnected' : 'initial launch';
-                await restartBrowser(reason);
+                await restartBrowser(reason, !browser && !needsBrowserRestart);
             } else if (pagesSinceRestart >= PAGES_BETWEEN_RESTARTS) {
                 // Periodic restart to prevent memory accumulation from long crawls
-                await restartBrowser(`periodic restart after ${pagesSinceRestart} pages`);
+                await restartBrowser(`periodic restart after ${pagesSinceRestart} pages`, true);
             } else if (pageNeedsRecreation) {
                 // The previous page.evaluate or navigation timed out / errored.
                 // Close the stale page and create a fresh one to avoid corrupted state.
@@ -609,6 +724,11 @@ export class ContentProcessor {
                             logger.debug(`HEAD returned ${headStatus} for ${url}, skipping`);
                             if (headStatus === 404) {
                                 notFoundUrls.add(url);
+                                // The URL was optimistically added to visitedUrls when
+                                // dequeued (before we knew it was dead). Remove it so the
+                                // obsolete-chunk cleanup treats it as gone and purges its
+                                // chunks — otherwise deleted pages linger forever.
+                                visitedUrls.delete(normalizedUrl);
                             }
                             skippedCount++;
                             continue;
@@ -714,6 +834,14 @@ export class ContentProcessor {
                         }
                     }
                 } catch (error: any) {
+                    // A browser that cannot launch is fatal for the whole crawl —
+                    // rethrow so the source (and the run) is reported as failed
+                    // rather than logging an error per URL and finishing "green".
+                    if (error instanceof BrowserLaunchError) {
+                        logger.error(`Aborting crawl of ${baseUrl}: ${error.message}`);
+                        throw error;
+                    }
+
                     const status = this.getHttpStatus(error);
 
                     // ── Handle 429 (Too Many Requests) with retry ──
@@ -768,6 +896,11 @@ export class ContentProcessor {
                     }
 
                     if (status === 404) {
+                        notFoundUrls.add(url);
+                        // The URL was optimistically added to visitedUrls when dequeued
+                        // (before this GET revealed it's a 404). Remove it so the
+                        // obsolete-chunk cleanup treats it as gone and purges its chunks.
+                        visitedUrls.delete(normalizedUrl);
                         const sources = referrers.get(url) ?? new Set([baseUrl]);
                         for (const source of sources) {
                             addBrokenLink(source, url);
@@ -896,17 +1029,8 @@ export class ContentProcessor {
                 page = existingPage;
             } else {
                 // Standalone mode: launch a browser for this single page
-                let executablePath: string | undefined = process.env.PUPPETEER_EXECUTABLE_PATH;
-                if (!executablePath) {
-                    if (fs.existsSync('/usr/bin/chromium')) {
-                        executablePath = '/usr/bin/chromium';
-                    } else if (fs.existsSync('/usr/bin/chromium-browser')) {
-                        executablePath = '/usr/bin/chromium-browser';
-                    }
-                }
-                
                 browser = await puppeteer.launch({
-                    executablePath,
+                    executablePath: resolveBrowserExecutablePath(),
                     args: [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
@@ -1442,6 +1566,36 @@ export class ContentProcessor {
         }
     }
 
+    async convertFileToMarkdown(filePath: string, extension: string, logger: Logger): Promise<string> {
+        const ext = extension.toLowerCase();
+        if (ext === '.pdf') {
+            return this.convertPdfToMarkdown(filePath, logger);
+        } else if (ext === '.doc') {
+            return this.convertDocToMarkdown(filePath, logger);
+        } else if (ext === '.docx') {
+            return this.convertDocxToMarkdown(filePath, logger);
+        } else if (ext === '.html' || ext === '.htm') {
+            const content = fs.readFileSync(filePath, { encoding: 'utf8' });
+            const cleanHtml = sanitizeHtml(content, {
+                allowedTags: [
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
+                    'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
+                    'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
+                ],
+                allowedAttributes: {
+                    'a': ['href'],
+                    'pre': ['class', 'data-language'],
+                    'code': ['class', 'data-language'],
+                    'div': ['class'],
+                    'span': ['class']
+                }
+            });
+            return this.turndownService.turndown(cleanHtml);
+        } else {
+            throw new Error(`Unsupported file extension for conversion: ${extension}`);
+        }
+    }
+
     private async downloadAndConvertPdfFromUrl(url: string, logger: Logger): Promise<string> {
         logger.debug(`Downloading and converting PDF from URL: ${url}`);
         
@@ -1561,8 +1715,18 @@ export class ContentProcessor {
             
             for (const file of files) {
                 const filePath = path.join(dirPath, file);
-                const stat = fs.statSync(filePath);
-                
+
+                // A dangling symlink makes statSync throw ENOENT; skip the
+                // entry rather than abandoning the rest of the directory
+                let stat: fs.Stats;
+                try {
+                    stat = fs.statSync(filePath);
+                } catch (error) {
+                    logger.warn(`Skipping unreadable entry ${filePath}:`, error);
+                    skippedFiles++;
+                    continue;
+                }
+
                 // Skip already visited paths
                 if (visitedPaths.has(filePath)) {
                     logger.debug(`Skipping already visited path: ${filePath}`);
@@ -1599,49 +1763,29 @@ export class ContentProcessor {
                         let content: string;
                         let processedContent: string;
                         
-                        if (extension === '.pdf') {
-                            // Handle PDF files
-                            logger.debug(`Processing PDF file: ${filePath}`);
-                            processedContent = await this.convertPdfToMarkdown(filePath, logger);
-                        } else if (extension === '.doc') {
-                            // Handle legacy Word DOC files
-                            logger.debug(`Processing DOC file: ${filePath}`);
-                            processedContent = await this.convertDocToMarkdown(filePath, logger);
-                        } else if (extension === '.docx') {
-                            // Handle modern Word DOCX files
-                            logger.debug(`Processing DOCX file: ${filePath}`);
-                            processedContent = await this.convertDocxToMarkdown(filePath, logger);
+                        const convertibleExtensions = ['.pdf', '.doc', '.docx', '.html', '.htm'];
+                        if (convertibleExtensions.includes(extension)) {
+                            if (extension === '.html' || extension === '.htm') {
+                                // For HTML, check raw file size before converting
+                                content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
+                                if (content.length > config.max_size) {
+                                    logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
+                                    skippedFiles++;
+                                    continue;
+                                }
+                            }
+                            processedContent = await this.convertFileToMarkdown(filePath, extension, logger);
                         } else {
                             // Handle text-based files
                             content = fs.readFileSync(filePath, { encoding: encoding as BufferEncoding });
-                            
+
                             if (content.length > config.max_size) {
                                 logger.warn(`File content (${content.length} chars) exceeds max size (${config.max_size}). Skipping ${filePath}.`);
                                 skippedFiles++;
                                 continue;
                             }
-                            
-                            // Convert HTML to Markdown if needed
-                            if (extension === '.html' || extension === '.htm') {
-                                logger.debug(`Converting HTML to Markdown for ${filePath}`);
-                                const cleanHtml = sanitizeHtml(content, {
-                                    allowedTags: [
-                                        'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'ul', 'ol',
-                                        'li', 'b', 'i', 'strong', 'em', 'code', 'pre',
-                                        'div', 'span', 'table', 'thead', 'tbody', 'tr', 'th', 'td'
-                                    ],
-                                    allowedAttributes: {
-                                        'a': ['href'],
-                                        'pre': ['class', 'data-language'],
-                                        'code': ['class', 'data-language'],
-                                        'div': ['class'],
-                                        'span': ['class']
-                                    }
-                                });
-                                processedContent = this.turndownService.turndown(cleanHtml);
-                            } else {
-                                processedContent = content;
-                            }
+
+                            processedContent = content;
                         }
                         
                         // Check size limit for processed content
@@ -1675,8 +1819,12 @@ export class ContentProcessor {
             allowedFiles?: Set<string>;
             mtimeCutoff?: number;
             trackFiles?: Set<string>;
+            // The directory the scan started from. Recursive calls pass it down
+            // so `exclude_paths` patterns keep matching against the source root
+            // and not against the current subdirectory.
+            rootPath?: string;
         }
-    ): Promise<{ processedFiles: number; skippedFiles: number; maxMtime: number }> {
+    ): Promise<CodeScanResult> {
         const logger = parentLogger.child('code-directory-processor');
         logger.info(`Processing code directory: ${dirPath}`);
 
@@ -1690,9 +1838,14 @@ export class ContentProcessor {
             '.json', '.yaml', '.yml', '.md'
         ];
         const excludeExtensions = config.exclude_extensions || [];
+        const excludePaths = config.exclude_paths || [];
         const encoding = config.encoding || ('utf8' as BufferEncoding);
+        const rootPath = options?.rootPath ?? dirPath;
+        const childOptions = { ...options, rootPath };
 
         let maxMtime = 0;
+
+        let incomplete = false;
 
         try {
             const files = fs.readdirSync(dirPath);
@@ -1705,7 +1858,19 @@ export class ContentProcessor {
 
             for (const file of files) {
                 const filePath = path.join(dirPath, file);
-                const stat = fs.statSync(filePath);
+
+                // statSync follows symlinks, so a dangling one (common in
+                // vendored forks) throws ENOENT. Skipping the entry keeps the
+                // rest of the directory — letting it throw used to abandon
+                // every sibling after it, and cleanup then deleted their chunks.
+                let stat: fs.Stats;
+                try {
+                    stat = fs.statSync(filePath);
+                } catch (error) {
+                    logger.warn(`Skipping unreadable entry ${filePath}:`, error);
+                    skippedFiles++;
+                    continue;
+                }
 
                 if (visitedPaths.has(filePath)) {
                     logger.debug(`Skipping already visited path: ${filePath}`);
@@ -1713,6 +1878,22 @@ export class ContentProcessor {
                 }
 
                 visitedPaths.add(filePath);
+
+                // An excluded path never reaches trackFiles or maxMtime, so the
+                // caller treats it like a deleted file and removes its chunks
+                if (excludePaths.length > 0) {
+                    const relativePath = path.relative(rootPath, filePath).replace(/\\/g, '/');
+                    const excluded = stat.isDirectory()
+                        ? Utils.isDirectoryExcluded(relativePath, excludePaths)
+                        : Utils.matchesAnyGlob(relativePath, excludePaths);
+                    if (excluded) {
+                        logger.debug(`Skipping excluded path: ${relativePath}`);
+                        if (!stat.isDirectory()) {
+                            skippedFiles++;
+                        }
+                        continue;
+                    }
+                }
 
                 if (stat.isDirectory()) {
                     if (recursive) {
@@ -1722,11 +1903,12 @@ export class ContentProcessor {
                             processFileContent,
                             logger,
                             visitedPaths,
-                            options
+                            childOptions
                         );
                         processedFiles += childResult.processedFiles;
                         skippedFiles += childResult.skippedFiles;
                         maxMtime = Math.max(maxMtime, childResult.maxMtime);
+                        incomplete = incomplete || childResult.incomplete;
                     } else {
                         logger.debug(`Skipping directory ${filePath} (recursive=false)`);
                     }
@@ -1777,10 +1959,13 @@ export class ContentProcessor {
             }
 
             logger.info(`Code directory processed. Processed: ${processedFiles}, Skipped: ${skippedFiles}`);
-            return { processedFiles, skippedFiles, maxMtime };
+            return { processedFiles, skippedFiles, maxMtime, incomplete };
         } catch (error) {
+            // The directory could not be listed at all — report the scan as
+            // incomplete so the caller skips cleanup instead of treating every
+            // file under this path as deleted
             logger.error(`Error reading code directory ${dirPath}:`, error);
-            return { processedFiles: 0, skippedFiles: 0, maxMtime };
+            return { processedFiles: 0, skippedFiles: 0, maxMtime, incomplete: true };
         }
     }
 
@@ -1925,7 +2110,12 @@ export class ContentProcessor {
         if (lang) {
             try {
                 const codeChunker = await this.getCodeChunker(lang, sourceConfig.chunk_size);
-                chunks = await codeChunker.chunk(code);
+                chunks = await Promise.race([
+                    codeChunker.chunk(code),
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error(`CodeChunker timed out after 30s for ${normalizedPath || url}`)), 30000)
+                    )
+                ]);
             } catch (error) {
                 logger.warn(`CodeChunker failed for ${normalizedPath || url}, falling back to token chunking:`, error);
                 const chunker = await this.getTokenChunker(sourceConfig.chunk_size);
@@ -1947,7 +2137,9 @@ export class ContentProcessor {
                 continue;
             }
 
-            const searchableText = contextPrefix + content;
+            // See chunkMarkdown: an unpaired surrogate makes the store's JSON
+            // body invalid, so sanitize before the id is derived from the text.
+            const searchableText = Utils.stripLoneSurrogates(contextPrefix + content);
             const chunkId = Utils.generateHash(`${url}::${searchableText}`);
 
             documentChunks.push({
@@ -1982,9 +2174,9 @@ export class ContentProcessor {
     async chunkMarkdown(markdown: string, sourceConfig: SourceConfig, url: string): Promise<DocumentChunk[]> {
         const logger = this.logger.child('chunker');
         
-        // --- Configuration ---
-        const MAX_TOKENS = 1000;
-        const MIN_TOKENS = 150;      // 💡 Merges "OpenAI-compatible" sentence into the next block
+        // --- Configuration (character-based, ~4 chars ≈ 1 token) ---
+        const MAX_CHARS = 4000;
+        const MIN_CHARS = 600;       // 💡 Merges short sections into the next block
         const OVERLAP_PERCENT = 0.1; // 10% overlap for large splits
         
         const chunks: DocumentChunk[] = [];
@@ -2033,7 +2225,10 @@ export class ContentProcessor {
             // to searches for parent topics even if the body doesn't mention them.
             const breadcrumbs = hierarchy.filter(h => h).join(" > ");
             const contextPrefix = breadcrumbs ? `[Topic: ${breadcrumbs}]\n` : "";
-            const searchableText = contextPrefix + content.trim();
+            // Sanitize before hashing so the id and the stored text always agree:
+            // an unpaired surrogate (from a split pair, or straight from the
+            // source) makes the JSON body invalid and the write fails.
+            const searchableText = Utils.stripLoneSurrogates(contextPrefix + content.trim());
             const chunkId = Utils.generateHash(searchableText);
             
             const chunk: DocumentChunk = {
@@ -2056,39 +2251,41 @@ export class ContentProcessor {
     
         /**
          * Flushes the current buffer into the chunks array.
-         * Uses sub-splitting logic if the buffer exceeds MAX_TOKENS.
+         * Uses sub-splitting logic if the buffer exceeds MAX_CHARS.
          */
         const flushBuffer = (force = false) => {
             const trimmedBuffer = buffer.trim();
             if (!trimmedBuffer) return;
-    
-            const tokenCount = Utils.tokenize(trimmedBuffer).length;
-    
+
+            const charCount = trimmedBuffer.length;
+
             // 💡 SEMANTIC MERGING
             // If the current section is too short (like just a title or a one-liner),
             // we don't flush yet unless it's the end of the file (force=true).
-            if (tokenCount < MIN_TOKENS && !force) {
-                return; 
+            if (charCount < MIN_CHARS && !force) {
+                return;
             }
-    
+
             // Compute the appropriate topic hierarchy for merged content
             const topicHierarchy = computeTopicHierarchy();
-    
-            if (tokenCount > MAX_TOKENS) {
-                // 💡 RECURSIVE OVERLAP SPLITTING
+
+            if (charCount > MAX_CHARS) {
+                // 💡 OVERLAP SPLITTING
                 // If the section is a massive guide, split it but keep headers on every sub-piece.
-                const tokens = Utils.tokenize(trimmedBuffer);
-                const overlapSize = Math.floor(MAX_TOKENS * OVERLAP_PERCENT);
-                
-                for (let i = 0; i < tokens.length; i += (MAX_TOKENS - overlapSize)) {
-                    const subTokens = tokens.slice(i, i + MAX_TOKENS);
-                    const subContent = subTokens.join("");
+                const overlapSize = Math.floor(MAX_CHARS * OVERLAP_PERCENT);
+
+                for (let i = 0; i < trimmedBuffer.length; i += (MAX_CHARS - overlapSize)) {
+                    // Slice on code points, not code units: a boundary falling
+                    // inside a surrogate pair (emoji, some CJK) would leave a
+                    // lone surrogate, which Qdrant's JSON parser rejects — the
+                    // chunk then fails to store and is silently lost.
+                    const subContent = Utils.sliceSafe(trimmedBuffer, i, i + MAX_CHARS);
                     chunks.push(createDocumentChunk(subContent, topicHierarchy));
                 }
             } else {
                 chunks.push(createDocumentChunk(trimmedBuffer, topicHierarchy));
             }
-            
+
             buffer = ""; // Reset buffer after successful flush
             bufferHeadings = []; // Reset tracked headings
         };
@@ -2109,9 +2306,9 @@ export class ContentProcessor {
                     .trim();
                 
                 // Check if we should merge with previous content
-                const currentTokenCount = Utils.tokenize(buffer.trim()).length;
-                const hasBufferContent = currentTokenCount > 0;
-                const bufferIsSmall = currentTokenCount < MIN_TOKENS;
+                const currentCharCount = buffer.trim().length;
+                const hasBufferContent = currentCharCount > 0;
+                const bufferIsSmall = currentCharCount < MIN_CHARS;
                 
                 // Only merge if:
                 // 1. Buffer has content and is small
@@ -2142,7 +2339,7 @@ export class ContentProcessor {
                 buffer += `${line}\n`;
                 
                 // Safety valve: if a single section is huge, flush it periodically
-                if (Utils.tokenize(buffer).length >= MAX_TOKENS) {
+                if (buffer.length >= MAX_CHARS) {
                     flushBuffer();
                 }
             }

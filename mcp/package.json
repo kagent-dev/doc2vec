@@ -1,6 +1,6 @@
 {
   "name": "sqlite-vec-mcp-server",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "MCP Server for querying documentation with sqlite-vec",
   "main": "build/index.js",
   "type": "module",
@@ -24,14 +24,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@azure/identity": "^4.10.2",
+    "@azure/identity": "^4.13.1",
     "@azure/openai": "^2.0.0",
     "@google/generative-ai": "^0.24.1",
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.25.3",
     "@qdrant/js-client-rest": "^1.15.0",
     "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.7",
-    "express": "^5.1.0",
+    "express": "^5.2.1",
     "openai": "^4.104.0",
     "sqlite-vec": "0.1.7-alpha.2",
     "zod": "^3.24.2"

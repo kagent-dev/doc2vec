@@ -15,20 +15,25 @@ import { Logger, LogLevel } from './logger';
 import { Utils } from './utils';
 import { DatabaseManager } from './database';
 import { ContentProcessor } from './content-processor';
-import { 
-    Config, 
-    SourceConfig, 
-    GithubSourceConfig, 
-    WebsiteSourceConfig, 
+import {
+    Config,
+    SourceConfig,
+    GithubSourceConfig,
+    WebsiteSourceConfig,
     LocalDirectorySourceConfig,
     CodeSourceConfig,
     ZendeskSourceConfig,
+    S3SourceConfig,
     DatabaseConnection,
     DocumentChunk,
     BrokenLink,
     EmbeddingConfig,
-    MarkdownStoreConfig
+    MarkdownStoreConfig,
+    SourceRunStats,
+    SourceRunCounters,
+    newSourceRunCounters
 } from './types';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { MarkdownStore } from './markdown-store';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
@@ -46,6 +51,9 @@ export class Doc2Vec {
     private configDir: string;
     private brokenLinksByWebsite: Record<string, BrokenLink[]> = {};
     private markdownStore: MarkdownStore | undefined;
+    // Change counters for the source currently being processed by run().
+    // Sources are processed sequentially, so a single slot is sufficient.
+    private counters: SourceRunCounters = newSourceRunCounters('items');
 
     constructor(configPath: string) {
         this.logger = new Logger('Doc2Vec', {
@@ -87,15 +95,19 @@ export class Doc2Vec {
         } else {
             const openaiApiKey = embeddingConfig.openai?.api_key || process.env.OPENAI_API_KEY;
             const openaiModel = embeddingConfig.openai?.model || process.env.OPENAI_MODEL || 'text-embedding-3-large';
-            
+            const openaiBaseURL = embeddingConfig.openai?.base_url || process.env.OPENAI_BASE_URL;
+
             if (!openaiApiKey) {
                 this.logger.error('OpenAI requires api_key to be configured');
                 process.exit(1);
             }
-            
-            this.openai = new OpenAI({ apiKey: openaiApiKey });
+
+            this.openai = new OpenAI({
+                apiKey: openaiApiKey,
+                ...(openaiBaseURL && { baseURL: openaiBaseURL }),
+            });
             this.embeddingModel = openaiModel;
-            this.logger.info(`Using OpenAI with model: ${openaiModel} (${this.embeddingDimension} dimensions)`);
+            this.logger.info(`Using OpenAI with model: ${openaiModel} (${this.embeddingDimension} dimensions)${openaiBaseURL ? ` via ${openaiBaseURL}` : ''}`);
         }
         
         this.contentProcessor = new ContentProcessor(this.logger);
@@ -168,32 +180,95 @@ export class Doc2Vec {
         return parsedValue;
     }
 
-    public async run(): Promise<void> {
+    /**
+     * Sync sources sequentially. An optional selection restricts the run to a
+     * subset of the config's sources: `indices` are 0-based positions in the
+     * config's sources list (exact — the only unambiguous identifier, since
+     * product names can repeat), and `names` match every source with that
+     * product_name. The union of both is processed, in config order.
+     */
+    public async run(selection?: { indices?: number[]; names?: string[] }): Promise<SourceRunStats[]> {
+        let sources = this.config.sources;
+        const wantedIndices = selection?.indices ?? [];
+        const wantedNames = selection?.names ?? [];
+        if (wantedIndices.length > 0 || wantedNames.length > 0) {
+            const badIndices = wantedIndices.filter(i => !Number.isInteger(i) || i < 0 || i >= this.config.sources.length);
+            if (badIndices.length > 0) {
+                throw new Error(`Source index out of range: ${badIndices.join(', ')} (config has ${this.config.sources.length} sources)`);
+            }
+            const known = new Set(this.config.sources.map(s => s.product_name));
+            const unknown = wantedNames.filter(name => !known.has(name));
+            if (unknown.length > 0) {
+                throw new Error(`Unknown source(s): ${unknown.join(', ')}. Available: ${[...known].join(', ')}`);
+            }
+            const nameSet = new Set(wantedNames);
+            const indexSet = new Set(wantedIndices);
+            sources = this.config.sources.filter((s, i) => indexSet.has(i) || nameSet.has(s.product_name));
+            const label = sources.map(s => `${s.product_name} (${s.type})`).join(', ');
+            this.logger.info(`Source filter active: syncing ${sources.length} of ${this.config.sources.length} sources: ${label}`);
+        }
+
         // Initialize Postgres markdown store table if configured
         if (this.markdownStore) {
             await this.markdownStore.init();
         }
 
         this.logger.section('PROCESSING SOURCES');
-        
-        for (const sourceConfig of this.config.sources) {
+
+        const runStats: SourceRunStats[] = [];
+
+        for (const sourceConfig of sources) {
             const sourceLogger = this.logger.child(`source:${sourceConfig.product_name}`);
-            
+
             sourceLogger.info(`Processing ${sourceConfig.type} source for ${sourceConfig.product_name}@${sourceConfig.version}`);
-            
-            if (sourceConfig.type === 'github') {
-                await this.processGithubRepo(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'website') {
-                await this.processWebsite(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'local_directory') {
-                await this.processLocalDirectory(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'code') {
-                await this.processCodeSource(sourceConfig, sourceLogger);
-            } else if (sourceConfig.type === 'zendesk') {
-                await this.processZendesk(sourceConfig, sourceLogger);
-            } else {
-                sourceLogger.error(`Unknown source type: ${(sourceConfig as any).type}`);
+
+            const startTime = Date.now();
+            let ok = true;
+            let errorMessage: string | undefined;
+
+            const itemsKindByType: Record<string, string> = {
+                website: 'pages',
+                github: 'issues',
+                local_directory: 'files',
+                code: 'files',
+                s3: 'objects',
+                zendesk: 'items',
+            };
+            this.counters = newSourceRunCounters(itemsKindByType[sourceConfig.type] ?? 'items');
+
+            try {
+                if (sourceConfig.type === 'github') {
+                    await this.processGithubRepo(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'website') {
+                    await this.processWebsite(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'local_directory') {
+                    await this.processLocalDirectory(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'code') {
+                    await this.processCodeSource(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 'zendesk') {
+                    await this.processZendesk(sourceConfig, sourceLogger);
+                } else if (sourceConfig.type === 's3') {
+                    await this.processS3(sourceConfig, sourceLogger);
+                } else {
+                    ok = false;
+                    errorMessage = `Unknown source type: ${(sourceConfig as any).type}`;
+                    sourceLogger.error(errorMessage);
+                }
+            } catch (error) {
+                ok = false;
+                errorMessage = error instanceof Error ? error.message : String(error);
+                sourceLogger.error(`Failed to process ${sourceConfig.type} source for ${sourceConfig.product_name}:`, error);
             }
+
+            runStats.push({
+                product_name: sourceConfig.product_name,
+                type: sourceConfig.type,
+                version: sourceConfig.version,
+                duration_ms: Date.now() - startTime,
+                ok,
+                ...(errorMessage && { error: errorMessage }),
+                counters: this.counters
+            });
         }
 
         // Close the Postgres markdown store connection pool
@@ -202,6 +277,9 @@ export class Doc2Vec {
         }
 
         this.logger.section('PROCESSING COMPLETE');
+        this.logger.event('run-summary', { sources: runStats });
+
+        return runStats;
     }
 
     private async fetchAndProcessGitHubIssues(repo: string, sourceConfig: GithubSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
@@ -210,27 +288,40 @@ export class Doc2Vec {
         
         // Initialize metadata storage if needed
         await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
-        
+        // Capture timestamp at the start so issues updated during sync are re-processed next run
+        const syncStartDate = new Date().toISOString();
+
         // Get the last run date from the database
         const startDate = sourceConfig.start_date || '2025-01-01';
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, repo, `${startDate}T00:00:00Z`, logger);
 
-        const fetchWithRetry = async (url: string, params = {}, retries = 5, delay = 5000): Promise<any> => {
+        // Retryable: 5xx, 429, rate-limited 403s, and network/timeout errors.
+        // Everything else is deterministic — the same request fails identically,
+        // so retrying only burns wall-clock. In particular a 422 from deep
+        // page-number pagination used to cost ~75s of backoff before failing.
+        const isRetryableStatus = (status: number | undefined): boolean =>
+            status === undefined || status >= 500 || status === 429;
+
+        const requestWithRetry = async (url: string, params?: Record<string, any>, retries = 5, delay = 5000): Promise<any> => {
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
                     // Only log on retries to reduce noise during pagination
                     if (attempt > 0) {
                         logger.debug(`GitHub API retry: ${url} (attempt ${attempt + 1}/${retries})`);
                     }
+                    // Callers need the response headers (Link) for cursor
+                    // pagination, so the whole response is returned.
                     const response = await axios.get(url, {
                         headers: {
                             Authorization: `token ${GITHUB_TOKEN}`,
                             Accept: 'application/vnd.github.v3+json',
                         },
-                        params,
+                        // Subsequent pages come from a Link URL that already
+                        // carries its query string — adding params would duplicate it
+                        ...(params && { params }),
                         timeout: 30000, // 30 second timeout
                     });
-                    return response.data;
+                    return response;
                 } catch (error: any) {
                     // Enhanced error logging for debugging
                     const errorDetails = {
@@ -267,6 +358,14 @@ export class Doc2Vec {
                             logger.error(`GitHub API returned 403 (not rate limit): ${error.message}`);
                             throw error;
                         }
+                    } else if (!isRetryableStatus(error.response?.status)) {
+                        // Deterministic failure (422, 404, 401, ...) — surface the
+                        // API's own message, which explains what to do instead.
+                        const apiMessage = error.response?.data?.message;
+                        logger.error(
+                            `GitHub API returned ${error.response.status} (not retryable): ${apiMessage || error.message}`
+                        );
+                        throw error;
                     } else {
                         // For non-403 errors, wait before retrying (exponential backoff)
                         if (attempt < retries - 1) {
@@ -283,44 +382,97 @@ export class Doc2Vec {
             throw new Error('Max retries reached');
         };
 
+        /**
+         * Walk every issue updated since `sinceDate` by following GitHub's
+         * `Link: rel="next"` cursor URLs.
+         *
+         * Page-number pagination (`?page=N`) cannot be used here: GitHub caps it
+         * on this endpoint and answers HTTP 422 ("Pagination with the page
+         * parameter is not supported for large datasets, please use cursor based
+         * pagination") once the offset grows past its limit. That limit is well
+         * below the size of a full-window rebuild on a busy repo, so page-based
+         * paging aborted the whole source and left the collection empty. The
+         * Link URL already contains the opaque `after=` cursor and is passed
+         * through verbatim.
+         */
         const fetchAllIssues = async (sinceDate: string): Promise<any[]> => {
             let issues: any[] = [];
-            let page = 1;
-            const perPage = 100;
-            const sinceTimestamp = new Date(sinceDate);
+            // sort=updated&direction=asc makes the walk stable: results are
+            // ordered by the same field `since` filters on, so a page boundary
+            // can't shuffle items in or out mid-walk.
+            let url: string | null = GITHUB_API_URL;
+            let params: Record<string, any> | undefined = {
+                per_page: 100,
+                state: 'all',
+                since: sinceDate,
+                sort: 'updated',
+                direction: 'asc',
+            };
+            let page = 0;
 
-            while (true) {
+            while (url) {
+                page++;
                 // Log progress every 10 pages to reduce noise
                 if (page === 1 || page % 10 === 0) {
                     logger.debug(`Fetching issues page ${page}... (${issues.length} issues so far)`);
                 }
-                
-                const data = await fetchWithRetry(GITHUB_API_URL, {
-                    per_page: perPage,
-                    page,
-                    state: 'all',
-                    since: sinceDate,
-                });
 
-                if (data.length === 0) break;
+                const response = await requestWithRetry(url, params);
+                const data = response.data;
+                if (!Array.isArray(data)) {
+                    logger.warn(`Unexpected non-array response while paginating issues for ${repo}; stopping the walk`);
+                    break;
+                }
 
-                const filtered = data.filter((issue: any) => new Date(issue.created_at) >= sinceTimestamp);
-                issues = issues.concat(filtered);
+                // The `since` param already scopes results to issues whose
+                // updated_at is after sinceDate — i.e. anything created, closed,
+                // reopened, edited, or newly commented since the last run. Do NOT
+                // re-filter by created_at: an old issue that was just closed or
+                // received a new comment has an old created_at and would be
+                // dropped, leaving its status and comments permanently stale.
+                issues = issues.concat(data);
 
-                if (filtered.length < data.length) break;
-                page++;
+                const nextUrl = Utils.parseNextLink(response.headers?.link ?? response.headers?.Link);
+                // Guard against a server echoing the same cursor forever
+                if (!nextUrl || nextUrl === url) break;
+                url = nextUrl;
+                params = undefined; // the cursor URL is already fully-formed
             }
+
+            logger.info(`Fetched ${issues.length} issues/PRs for ${repo} across ${page} page(s)`);
             return issues;
         };
 
         const fetchIssueComments = async (issueNumber: number): Promise<any[]> => {
-            const url = `${GITHUB_API_URL}/${issueNumber}/comments`;
-            return await fetchWithRetry(url);
+            // GitHub returns 30 comments per page by default and paginates the
+            // rest behind Link headers; requesting the first page only silently
+            // truncated long discussions, so the stored chunks were missing the
+            // newest comments.
+            const comments: any[] = [];
+            let url: string | null = `${GITHUB_API_URL}/${issueNumber}/comments`;
+            let params: Record<string, any> | undefined = { per_page: 100 };
+
+            while (url) {
+                const response = await requestWithRetry(url, params);
+                if (!Array.isArray(response.data)) break;
+                comments.push(...response.data);
+
+                const nextUrl = Utils.parseNextLink(response.headers?.link ?? response.headers?.Link);
+                if (!nextUrl || nextUrl === url) break;
+                url = nextUrl;
+                params = undefined;
+            }
+            return comments;
         };
 
         const generateMarkdownForIssue = async (issue: any): Promise<string> => {
             const comments = await fetchIssueComments(issue.number);
-            let md = `# Issue #${issue.number}: ${issue.title}\n\n`;
+            // This endpoint returns both issues and pull requests; only PRs carry
+            // a `pull_request` object. Labelling every item "Issue #N" made
+            // retrieved PR chunks read as issues, so use the real kind.
+            const itemLabel = issue.pull_request ? 'PR' : 'Issue';
+            let md = `# ${itemLabel} #${issue.number}: ${issue.title}\n\n`;
+            md += `- **Type:** ${issue.pull_request ? 'Pull request' : 'Issue'}\n`;
             md += `- **Author:** ${issue.user.login}\n`;
             md += `- **State:** ${issue.state}\n`;
             md += `- **Created on:** ${new Date(issue.created_at).toDateString()}\n`;
@@ -338,6 +490,10 @@ export class Doc2Vec {
 
             return md;
         };
+
+        // Chunks that could not be stored (e.g. a rejected Qdrant upsert).
+        // Tallied across all issues and escalated once the walk completes.
+        let failedChunks = 0;
 
         // Process a single issue and store its chunks
         const processIssue = async (issue: any): Promise<void> => {
@@ -358,7 +514,26 @@ export class Doc2Vec {
             
             const chunks = await this.contentProcessor.chunkMarkdown(markdown, issueConfig, url);
             logger.info(`Issue #${issueNumber}: Created ${chunks.length} chunks`);
-            
+
+            // Purge the issue's existing chunks before inserting the fresh set.
+            // chunk_id is a content hash, so when an issue changes (closed/reopened,
+            // edited, new comments) the regenerated chunks get new ids and the old
+            // ones would otherwise linger — leaving stale state ("open") and missing
+            // the latest comments in search results. All chunks for an issue share
+            // its unique url, so delete-by-url reconciles them exactly.
+            let removedChunks = 0;
+            if (dbConnection.type === 'sqlite') {
+                removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+            } else if (dbConnection.type === 'qdrant') {
+                removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+            }
+            if (removedChunks > 0) {
+                this.counters.items_updated++;
+                this.counters.chunks_deleted += removedChunks;
+            } else {
+                this.counters.items_new++;
+            }
+
             // Process and store each chunk immediately
             for (const chunk of chunks) {
                 const chunkHash = Utils.generateHash(chunk.content);
@@ -376,6 +551,7 @@ export class Doc2Vec {
                     const embeddings = await this.createEmbeddings([chunk.content]);
                     if (embeddings.length) {
                         DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
+                        this.counters.chunks_added++;
                         logger.debug(`Stored chunk ${chunkId} in SQLite`);
                     } else {
                         logger.error(`Embedding failed for chunk: ${chunkId}`);
@@ -406,12 +582,17 @@ export class Doc2Vec {
                         const embeddings = await this.createEmbeddings([chunk.content]);
                         if (embeddings.length) {
                             await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
+                            this.counters.chunks_added++;
                             logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
                         } else {
                             logger.error(`Embedding failed for chunk: ${chunkId}`);
                         }
                     } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
+                        // Keep going so one bad chunk can't cost the whole repo,
+                        // but remember it: the count is escalated below so the run
+                        // fails and the last-run date is not advanced.
+                        failedChunks++;
+                        logger.error(`Error processing chunk ${chunkId} for ${url} in Qdrant:`, error);
                     }
                 }
             }
@@ -427,9 +608,18 @@ export class Doc2Vec {
             await processIssue(issues[i]);
         }
 
+        // A chunk that failed to store is silent data loss, so refuse to advance
+        // the last-run date: the next run reprocesses this window instead of
+        // treating the gap as synced. Everything that did store is kept.
+        if (failedChunks > 0) {
+            throw new Error(
+                `${failedChunks} chunk(s) failed to store for ${repo}; not advancing the last-run date so the next run retries them`
+            );
+        }
+
         // Update the last run date in the database after processing all issues
-        await DatabaseManager.updateLastRunDate(dbConnection, repo, logger, this.embeddingDimension);
-        
+        await DatabaseManager.updateLastRunDate(dbConnection, repo, logger, this.embeddingDimension, syncStartDate);
+
         logger.info(`Successfully processed ${issues.length} issues`);
     }
 
@@ -561,18 +751,39 @@ export class Doc2Vec {
 
         logger.section('CLEANUP');
 
-        // Remove 404 URLs from the Postgres markdown store
-        if (useMarkdownStore && crawlResult.notFoundUrls && crawlResult.notFoundUrls.size > 0) {
-            logger.info(`Removing ${crawlResult.notFoundUrls.size} not-found URLs from markdown store`);
+        // Remove URLs that returned 404 during the crawl. A 404 is a definitive
+        // "this page is gone" signal (network errors fall through to full
+        // processing and never land here), so we purge these unconditionally —
+        // even when hasNetworkErrors below skips the broad obsolete cleanup.
+        if (crawlResult.notFoundUrls && crawlResult.notFoundUrls.size > 0) {
+            logger.info(`Removing ${crawlResult.notFoundUrls.size} not-found (404) URLs`);
             for (const url of crawlResult.notFoundUrls) {
+                // Postgres markdown store
+                if (useMarkdownStore) {
+                    try {
+                        await this.markdownStore!.deleteMarkdown(url);
+                    } catch (pgError) {
+                        logger.error(`Failed to delete markdown from Postgres for ${url}:`, pgError);
+                    }
+                }
+                // Vector DB chunks
                 try {
-                    await this.markdownStore!.deleteMarkdown(url);
-                } catch (pgError) {
-                    logger.error(`Failed to delete markdown from Postgres for ${url}:`, pgError);
+                    let removedChunks = 0;
+                    if (dbConnection.type === 'sqlite') {
+                        removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                    } else if (dbConnection.type === 'qdrant') {
+                        removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                    }
+                    if (removedChunks > 0) {
+                        this.counters.items_deleted++;
+                        this.counters.chunks_deleted += removedChunks;
+                    }
+                } catch (dbError) {
+                    logger.error(`Failed to delete chunks for 404 URL ${url}:`, dbError);
                 }
             }
         }
-        
+
         if (crawlResult.hasNetworkErrors) {
             logger.warn('Skipping cleanup due to network errors encountered during crawling. This prevents removal of valid chunks when the site is temporarily unreachable.');
         } else {
@@ -584,13 +795,16 @@ export class Doc2Vec {
                 await DatabaseManager.setMetadataValue(dbConnection, syncCompleteKey, 'true', logger, this.embeddingDimension);
                 logger.info('Full sync completed successfully — subsequent runs will use normal caching');
             }
+            let removed = { items: 0, chunks: 0 };
             if (dbConnection.type === 'sqlite') {
                 logger.info(`Running SQLite cleanup for ${urlPrefix}`);
-                DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);
+                removed = DatabaseManager.removeObsoleteChunksSQLite(dbConnection.db, visitedUrls, urlPrefix, logger);
             } else if (dbConnection.type === 'qdrant') {
                 logger.info(`Running Qdrant cleanup for ${urlPrefix} in collection ${dbConnection.collectionName}`);
-                await DatabaseManager.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
+                removed = await DatabaseManager.removeObsoleteChunksQdrant(dbConnection, visitedUrls, urlPrefix, logger);
             }
+            this.counters.items_deleted += removed.items;
+            this.counters.chunks_deleted += removed.chunks;
         }
 
         logger.info(`Finished processing website: ${config.url}`);
@@ -613,7 +827,11 @@ export class Doc2Vec {
     }
 
     private writeBrokenLinksReport(): void {
-        const reportPath = path.join(this.configDir, '404.yaml');
+        // The default (next to the config file) breaks when the config lives on
+        // a read-only mount (e.g. a Kubernetes ConfigMap in controller mode) —
+        // DOC2VEC_REPORT_DIR points the report somewhere writable instead.
+        const reportDir = process.env.DOC2VEC_REPORT_DIR || this.configDir;
+        const reportPath = path.join(reportDir, '404.yaml');
         const orderedEntries = Object.entries(this.brokenLinksByWebsite)
             .sort(([a], [b]) => a.localeCompare(b));
         const reportPayload = orderedEntries.map(([website, links]) => ({
@@ -690,15 +908,240 @@ export class Doc2Vec {
         );
         
         logger.section('CLEANUP');
+        let removed = { items: 0, chunks: 0 };
         if (dbConnection.type === 'sqlite') {
             logger.info(`Running SQLite cleanup for local directory ${config.path}`);
-            DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config, logger);
+            removed = DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, config, logger);
         } else if (dbConnection.type === 'qdrant') {
             logger.info(`Running Qdrant cleanup for local directory ${config.path} in collection ${dbConnection.collectionName}`);
-            await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, config, logger);
+            removed = await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, config, logger);
         }
-        
+        this.counters.items_deleted += removed.items;
+        this.counters.chunks_deleted += removed.chunks;
+
         logger.info(`Finished processing local directory: ${config.path}`);
+    }
+
+    private async processS3(config: S3SourceConfig, parentLogger: Logger): Promise<void> {
+        const logger = parentLogger.child('process');
+        logger.info(`Starting processing for S3 bucket: ${config.bucket}${config.prefix ? ` (prefix: ${config.prefix})` : ''}`);
+
+        const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
+        await DatabaseManager.initDatabaseMetadata(dbConnection, logger);
+        const processedFiles: Set<string> = new Set();
+        // Capture timestamp at the start so objects modified during sync are re-processed next run
+        const syncStartTimestamp = Date.now();
+
+        const s3Client = new S3Client({
+            region: config.region || process.env.AWS_DEFAULT_REGION || 'us-east-1',
+            ...(config.endpoint ? { endpoint: config.endpoint, forcePathStyle: true } : {})
+        });
+
+        // Metadata keys for incremental sync
+        const sanitizedPrefix = (config.prefix || '').replace(/[^a-zA-Z0-9]+/g, '_');
+        const bucketKey = `${config.bucket}_${sanitizedPrefix}`;
+        const lastSyncKey = `s3_last_sync_${bucketKey}`;
+        const fileListKey = `s3_filelist_${bucketKey}`;
+
+        const lastSyncValue = await DatabaseManager.getMetadataValue(dbConnection, lastSyncKey, '0', logger);
+        const lastSyncTimestamp = parseInt(lastSyncValue || '0', 10);
+
+        const includeExtensions = config.include_extensions || ['.md', '.txt', '.html', '.htm', '.pdf', '.doc', '.docx'];
+        const excludeExtensions = config.exclude_extensions || [];
+        const encoding = config.encoding || 'utf8' as BufferEncoding;
+
+        // List all matching objects
+        logger.section('S3 OBJECT LISTING');
+        const allObjects: Array<{ key: string; lastModified: Date; size: number }> = [];
+        let continuationToken: string | undefined;
+
+        do {
+            const response = await s3Client.send(new ListObjectsV2Command({
+                Bucket: config.bucket,
+                Prefix: config.prefix || undefined,
+                ContinuationToken: continuationToken,
+            }));
+
+            for (const obj of response.Contents || []) {
+                if (!obj.Key || obj.Key.endsWith('/')) continue; // skip folder markers
+
+                const extension = path.extname(obj.Key).toLowerCase();
+
+                if (excludeExtensions.includes(extension)) continue;
+                if (includeExtensions.length > 0 && !includeExtensions.includes(extension)) continue;
+
+                allObjects.push({
+                    key: obj.Key,
+                    lastModified: obj.LastModified!,
+                    size: obj.Size || 0,
+                });
+            }
+
+            continuationToken = response.NextContinuationToken;
+        } while (continuationToken);
+
+        logger.info(`Found ${allObjects.length} matching objects in S3 bucket`);
+
+        // Process objects
+        logger.section('S3 FILE PROCESSING AND EMBEDDING');
+        let processedCount = 0;
+        let skippedCount = 0;
+
+        for (const obj of allObjects) {
+            processedFiles.add(obj.key);
+
+            // Incremental check: skip if object hasn't been modified since last sync
+            if (lastSyncTimestamp > 0 && obj.lastModified.getTime() <= lastSyncTimestamp) {
+                logger.debug(`Skipping unchanged object: ${obj.key}`);
+                skippedCount++;
+                continue;
+            }
+
+            // Size check
+            if (obj.size > config.max_size) {
+                logger.warn(`Object ${obj.key} (${obj.size} bytes) exceeds max_size (${config.max_size}). Skipping.`);
+                skippedCount++;
+                continue;
+            }
+
+            logger.info(`Processing S3 object: ${obj.key} (${obj.size} bytes)`);
+
+            try {
+                const getResponse = await s3Client.send(new GetObjectCommand({
+                    Bucket: config.bucket,
+                    Key: obj.key,
+                }));
+
+                const extension = path.extname(obj.key).toLowerCase();
+                let content: string;
+
+                const binaryExtensions = ['.pdf', '.doc', '.docx'];
+                if (binaryExtensions.includes(extension)) {
+                    // Binary files: write to temp file and convert
+                    const bodyBytes = await getResponse.Body!.transformToByteArray();
+                    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 's3-doc2vec-'));
+                    const tempFilePath = path.join(tempDir, path.basename(obj.key));
+                    try {
+                        fs.writeFileSync(tempFilePath, Buffer.from(bodyBytes));
+                        content = await this.contentProcessor.convertFileToMarkdown(tempFilePath, extension, logger);
+                    } finally {
+                        // Cleanup temp files
+                        try { fs.unlinkSync(tempFilePath); } catch {}
+                        try { fs.rmdirSync(tempDir); } catch {}
+                    }
+                } else if (extension === '.html' || extension === '.htm') {
+                    // HTML files: write to temp, convert via contentProcessor
+                    const bodyString = await getResponse.Body!.transformToString(encoding);
+                    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 's3-doc2vec-'));
+                    const tempFilePath = path.join(tempDir, path.basename(obj.key));
+                    try {
+                        fs.writeFileSync(tempFilePath, bodyString, { encoding });
+                        content = await this.contentProcessor.convertFileToMarkdown(tempFilePath, extension, logger);
+                    } finally {
+                        try { fs.unlinkSync(tempFilePath); } catch {}
+                        try { fs.rmdirSync(tempDir); } catch {}
+                    }
+                } else {
+                    // Text files: read directly as string
+                    content = await getResponse.Body!.transformToString(encoding);
+                }
+
+                if (content.length > config.max_size) {
+                    logger.warn(`Processed content for ${obj.key} (${content.length} chars) exceeds max_size. Skipping.`);
+                    skippedCount++;
+                    continue;
+                }
+
+                // Generate URL
+                let fileUrl: string;
+                if (config.url_rewrite_prefix) {
+                    const prefix = config.url_rewrite_prefix.endsWith('/')
+                        ? config.url_rewrite_prefix.slice(0, -1)
+                        : config.url_rewrite_prefix;
+                    const relativePath = config.prefix
+                        ? obj.key.substring(config.prefix.length).replace(/^\//, '')
+                        : obj.key;
+                    fileUrl = `${prefix}/${relativePath}`;
+                } else {
+                    fileUrl = `s3://${config.bucket}/${obj.key}`;
+                }
+
+                // Resolve metadata(...) references in product_name and version
+                const s3Meta = getResponse.Metadata || {};
+                const resolvedConfig = {
+                    ...config,
+                    product_name: this.resolveS3MetadataValue(config.product_name, s3Meta),
+                    version: this.resolveS3MetadataValue(config.version, s3Meta),
+                };
+
+                const chunks = await this.contentProcessor.chunkMarkdown(content, resolvedConfig, fileUrl);
+                logger.info(`Created ${chunks.length} chunks for ${obj.key}`);
+
+                await this.processChunksForUrl(chunks, fileUrl, dbConnection, logger);
+                processedCount++;
+            } catch (error) {
+                logger.error(`Error processing S3 object ${obj.key}:`, error);
+            }
+        }
+
+        logger.info(`Processed: ${processedCount}, Skipped: ${skippedCount}`);
+
+        // Cleanup: remove chunks for deleted objects
+        logger.section('CLEANUP');
+        const previousListValue = await DatabaseManager.getMetadataValue(dbConnection, fileListKey, '[]', logger);
+        const previousList: string[] = previousListValue ? JSON.parse(previousListValue) : [];
+        const deletedKeys = previousList.filter(key => !processedFiles.has(key));
+
+        if (deletedKeys.length > 0) {
+            logger.info(`Removing chunks for ${deletedKeys.length} deleted objects`);
+            for (const deletedKey of deletedKeys) {
+                let fileUrl: string;
+                if (config.url_rewrite_prefix) {
+                    const prefix = config.url_rewrite_prefix.endsWith('/')
+                        ? config.url_rewrite_prefix.slice(0, -1)
+                        : config.url_rewrite_prefix;
+                    const relativePath = config.prefix
+                        ? deletedKey.substring(config.prefix.length).replace(/^\//, '')
+                        : deletedKey;
+                    fileUrl = `${prefix}/${relativePath}`;
+                } else {
+                    fileUrl = `s3://${config.bucket}/${deletedKey}`;
+                }
+
+                let removedChunks = 0;
+                if (dbConnection.type === 'sqlite') {
+                    removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, fileUrl, logger);
+                } else if (dbConnection.type === 'qdrant') {
+                    removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, fileUrl, logger);
+                }
+                if (removedChunks > 0) {
+                    this.counters.items_deleted++;
+                    this.counters.chunks_deleted += removedChunks;
+                }
+            }
+        }
+
+        // Persist sync state
+        const currentKeys = Array.from(processedFiles);
+        await DatabaseManager.setMetadataValue(dbConnection, fileListKey, JSON.stringify(currentKeys), logger, this.embeddingDimension);
+        await DatabaseManager.setMetadataValue(dbConnection, lastSyncKey, `${syncStartTimestamp}`, logger, this.embeddingDimension);
+
+        logger.info(`Finished processing S3 bucket: ${config.bucket}`);
+    }
+
+    /**
+     * Resolves a config value that may use the metadata(...) syntax.
+     * e.g. "metadata(x-amz-meta-product-name)" looks up "product-name" in the S3 object's user metadata.
+     * Returns the original value if no metadata(...) pattern is found.
+     * Returns empty string if the referenced metadata key doesn't exist on the object.
+     */
+    private resolveS3MetadataValue(configValue: string, s3Metadata: Record<string, string>): string {
+        const match = configValue.match(/^metadata\((.+)\)$/);
+        if (!match) return configValue;
+        const metaKey = match[1];
+        // AWS SDK returns user metadata keys without the x-amz-meta- prefix
+        const lookupKey = metaKey.replace(/^x-amz-meta-/, '');
+        return s3Metadata[lookupKey] ?? '';
     }
 
     private async processCodeSource(config: CodeSourceConfig, parentLogger: Logger): Promise<void> {
@@ -722,6 +1165,10 @@ export class Doc2Vec {
         let lastMtimeKey: string | undefined;
         let trackedFiles: Set<string> | undefined;
         let maxObservedMtime = 0;
+        // Set when a directory could not be listed: the files we saw are only a
+        // subset of what is on disk, so nothing may be treated as deleted and no
+        // "last scanned" marker may advance past this run
+        let scanIncomplete = false;
 
         if (config.source === 'local_directory') {
             if (!config.path) {
@@ -824,20 +1271,32 @@ export class Doc2Vec {
                 }
             );
 
+            scanIncomplete = scanResult.incomplete;
+            if (scanIncomplete) {
+                logger.error('Directory scan was incomplete — skipping cleanup so unscanned files keep their chunks');
+            }
+
             if (trackedFiles) {
                 maxObservedMtime = scanResult.maxMtime;
             }
         } finally {
             logger.section('CLEANUP');
 
-            if (incrementalMode) {
+            if (scanIncomplete) {
+                logger.warn('Skipping cleanup and last-scanned markers: the scan did not cover the whole tree');
+            } else if (incrementalMode) {
                 if (deleteUrls.length > 0) {
                     logger.info(`Cleaning up ${deleteUrls.length} deleted/renamed files`);
                     for (const url of deleteUrls) {
+                        let removedChunks = 0;
                         if (dbConnection.type === 'sqlite') {
-                            DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                            removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
                         } else if (dbConnection.type === 'qdrant') {
-                            await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                            removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        }
+                        if (removedChunks > 0) {
+                            this.counters.items_deleted++;
+                            this.counters.chunks_deleted += removedChunks;
                         }
                     }
                 } else {
@@ -852,10 +1311,15 @@ export class Doc2Vec {
 
                     for (const deletedFile of deletedFiles) {
                         const url = this.buildCodeFileUrl(deletedFile, basePath as string, config, repoUrlPrefix);
+                        let removedChunks = 0;
                         if (dbConnection.type === 'sqlite') {
-                            DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                            removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
                         } else if (dbConnection.type === 'qdrant') {
-                            await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                            removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                        }
+                        if (removedChunks > 0) {
+                            this.counters.items_deleted++;
+                            this.counters.chunks_deleted += removedChunks;
                         }
                     }
 
@@ -866,16 +1330,21 @@ export class Doc2Vec {
                     }
                 }
             } else {
+                let removed = { items: 0, chunks: 0 };
                 if (dbConnection.type === 'sqlite') {
                     logger.info(`Running SQLite cleanup for code source ${basePath}`);
-                    DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, cleanupPathConfig, logger);
+                    removed = DatabaseManager.removeObsoleteFilesSQLite(dbConnection.db, processedFiles, cleanupPathConfig, logger);
                 } else if (dbConnection.type === 'qdrant') {
                     logger.info(`Running Qdrant cleanup for code source ${basePath} in collection ${dbConnection.collectionName}`);
-                    await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, cleanupPathConfig, logger);
+                    removed = await DatabaseManager.removeObsoleteFilesQdrant(dbConnection, processedFiles, cleanupPathConfig, logger);
                 }
+                this.counters.items_deleted += removed.items;
+                this.counters.chunks_deleted += removed.chunks;
             }
 
-            if (config.source === 'github' && basePath && repoBranch) {
+            // Storing the SHA after an incomplete scan would make the next run
+            // diff from it and never revisit the files this run missed
+            if (config.source === 'github' && basePath && repoBranch && !scanIncomplete) {
                 const headSha = await this.getRepoHeadSha(basePath, logger);
                 if (headSha) {
                     const shaKey = this.buildCodeShaMetadataKey(config.repo as string, repoBranch);
@@ -891,6 +1360,12 @@ export class Doc2Vec {
                     logger.warn(`Failed to remove temporary repo at ${tempDir}:`, error);
                 }
             }
+        }
+
+        // Fail the source rather than reporting a partial ingest as a success —
+        // the collection is still serving whatever it had for the unscanned files
+        if (scanIncomplete) {
+            throw new Error(`Code scan of ${basePath} was incomplete: at least one directory could not be read`);
         }
 
         logger.info(`Finished processing code source (${config.source})`);
@@ -1092,11 +1567,20 @@ export class Doc2Vec {
     private async fetchAndProcessZendeskTickets(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
         const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2`;
         const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
-        
+        // Capture timestamp at the start so tickets updated during sync are re-processed next run
+        const syncStartDate = new Date().toISOString();
+
         // Get the last run date from the database
         const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, `${startDate}T00:00:00Z`, logger);
-        
+
+        // Status filter applied client-side (includes 'closed' by default so tickets
+        // transitioning to closed get updated rather than left stale)
+        const statusFilter = new Set(config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved', 'closed']);
+
+        const excludedOrgNames = new Set((config.excluded_organizations || []).map(n => n.toLowerCase()));
+        const excludedOrgIds = new Set<number>();
+
         const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
@@ -1106,16 +1590,19 @@ export class Doc2Vec {
                             'Content-Type': 'application/json',
                         },
                     });
-                    
-                    if (response.status === 429) {
-                        const retryAfter = parseInt(response.headers['retry-after'] || '60');
-                        logger.warn(`Rate limited, waiting ${retryAfter}s before retry`);
-                        await new Promise(res => setTimeout(res, retryAfter * 1000));
-                        continue;
-                    }
-                    
                     return response.data;
                 } catch (error: any) {
+                    // 403 is a permissions error — retrying won't help
+                    if (error.response?.status === 403) throw error;
+
+                    if (error.response?.status === 429) {
+                        const retryAfter = parseInt(error.response.headers?.['retry-after'] || '60', 10);
+                        logger.warn(`Rate limited by Zendesk, waiting ${retryAfter}s before retry`);
+                        await new Promise(res => setTimeout(res, retryAfter * 1000));
+                        attempt--; // Don't burn a retry on rate-limit waits
+                        continue;
+                    }
+
                     logger.error(`Zendesk API error (attempt ${attempt + 1}):`, error.message);
                     if (attempt === retries - 1) throw error;
                     await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
@@ -1145,15 +1632,19 @@ export class Doc2Vec {
             if (comments && comments.length > 0) {
                 md += `## Comments\n\n`;
                 for (const comment of comments) {
-                    if (comment.public) {
-                        md += `### ${comment.author_id} - ${new Date(comment.created_at).toDateString()}\n\n`;
-                        
-                        // Handle comment body
-                        const rawBody = comment.plain_body || comment.html_body || comment.body || '';
-                        const commentBody = rawBody.replace(/&nbsp;/g, " ") || '_No content._';
-                        
-                        md += `${commentBody}\n\n---\n\n`;
+                    // Skip non-public comments unless internal comments are explicitly enabled
+                    if (!comment.public && !config.include_internal_comments) {
+                        continue;
                     }
+
+                    const visibility = comment.public ? '' : ' (internal)';
+                    md += `### ${comment.author_id} - ${new Date(comment.created_at).toDateString()}${visibility}\n\n`;
+
+                    // Handle comment body
+                    const rawBody = comment.plain_body || comment.html_body || comment.body || '';
+                    const commentBody = rawBody.replace(/&nbsp;/g, " ") || '_No content._';
+
+                    md += `${commentBody}\n\n---\n\n`;
                 }
             } else {
                 md += `## Comments\n\n_No comments._\n`;
@@ -1165,118 +1656,163 @@ export class Doc2Vec {
         const processTicket = async (ticket: any): Promise<void> => {
             const ticketId = ticket.id;
             const url = `https://${config.zendesk_subdomain}.zendesk.com/agent/tickets/${ticketId}`;
-            
+
+            // Deleted tickets — remove their chunks and stop
+            if (ticket.status === 'deleted') {
+                logger.info(`Ticket #${ticketId} was deleted in Zendesk — removing its chunks`);
+                let removedChunks = 0;
+                if (dbConnection.type === 'sqlite') {
+                    removedChunks = DatabaseManager.removeChunksByUrlSQLite(dbConnection.db, url, logger);
+                } else {
+                    removedChunks = await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
+                }
+                if (removedChunks > 0) {
+                    this.counters.items_deleted++;
+                    this.counters.chunks_deleted += removedChunks;
+                }
+                return;
+            }
+
+            // Skip tickets belonging to excluded organizations
+            if (ticket.organization_id && excludedOrgIds.has(ticket.organization_id)) {
+                logger.debug(`Ticket #${ticketId} belongs to excluded organization ${ticket.organization_id} — skipping`);
+                return;
+            }
+
+            // Skip tickets whose status is outside the configured filter
+            if (!statusFilter.has(ticket.status)) {
+                logger.debug(`Ticket #${ticketId} has status '${ticket.status}' outside configured filter — skipping`);
+                return;
+            }
+
             logger.info(`Processing ticket #${ticketId}`);
-            
-            // Fetch ticket comments
-            const commentsUrl = `${baseUrl}/tickets/${ticketId}/comments.json`;
-            const commentsData = await fetchWithRetry(commentsUrl);
-            const comments = commentsData?.comments || [];
-            
+
+            // Fetch ticket comments. Zendesk returns at most 100 comments per page
+            // (ordered oldest-first), so follow next_page to capture the newest
+            // comments on tickets with more than 100 — otherwise they're silently dropped.
+            const comments: any[] = [];
+            let commentsUrl: string | null = `${baseUrl}/tickets/${ticketId}/comments.json`;
+            while (commentsUrl) {
+                const commentsData: any = await fetchWithRetry(commentsUrl);
+                comments.push(...(commentsData?.comments || []));
+                commentsUrl = commentsData?.next_page || null;
+                if (commentsUrl) await new Promise(res => setTimeout(res, 1000));
+            }
+
             // Generate markdown for the ticket
             const markdown = generateMarkdownForTicket(ticket, comments);
-            
+
             // Chunk the markdown content
             const ticketConfig = {
                 ...config,
                 product_name: config.product_name || `zendesk_${config.zendesk_subdomain}`,
                 max_size: config.max_size || Infinity
             };
-            
+
             const chunks = await this.contentProcessor.chunkMarkdown(markdown, ticketConfig, url);
             logger.info(`Ticket #${ticketId}: Created ${chunks.length} chunks`);
-            
-            // Process and store each chunk
-            for (const chunk of chunks) {
-                const chunkHash = Utils.generateHash(chunk.content);
-                const chunkId = chunk.metadata.chunk_id.substring(0, 8) + '...';
-                
-                if (dbConnection.type === 'sqlite') {
-                    const { checkHashStmt } = DatabaseManager.prepareSQLiteStatements(dbConnection.db);
-                    const existing = checkHashStmt.get(chunk.metadata.chunk_id) as { hash: string } | undefined;
-                    
-                    if (existing && existing.hash === chunkHash) {
-                        logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                        continue;
-                    }
 
-                    const embeddings = await this.createEmbeddings([chunk.content]);
-                    if (embeddings.length) {
-                        DatabaseManager.insertVectorsSQLite(dbConnection.db, chunk, embeddings[0], logger, chunkHash);
-                        logger.debug(`Stored chunk ${chunkId} in SQLite`);
-                    } else {
-                        logger.error(`Embedding failed for chunk: ${chunkId}`);
-                    }
-                } else if (dbConnection.type === 'qdrant') {
-                    try {
-                        let pointId: string;
-                        try {
-                            pointId = chunk.metadata.chunk_id;
-                            if (!Utils.isValidUuid(pointId)) {
-                                pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                            }
-                        } catch (e) {
-                            pointId = crypto.randomUUID();
-                        }
+            // Use processChunksForUrl which performs a URL-level diff:
+            // deletes all existing chunks for this URL before reinserting,
+            // so stale chunks from previous versions are never left behind.
+            await this.processChunksForUrl(chunks, url, dbConnection, logger);
+        };
 
-                        const existingPoints = await dbConnection.client.retrieve(dbConnection.collectionName, {
-                            ids: [pointId],
-                            with_payload: true,
-                            with_vector: false,
-                        });
-
-                        if (existingPoints.length > 0 && existingPoints[0].payload && existingPoints[0].payload.hash === chunkHash) {
-                            logger.info(`Skipping unchanged chunk: ${chunkId}`);
-                            continue;
-                        }
-                        
-                        const embeddings = await this.createEmbeddings([chunk.content]);
-                        if (embeddings.length) {
-                            await DatabaseManager.storeChunkInQdrant(dbConnection, chunk, embeddings[0], chunkHash);
-                            logger.debug(`Stored chunk ${chunkId} in Qdrant (${dbConnection.collectionName})`);
-                        } else {
-                            logger.error(`Embedding failed for chunk: ${chunkId}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Error processing chunk in Qdrant:`, error);
+        if (excludedOrgNames.size > 0) {
+            logger.info(`Resolving ${excludedOrgNames.size} excluded organization name(s) to IDs`);
+            const resolvedNames = new Set<string>();
+            let orgsUrl: string | null = `${baseUrl}/organizations.json?page[size]=100`;
+            while (orgsUrl) {
+                const orgsData: any = await fetchWithRetry(orgsUrl);
+                for (const org of orgsData?.organizations || []) {
+                    const orgName = (org.name || '').toLowerCase();
+                    if (excludedOrgNames.has(orgName)) {
+                        excludedOrgIds.add(org.id);
+                        resolvedNames.add(orgName);
                     }
+                }
+                orgsUrl = orgsData?.meta?.has_more ? orgsData?.links?.next : null;
+            }
+            logger.info(`Excluding tickets from ${excludedOrgIds.size} organization(s): ${[...excludedOrgIds].join(', ')}`);
+            const unresolved = [...excludedOrgNames].filter(name => !resolvedNames.has(name));
+            if (unresolved.length > 0) {
+                throw new Error(`Cannot resolve excluded organization(s): ${unresolved.join(', ')}. Aborting to avoid syncing data for them.`);
+            }
+        }
+
+        logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
+
+        // Build query parameters — use the status filter for the search query
+        const statusList = Array.from(statusFilter);
+        const statusClause = `status:${statusList.join(',status:')}`;
+
+        // Zendesk /search.json caps results at 1000 (10 pages * 100). Bisect the date range
+        // into smaller windows whenever a window would exceed that cap, so we never hit page 11.
+        let totalTickets = 0;
+        let failedTickets = 0;
+
+        const processResults = async (results: any[]) => {
+            for (const ticket of results) {
+                try {
+                    await processTicket(ticket);
+                    totalTickets++;
+                } catch (error: any) {
+                    failedTickets++;
+                    logger.error(`Failed to process ticket #${ticket.id}, will retry next run: ${error.message}`);
                 }
             }
         };
 
-        logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
-        
-        // Build query parameters
-        const statusFilter = config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved'];
-        const query = `updated>${lastRunDate.split('T')[0]} status:${statusFilter.join(',status:')}`;
-        
-        let nextPage = `${baseUrl}/search.json?query=${encodeURIComponent(query)}&sort_by=updated_at&sort_order=asc`;
-        let totalTickets = 0;
-        
-        while (nextPage) {
-            const data = await fetchWithRetry(nextPage);
-            const tickets = data.results || [];
-            
-            logger.info(`Processing batch of ${tickets.length} tickets`);
-            
-            for (const ticket of tickets) {
-                await processTicket(ticket);
-                totalTickets++;
+        // Work queue of [start, end) date windows (ISO strings). Seed with [lastRunDate, syncStartDate).
+        const windows: Array<[string, string]> = [[lastRunDate, syncStartDate]];
+        const MAX_PER_WINDOW = 1000;
+
+        while (windows.length > 0) {
+            const [wStart, wEnd] = windows.shift()!;
+            const q = `updated>${wStart} updated<${wEnd} ${statusClause}`;
+            const firstUrl = `${baseUrl}/search.json?query=${encodeURIComponent(q)}&sort_by=updated_at&sort_order=asc`;
+
+            logger.debug(`Searching window ${wStart} .. ${wEnd}`);
+            const firstData = await fetchWithRetry(firstUrl);
+            const count = firstData?.count ?? 0;
+
+            if (count > MAX_PER_WINDOW) {
+                const startMs = new Date(wStart).getTime();
+                const endMs = new Date(wEnd).getTime();
+                if (endMs - startMs <= 1000) {
+                    logger.warn(`Window ${wStart} .. ${wEnd} has ${count} tickets but is already ≤1s wide — processing first 1000 only, some may be missed`);
+                } else {
+                    const midIso = new Date(startMs + Math.floor((endMs - startMs) / 2)).toISOString();
+                    logger.debug(`Window has ${count} tickets (>${MAX_PER_WINDOW}) — bisecting at ${midIso}`);
+                    windows.unshift([wStart, midIso], [midIso, wEnd]);
+                    continue;
+                }
             }
-            
-            nextPage = data.next_page;
-            
-            if (nextPage) {
+
+            logger.info(`Processing window ${wStart}..${wEnd}: ${count} tickets`);
+            await processResults(firstData.results || []);
+
+            let nextPage: string | null = firstData.next_page || null;
+            while (nextPage) {
                 logger.debug(`Fetching next page: ${nextPage}`);
-                // Rate limiting: wait between requests
                 await new Promise(res => setTimeout(res, 1000));
+                const data = await fetchWithRetry(nextPage);
+                await processResults(data.results || []);
+                nextPage = data.next_page || null;
             }
         }
 
-        // Update the last run date in the database
-        await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger, this.embeddingDimension);
-        
-        logger.info(`Successfully processed ${totalTickets} tickets`);
+        // Only advance the watermark when all tickets succeeded
+        if (failedTickets === 0) {
+            await DatabaseManager.updateLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, logger, this.embeddingDimension, syncStartDate);
+            logger.info(`Successfully processed ${totalTickets} tickets`);
+        } else {
+            logger.warn(
+                `Run completed with ${failedTickets} ticket failure(s). ` +
+                `Watermark NOT advanced — failed tickets will be retried next run. ` +
+                `Successfully processed: ${totalTickets}.`
+            );
+        }
     }
 
     private async fetchAndProcessZendeskArticles(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
@@ -1441,6 +1977,7 @@ export class Doc2Vec {
 
         if (unchanged) {
             logger.info(`Skipping unchanged URL (${chunks.length} chunks): ${url}`);
+            this.counters.items_unchanged++;
             return 0;
         }
 
@@ -1452,6 +1989,10 @@ export class Doc2Vec {
             } else {
                 await DatabaseManager.removeChunksByUrlQdrant(dbConnection, url, logger);
             }
+            this.counters.items_updated++;
+            this.counters.chunks_deleted += existingHashesSorted.length;
+        } else {
+            this.counters.items_new++;
         }
 
         // 5. Embed and insert all new chunks
@@ -1481,6 +2022,7 @@ export class Doc2Vec {
         }
 
         chunkProgress.complete();
+        this.counters.chunks_added += embeddedCount;
         return embeddedCount;
     }
 
@@ -1516,7 +2058,7 @@ export class Doc2Vec {
             const response = await this.openai.embeddings.create({
                 model: this.embeddingModel,
                 input: safeTexts,
-            });
+            }, { timeout: 60000 });
             logger.debug(`Successfully created ${response.data.length} embeddings`);
             return response.data.map(d => d.embedding);
         } catch (error) {
@@ -1526,12 +2068,76 @@ export class Doc2Vec {
     }
 }
 
-if (require.main === module) {
-    const configPath = process.argv[2] || 'config.yaml';
+function runOneShot(configPath: string, selection?: { indices?: number[]; names?: string[] }): void {
     if (!fs.existsSync(configPath)) {
         console.error('Please provide a valid path to a YAML config file.');
         process.exit(1);
     }
     const doc2Vec = new Doc2Vec(configPath);
-    doc2Vec.run().catch(console.error);
+    doc2Vec.run(selection)
+        .then((stats) => process.exit(stats.some(s => !s.ok) ? 1 : 0))
+        .catch((err) => { console.error(err instanceof Error ? err.message : err); process.exit(1); });
+}
+
+if (require.main === module) {
+    const { Command } = require('commander') as typeof import('commander');
+    const program = new Command();
+
+    program
+        .name('doc2vec')
+        .description('Crawl documentation sources and store embeddings in vector databases')
+        // Legacy invocation: `doc2vec [config.yaml]` runs a one-shot sync.
+        // The source-filter flags live only on the `run` subcommand: declaring
+        // them here too would swallow them at the program level before the
+        // subcommand's parser ever sees them.
+        .argument('[config]', 'path to a YAML config file', 'config.yaml')
+        .action((configPath: string) => runOneShot(configPath));
+
+    program
+        .command('run <config>')
+        .description('Run a one-shot sync for a config file (what the controller spawns)')
+        .option('--source <product_name>', 'only sync sources with this product_name (repeatable)',
+            (value: string, previous: string[]) => [...previous, value], [] as string[])
+        .option('--source-index <n>', 'only sync the source at this 0-based position in the config (repeatable, exact)',
+            (value: string, previous: number[]) => [...previous, parseInt(value, 10)], [] as number[])
+        .action((configPath: string, options: { source: string[]; sourceIndex: number[] }) =>
+            runOneShot(configPath, { names: options.source, indices: options.sourceIndex }));
+
+    program
+        .command('controller [configs...]')
+        .description('Run as a long-lived controller: schedule sync jobs per config file, persist runs in Postgres, serve a web UI')
+        .option('--database-url <url>', 'Postgres connection string (or DATABASE_URL env var)')
+        .option('--port <port>', 'HTTP port for the API/UI (or PORT env var)', (v: string) => parseInt(v, 10))
+        .option('--read-write', 'allow creating/editing configs from the UI (default: read-only)', false)
+        .option('--config-dir <dir>', 'directory where UI-created configs are written (required with --read-write)')
+        .option('--max-parallel <n>', 'maximum number of sync jobs running at once', (v: string) => parseInt(v, 10), 1)
+        .option('--reload-interval <seconds>', 'how often to re-poll config files for changes', (v: string) => parseInt(v, 10), 30)
+        .option('--log-retention-days <days>', 'delete run logs older than this many days', (v: string) => parseInt(v, 10), 14)
+        .option('--slack-webhook-url <url>', 'Slack incoming webhook for run notifications (or SLACK_WEBHOOK_URL env var)')
+        .option('--slack-notify <mode>', "which runs to notify about: 'all' or 'failures'", 'all')
+        .option('--public-url <url>', 'externally reachable base URL, used for links in notifications (or PUBLIC_URL env var)')
+        .action(async (configs: string[], options: any) => {
+            // Lazy-require so the one-shot path doesn't load express/pg
+            const { startController } = require('./controller') as typeof import('./controller');
+            try {
+                await startController({
+                    configArgs: configs,
+                    databaseUrl: options.databaseUrl || process.env.DATABASE_URL,
+                    port: options.port || (process.env.PORT ? parseInt(process.env.PORT, 10) : 8080),
+                    readWrite: options.readWrite,
+                    configDir: options.configDir,
+                    maxParallel: options.maxParallel,
+                    reloadIntervalSec: options.reloadInterval,
+                    logRetentionDays: options.logRetentionDays,
+                    slackWebhookUrl: options.slackWebhookUrl || process.env.SLACK_WEBHOOK_URL,
+                    slackNotify: options.slackNotify === 'failures' ? 'failures' : 'all',
+                    publicUrl: options.publicUrl || process.env.PUBLIC_URL,
+                });
+            } catch (err) {
+                console.error(err instanceof Error ? err.message : err);
+                process.exit(1);
+            }
+        });
+
+    program.parse();
 } 

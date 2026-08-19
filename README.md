@@ -6,7 +6,12 @@ This project provides a configurable tool (`doc2vec`) to crawl specified website
 
 The primary goal is to prepare documentation content for Retrieval-Augmented Generation (RAG) systems or semantic search applications.
 
-> **⚠️ Version 2.0.0 Breaking Change:** Version 2.0.0 introduced enhanced chunking with new metadata fields (`chunk_index` and `total_chunks`) that enable page reconstruction and improved chunk ordering. The database schema has changed, and databases created with versions prior to 2.0.0 use a different format. **If you're upgrading to version 2.0.0 or later, you should start with fresh databases** to take advantage of the new features. While the MCP server maintains backward compatibility for querying old databases, doc2vec itself will create databases in the new format. If you need to migrate existing data, consider re-running doc2vec on your sources to regenerate the databases with the enhanced chunking format.
+Run it two ways:
+
+*   **One-shot sync** — `doc2vec run config.yaml` processes every source in a config file and exits. Ideal for a cron job or CI step. Pass `--source <product_name>` (all entries with that name) or `--source-index <n>` (a single entry, by its 0-based position in the config) to sync only selected sources; both flags are repeatable.
+*   **[Controller mode](#controller-mode)** — `doc2vec controller ./configs/` stays running: it schedules each config on its own cron expression, keeps run history and per-source statistics in Postgres, and serves a web UI with live log streaming, searchable run logs, and chunk inspection. Deploy it once and manage all your sources from the browser.
+
+[![doc2vec controller dashboard](docs/images/controller-dashboard.png)](#controller-mode)
 
 ## Key Features
 
@@ -52,6 +57,7 @@ The primary goal is to prepare documentation content for Retrieval-Augmented Gen
 *   **Incremental Updates:** For GitHub and Zendesk sources, tracks the last run date to only fetch new or updated issues/tickets.
 *   **Cleanup:** Removes obsolete chunks from the database corresponding to pages or files that are no longer found during processing.
 *   **Configuration:** Driven by a YAML configuration file (`config.yaml`) specifying sites, repositories, local directories, Zendesk instances, database types, metadata, and other parameters.
+*   **[Controller Mode](#controller-mode):** Optionally runs as a long-lived controller that schedules sync jobs from multiple config files (cron `schedule` field), persists run history and statistics in Postgres, and serves a web UI with live log streaming, whole-run log search, and chunk inspection — read-only (configs from files/ConfigMap) or read-write (create/edit configs from the UI).
 *   **Structured Logging:** Uses a custom logger (`logger.ts`) with levels, timestamps, colors, progress bars, and child loggers for clear execution monitoring.
 
 ## Chunk Metadata & Page Reconstruction
@@ -151,6 +157,16 @@ Configuration is managed through two files:
     OPENAI_API_KEY="sk-..."
     OPENAI_MODEL="text-embedding-3-large"  # Optional, defaults to text-embedding-3-large
 
+    # Optional: Override the OpenAI API base URL. Useful for pointing the
+    # OpenAI SDK at an OpenAI-compatible endpoint such as Ollama, LM Studio,
+    # llama.cpp, vLLM, or a proxy gateway. When unset, the SDK uses the
+    # default OpenAI endpoint. Equivalent to the `embedding.openai.base_url`
+    # field in config.yaml; the env var wins if both are set.
+    # Example values:
+    #   OPENAI_BASE_URL="http://localhost:11434/v1"        # Ollama
+    #   OPENAI_BASE_URL="https://gateway.example.com/v1"   # proxy / gateway
+    OPENAI_BASE_URL="http://localhost:11434/v1"
+
     # Optional: Embedding dimension size (defaults to 3072)
     EMBEDDING_DIMENSION="3072"
 
@@ -176,7 +192,7 @@ Configuration is managed through two files:
     **Structure:**
 
     *   `sources`: An array of source configurations.
-        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, `'code'`, or `'zendesk'`
+        *   `type`: Either `'website'`, `'github'`, `'local_directory'`, `'code'`, `'zendesk'`, or `'s3'`
         
         For websites (`type: 'website'`):
         *   `url`: The starting URL for crawling the documentation site.
@@ -202,6 +218,7 @@ Configuration is managed through two files:
         *   `branch`: (Optional) Branch to clone for GitHub sources.
         *   `include_extensions`: (Optional) Array of file extensions to include (defaults to common code extensions).
         *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
+        *   `exclude_paths`: (Optional) Array of glob patterns, relative to the source root, that the scanner skips. See [Excluding paths from code sources](#excluding-paths-from-code-sources).
         *   `recursive`: (Optional) Whether to traverse subdirectories (defaults to `true`).
         *   `url_rewrite_prefix`: (Optional) URL prefix to rewrite `file://` URLs for local sources.
         *   `encoding`: (Optional) File encoding to use (defaults to `'utf8'`).
@@ -218,6 +235,24 @@ Configuration is managed through two files:
         *   `start_date`: (Optional) Only process tickets/articles updated since this date (e.g., `'2025-01-01'`).
         *   `ticket_status`: (Optional) Filter tickets by status (defaults to `['new', 'open', 'pending', 'hold', 'solved']`).
         *   `ticket_priority`: (Optional) Filter tickets by priority (defaults to all priorities).
+        *   `excluded_organizations`: (Optional) An array of Zendesk organization names whose tickets should be skipped. The sync will abort if any name cannot be resolved.
+        *   `include_internal_comments`: (Optional) Include non-public (internal/agent-only) comments in the indexed content (defaults to `false`, i.e. only public comments are indexed). Internal comments are labeled `(internal)` in the generated markdown.
+
+        For S3 buckets (`type: 's3'`):
+        *   `bucket`: The S3 bucket name.
+        *   `prefix`: (Optional) Key prefix to filter objects (e.g., `'docs/'`). Only objects under this prefix will be processed.
+        *   `region`: (Optional) AWS region (defaults to `AWS_DEFAULT_REGION` environment variable or `'us-east-1'`).
+        *   `endpoint`: (Optional) Custom S3 endpoint for S3-compatible services (MinIO, LocalStack, etc.).
+        *   `include_extensions`: (Optional) Array of file extensions to include (e.g., `['.md', '.txt', '.pdf']`). Defaults to `['.md', '.txt', '.html', '.htm', '.pdf', '.doc', '.docx']`.
+        *   `exclude_extensions`: (Optional) Array of file extensions to exclude.
+        *   `encoding`: (Optional) Text file encoding (defaults to `'utf8'`). Does not apply to binary files (PDF, DOC, DOCX).
+        *   `url_rewrite_prefix`: (Optional) URL prefix to rewrite `s3://` URLs (e.g., `'https://docs.example.com'`).
+
+        **S3 user metadata resolution:** The `product_name` and `version` fields support a `metadata(...)` syntax to dynamically resolve values from S3 object user metadata. For example, `product_name: 'metadata(x-amz-meta-product-name)'` will set `product_name` to the value of the `x-amz-meta-product-name` user metadata on each S3 object. If the metadata key doesn't exist on an object, an empty string is used. Literal values (without the `metadata(...)` wrapper) work as before.
+
+        Authentication uses the AWS SDK default credential chain: environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), `~/.aws/credentials`, IAM roles, etc.
+
+        Incremental sync tracks object `LastModified` timestamps so only new or updated objects are processed on subsequent runs. Deleted objects are automatically cleaned up.
 
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
@@ -259,6 +294,7 @@ Configuration is managed through two files:
       openai:
         api_key: '${OPENAI_API_KEY}'  # Optional, uses env var by default
         model: 'text-embedding-3-large'  # Optional, defaults to text-embedding-3-large
+        # base_url: 'http://localhost:11434/v1'  # Optional, override OpenAI API base URL for Ollama / other OpenAI-compatible endpoints. Falls back to OPENAI_BASE_URL env var.
       # For Azure OpenAI, use this instead:
       # azure:
       #   api_key: '${AZURE_OPENAI_KEY}'
@@ -324,6 +360,10 @@ Configuration is managed through two files:
         repo: 'kagent-dev/doc2vec'
         branch: 'main'
         include_extensions: ['.ts', '.tsx', '.md']
+        exclude_paths:
+          - 'node_modules/**'
+          - 'dist/**'
+          - '**/*.test.ts'
         max_size: 1048576
         chunk_size: 2048
         database_config:
@@ -343,12 +383,28 @@ Configuration is managed through two files:
         start_date: '2025-01-01'
         ticket_status: ['open', 'pending']
         ticket_priority: ['high']
+        excluded_organizations: ['Acme Corp', 'Internal Testing']
         max_size: 1048576
         database_config:
           type: 'sqlite'
           params:
             db_path: './zendesk-kb.db'
       
+      # S3 bucket source example
+      - type: 's3'
+        product_name: 'metadata(x-amz-meta-product-name)'
+        version: 'latest'
+        bucket: 'my-documentation-bucket'
+        prefix: 'docs/v2/'
+        region: 'us-west-2'
+        include_extensions: ['.md', '.txt', '.pdf', '.html']
+        url_rewrite_prefix: 'https://docs.example.com'
+        max_size: 1048576
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './s3-docs.db'
+
       # Qdrant example
       - type: 'website'
         product_name: 'Istio'
@@ -363,6 +419,43 @@ Configuration is managed through two files:
             collection_name: 'istio_docs_latest'
       # ... more sources
     ```
+
+### Excluding paths from code sources
+
+Code sources (`type: 'code'`) accept `exclude_paths`. Each entry is a glob pattern that the scanner matches against the path of the file, relative to the source root. The root is the `path` directory for a local source, or the clone root for a GitHub source. Use it to keep vendored trees, generated code, and test files out of the index.
+
+```yaml
+      - type: 'code'
+        source: 'github'
+        product_name: 'my-product'
+        repo: 'my-org/my-repo'
+        branch: 'main'
+        include_extensions: ['.go', '.md', '.yaml', '.sh', '.py', '.proto']
+        exclude_paths:
+          - 'vendor/**'                 # vendored dependencies
+          - 'LICENSES/**'               # go-licenses output
+          - 'pkg/client/**'             # k8s code-generator output
+          - '**/*.pb.go'                # protobuf output
+          - '**/zz_generated.*.go'      # controller-gen output
+          - '**/*_test.go'              # tests
+          - 'hack/tools/**'
+        max_size: 1048576
+        database_config:
+          type: 'sqlite'
+          params:
+            db_path: './my-product-code.db'
+```
+
+Pattern rules:
+
+*   `*` matches any characters inside one path segment. It does not cross a `/`.
+*   `**` matches any characters, and it crosses `/`. `vendor/**` therefore matches every file below `vendor/`.
+*   A leading `**/` also matches zero directories, so `**/*_test.go` matches `main_test.go` at the root and `pkg/a/main_test.go` below it.
+*   `?` matches one character inside a segment.
+*   A pattern that names a directory (`vendor` or `vendor/**`) prunes the whole subtree. The scanner does not walk it.
+*   Matching is case-sensitive, and a pattern must match the whole relative path. Use `**/build/**`, not `build`, to exclude a directory at any depth.
+
+The scanner treats an excluded file as if it does not exist. A full scan therefore removes the chunks of files you newly excluded. For GitHub sources in incremental mode, the removal happens on the next full scan.
 
 ## Usage
 
@@ -391,6 +484,144 @@ The script will then:
 6.  For all sources: Chunk content, check for changes, generate embeddings (if needed), and store/update in the database.
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
+
+## Controller Mode
+
+Besides the one-shot sync, doc2vec can run as a **long-lived controller** that schedules sync jobs, records run history and statistics in Postgres, and serves a web UI for monitoring and managing configs:
+
+```bash
+doc2vec controller --database-url postgres://user:pass@host:5432/doc2vec ./configs/
+```
+
+Open http://localhost:8080 to see the dashboard ([screenshot above](#doc2vec)): every config with its schedule, next run, and the outcome of its last run, plus a **Run now** button. The **▾** next to it opens a source picker to sync only a subset of the config's source entries — each entry is selectable individually, even when several share a product name (e.g. istio as github + code + website) — and the run history marks such partial runs with the selected sources.
+
+Each config gets its own page with the full run history, per-source results, and the raw YAML:
+
+![Config run history](docs/images/controller-runs.png)
+
+…and a **Stats** tab with runs per day, success rate, and duration trend over the last 7/30/90 days:
+
+![Config statistics](docs/images/controller-stats.png)
+
+A run page shows what the sync did — duration, exit code, warning and error counts, per-source chunk counts and errors — above the run's logs.
+
+![Run detail with filtered logs](docs/images/controller-run-logs.png)
+
+### Scheduling
+
+Add a top-level cron `schedule` (and optionally a display `name`) to a config file, and the controller runs it automatically:
+
+```yaml
+name: product-docs
+schedule: "0 2 * * *"   # every day at 02:00
+sources:
+  - type: website
+    ...
+```
+
+Configs without a `schedule` are still listed in the UI and can be triggered manually with **Run now** (optionally for a subset of sources via the **▾** picker). Each run executes `doc2vec run <config.yaml>` as a child process (with `--source-index <n>` flags when a subset was selected); overlapping runs of the same config are skipped, and `--max-parallel` (default 1) caps how many sync jobs run at once — keep it low, since website sources launch a headless Chromium.
+
+### Logs
+
+Every line a sync job writes is stored in Postgres and streamed to the run page as it happens (`● live`), with follow-on-scroll and a `↓ Follow` button when you scroll away.
+
+Long runs produce a lot of output, so the browser only keeps the last 10,000 lines in memory — the header tells you when that is the case (`30,000 lines (showing last 10,000)`). Everything else stays one query away:
+
+*   **Level chips** (`ERROR 4`, `WARN 93`, …) count the whole run, not the visible window, and clicking one filters **server-side** — so the 4 errors from the first minute of a 50-minute run are one click away. Results page in with **Load 2,000 more**.
+*   **Keyword filter** matches the message or the module, case-insensitively, across the whole run.
+*   **↓ download log** streams the complete log as plain text (`run-<id>.log`) for grepping locally or attaching to an issue. With a filter active it becomes **↓ download matches** and applies the same filter.
+
+While a run is live, new lines matching the active filter keep arriving in the filtered view.
+
+Run logs are pruned after `--log-retention-days` (default 14); run history and statistics are kept indefinitely.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--database-url <url>` | `DATABASE_URL` env | Postgres connection string (required) |
+| `--port <n>` | `8080` (or `PORT`) | HTTP port for the API and UI |
+| `--read-write` | off (read-only) | Allow creating/editing/deleting configs from the UI |
+| `--config-dir <dir>` | — | Where UI-created configs are written (required with `--read-write`) |
+| `--max-parallel <n>` | `1` | Max concurrent sync jobs |
+| `--reload-interval <s>` | `30` | How often config files are re-read for changes |
+| `--log-retention-days <n>` | `14` | Run logs older than this are pruned (run history is kept) |
+| `--slack-webhook-url <url>` | `SLACK_WEBHOOK_URL` env | Slack incoming webhook — post a message when a run finishes |
+| `--slack-notify <mode>` | `all` | `all` or `failures` (failures also covers canceled runs) |
+| `--public-url <url>` | `PUBLIC_URL` env | Externally reachable base URL, used for "view run" links in notifications |
+
+Positional arguments are config files and/or directories (directories are scanned for `*.yaml`/`*.yml`, and re-scanned on every reload).
+
+### Slack notifications
+
+With `--slack-webhook-url` (or `SLACK_WEBHOOK_URL`) set, the controller posts to a [Slack incoming webhook](https://api.slack.com/messaging/webhooks) whenever a run reaches a terminal state — ✅ succeeded, ❌ failed (naming the failing sources and their errors), or ⚠️ canceled. Overlap-`skipped` runs are not notified. Set `--slack-notify failures` to silence successes, and `--public-url https://doc2vec.example.com` to get clickable "view run" links.
+
+### Read-only vs read-write
+
+- **Read-only** (default): configs come solely from the files passed on the command line — ideal for Kubernetes, where they live in a ConfigMap. The UI can view configs, trigger runs, and browse history/stats, but not modify anything. ConfigMap updates are picked up automatically via content-hash polling.
+- **Read-write** (`--read-write --config-dir ./configs`): the UI can also create, edit, and delete config YAML files. Files stay the source of truth on disk; concurrent edits are protected by a content-hash check.
+
+In both modes the UI always shows raw YAML: `${ENV_VAR}` secret placeholders are **never** resolved outside the sync job itself.
+
+### Kubernetes example
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doc2vec-controller
+spec:
+  replicas: 1        # keep a single replica: the scheduler is not distributed
+  selector:
+    matchLabels: { app: doc2vec-controller }
+  template:
+    metadata:
+      labels: { app: doc2vec-controller }
+    spec:
+      containers:
+        - name: controller
+          image: ghcr.io/kagent-dev/doc2vec:latest
+          command: ["node", "dist/doc2vec.js", "controller", "/etc/doc2vec"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: doc2vec-secrets, key: database-url }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: doc2vec-secrets, key: openai-api-key }
+          volumeMounts:
+            - name: configs
+              mountPath: /etc/doc2vec
+          resources:
+            requests: { memory: 1Gi }
+            limits: { memory: 4Gi }   # website sources launch headless Chromium
+      volumes:
+        - name: configs
+          configMap: { name: doc2vec-configs }
+```
+
+The controller detects ConfigMap updates without a restart. Health endpoint: `GET /api/health`.
+
+### API
+
+The UI is backed by a small REST API you can also use directly:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/configs` | Configs with schedule, next run, and last run |
+| `POST /api/configs/:id/run` | Trigger a run now |
+| `GET /api/configs/:id/stats?days=30` | Run counts, success rate, duration history |
+| `GET /api/configs/:id/chunks?product_name=&url=` | Inspect the stored chunks for a URL |
+| `GET /api/runs?configId=&status=&limit=&before=` | Run history |
+| `GET /api/runs/:id/logs?afterSeq=&limit=&levels=&q=` | Log lines, filtered by level (csv) and/or keyword |
+| `GET /api/runs/:id/logs/counts` | Line totals per level for the whole run |
+| `GET /api/runs/:id/logs/download?levels=&q=` | Whole log (or the matching lines) as plain text |
+| `POST /api/runs/:id/cancel` | Cancel a running job |
+| `GET /api/health` | Status, mode, version |
+
+Server-sent events: `GET /api/events` (run and config updates) and `GET /api/runs/:id/logs/stream?tail=10000` (replays the last `tail` stored lines, then tails live output).
 
 ## Database Options
 
@@ -577,6 +808,19 @@ If you don't specify a config path, it will look for config.yaml in the current 
 4.  **Complete:** Log completion status.
 
 ## Recent Changes
+
+### Code Scans: Dangling Symlinks and Incomplete Walks
+- **Dangling symlinks no longer abort a directory:** `statSync` follows symlinks, so a link whose target isn't in the clone (common in vendored forks, e.g. `crates/cel-fork/cel/README.md`) threw `ENOENT` and abandoned every remaining entry in that directory. Broken entries are now skipped with a warning and the walk continues
+- **Incomplete scans never delete chunks:** if a directory genuinely can't be listed, the scan is reported as incomplete — obsolete-file cleanup, the tracked-file list, the last-mtime marker, and the last-synced git SHA are all skipped, so unscanned files keep their chunks and the next run rescans them
+- **Incomplete scans fail the source:** a partial ingest is reported as a failed source instead of a silent success
+- **Quieter crawls:** planned browser restarts (initial launch, the every-50-pages recycle) log at `info`; only unplanned restarts (disconnected or degraded browser) warn
+
+### Searchable Controller Run Logs
+- **Server-side log filtering:** Level chips and the keyword filter now query Postgres instead of the browser's in-memory buffer, so errors and warnings from the start of a long run are reachable (`GET /api/runs/:id/logs?levels=error,warn&q=...`, paged with **Load 2,000 more**)
+- **Whole-run level counts:** New `GET /api/runs/:id/logs/counts` endpoint backs the level chips, which previously only counted the lines still held in the browser
+- **Plain-text download:** `GET /api/runs/:id/logs/download` streams the full log (or just the matching lines) as `run-<id>.log`
+- **Bounded replay:** The log stream accepts `?tail=N` so opening a 30,000-line run replays only the trailing window instead of the entire history
+- **Index:** New `d2v_run_logs (run_id, level, seq)` index keeps level filtering fast on long runs
 
 ### Postgres Markdown Store
 - **New feature:** Optionally store the generated markdown for each crawled website URL in a Postgres table (`url`, `product_name`, `markdown`, `updated_at`)

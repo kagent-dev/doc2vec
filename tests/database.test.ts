@@ -152,15 +152,16 @@ describe('DatabaseManager', () => {
         });
 
         it('should update and retrieve last run date', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            const syncDate = new Date().toISOString();
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, syncDate);
             const date = await DatabaseManager.getLastRunDate(conn, 'owner/repo', '2025-01-01T00:00:00Z', testLogger);
-            // Should be an ISO date string, not the default
-            expect(date).not.toBe('2025-01-01T00:00:00Z');
+            // Should be the date we passed in
+            expect(date).toBe(syncDate);
             expect(date).toMatch(/^\d{4}-\d{2}-\d{2}T/);
         });
 
         it('should normalize repo names in metadata keys', async () => {
-            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            await DatabaseManager.updateLastRunDate(conn, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, new Date().toISOString());
             // Check directly in db that the key uses underscore
             const result = db.prepare('SELECT key FROM vec_metadata WHERE key LIKE ?').get('last_run_%') as { key: string };
             expect(result.key).toBe('last_run_owner_repo');
@@ -224,6 +225,17 @@ describe('DatabaseManager', () => {
             expect(result).toBeDefined();
             expect(result.content).toBe(chunk.content);
             expect(result.product_name).toBe('TestProduct');
+        });
+
+        it('should record a creation date for each inserted chunk', () => {
+            const chunk = createTestChunk();
+            DatabaseManager.insertVectorsSQLite(db, chunk, createTestEmbedding(), testLogger);
+
+            const row = db.prepare('SELECT created_at FROM vec_chunk_dates WHERE chunk_id = ?')
+                .get(chunk.metadata.chunk_id) as any;
+
+            expect(row).toBeDefined();
+            expect(new Date(row.created_at).getTime()).not.toBeNaN();
         });
 
         it('should handle duplicate chunk_id inserts gracefully', () => {
@@ -413,6 +425,27 @@ describe('DatabaseManager', () => {
             expect(remaining.length).toBe(1);
             expect(remaining[0].chunk_id).toBe('out-of-scope');
         });
+
+        it('should report deleted URL and chunk counts', () => {
+            const embedding = createTestEmbedding();
+            // Two chunks on one obsolete page, one chunk on another
+            for (const [chunkId, url] of [
+                ['gone-1a', 'https://example.com/gone1'],
+                ['gone-1b', 'https://example.com/gone1'],
+                ['gone-2', 'https://example.com/gone2'],
+                ['kept', 'https://example.com/kept'],
+            ]) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = chunkId;
+                chunk.metadata.url = url;
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger);
+            }
+
+            const visitedUrls = new Set(['https://example.com/kept']);
+            const removed = DatabaseManager.removeObsoleteChunksSQLite(db, visitedUrls, 'https://example.com', testLogger);
+
+            expect(removed).toEqual({ items: 2, chunks: 3 });
+        });
     });
 
     // ─── removeChunksByUrlSQLite ─────────────────────────────────────
@@ -452,6 +485,19 @@ describe('DatabaseManager', () => {
         it('should not error when no chunks match', () => {
             DatabaseManager.removeChunksByUrlSQLite(db, 'https://nonexistent.com/page', testLogger);
             // Should not throw
+        });
+
+        it('should return the number of deleted chunks', () => {
+            const embedding = createTestEmbedding();
+            for (let i = 0; i < 3; i++) {
+                const chunk = createTestChunk();
+                chunk.metadata.chunk_id = `chunk-${i}`;
+                chunk.metadata.url = 'https://example.com/target';
+                DatabaseManager.insertVectorsSQLite(db, chunk, embedding, testLogger);
+            }
+
+            expect(DatabaseManager.removeChunksByUrlSQLite(db, 'https://example.com/target', testLogger)).toBe(3);
+            expect(DatabaseManager.removeChunksByUrlSQLite(db, 'https://example.com/target', testLogger)).toBe(0);
         });
     });
 
@@ -671,7 +717,7 @@ describe('DatabaseManager', () => {
             expect(pointId).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
         });
 
-        it('should handle upsert errors gracefully', async () => {
+        it('should propagate upsert errors so the job fails', async () => {
             const mockClient = {
                 upsert: vi.fn().mockRejectedValue(new Error('Connection refused')),
             };
@@ -684,8 +730,12 @@ describe('DatabaseManager', () => {
             const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
             const chunk = createTestChunk();
 
-            // Should not throw
-            await DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, createTestEmbedding());
+            // Must throw — a swallowed write error would let a sync report
+            // success while chunks silently fail to store (e.g. disk full).
+            await expect(
+                DatabaseManager.storeChunkInQdrant(qdrantDb, chunk, createTestEmbedding())
+            ).rejects.toThrow('Connection refused');
+            expect(consoleSpy).toHaveBeenCalled();
 
             consoleSpy.mockRestore();
         });
@@ -756,6 +806,51 @@ describe('DatabaseManager', () => {
             const deleteCall = mockClient.delete.mock.calls[0];
             expect(deleteCall[1].points).toContain('p1');
             expect(deleteCall[1].points).not.toContain('p2');
+        });
+
+        it('should paginate through all scroll pages when finding obsolete chunks', async () => {
+            // Qdrant caps a single scroll at its page limit and returns a
+            // next_page_offset to fetch the rest. removeObsoleteChunksQdrant
+            // must follow that cursor — otherwise large collections would only
+            // have their first page examined and obsolete chunks beyond it
+            // (e.g. a deleted page in a 20k+ chunk collection) would survive.
+            const mockClient = {
+                scroll: vi.fn()
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p1', payload: { url: 'https://example.com/old1', is_metadata: false } },
+                            { id: 'p2', payload: { url: 'https://example.com/current', is_metadata: false } },
+                        ],
+                        next_page_offset: 'cursor-2',
+                    })
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p3', payload: { url: 'https://example.com/old2', is_metadata: false } },
+                        ],
+                        next_page_offset: null,
+                    }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const visitedUrls = new Set(['https://example.com/current']);
+            await DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, visitedUrls, 'https://example.com', testLogger);
+
+            // Both pages must be scrolled, second call carrying the cursor
+            expect(mockClient.scroll).toHaveBeenCalledTimes(2);
+            expect(mockClient.scroll.mock.calls[1][1].offset).toBe('cursor-2');
+
+            // Obsolete points from BOTH pages deleted; the visited one retained
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleted = mockClient.delete.mock.calls[0][1].points;
+            expect(deleted).toContain('p1');
+            expect(deleted).toContain('p3');
+            expect(deleted).not.toContain('p2');
         });
 
         it('should not delete metadata points from Qdrant', async () => {
@@ -1085,7 +1180,8 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            const syncDate = new Date().toISOString();
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, syncDate);
 
             expect(mockClient.upsert).toHaveBeenCalledOnce();
             const call = mockClient.upsert.mock.calls[0];
@@ -1093,7 +1189,7 @@ describe('DatabaseManager', () => {
             const point = call[1].points[0];
             expect(point.payload.is_metadata).toBe(true);
             expect(point.payload.metadata_key).toBe('last_run_owner_repo');
-            expect(point.payload.metadata_value).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+            expect(point.payload.metadata_value).toBe(syncDate);
             expect(point.vector).toHaveLength(TEST_EMBEDDING_DIMENSION);
         });
 
@@ -1108,13 +1204,13 @@ describe('DatabaseManager', () => {
             };
 
             // Should not throw
-            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION);
+            await DatabaseManager.updateLastRunDate(qdrantDb, 'owner/repo', testLogger, TEST_EMBEDDING_DIMENSION, new Date().toISOString());
         });
     });
 
     // ─── removeObsoleteChunksQdrant - error handling ─────────────────
     describe('removeObsoleteChunksQdrant - error handling', () => {
-        it('should handle scroll error gracefully', async () => {
+        it('should propagate scroll errors so the job fails', async () => {
             const mockClient = {
                 scroll: vi.fn().mockRejectedValue(new Error('Scroll failed')),
             };
@@ -1124,14 +1220,17 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            // Should not throw
-            await DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, new Set(), 'https://example.com', testLogger);
+            // Must throw — a swallowed cleanup failure silently leaves orphans
+            // behind while the sync reports success.
+            await expect(
+                DatabaseManager.removeObsoleteChunksQdrant(qdrantDb, new Set(), 'https://example.com', testLogger)
+            ).rejects.toThrow('Scroll failed');
         });
     });
 
     // ─── removeChunksByUrlQdrant - error handling ────────────────────
     describe('removeChunksByUrlQdrant - error handling', () => {
-        it('should handle delete error gracefully', async () => {
+        it('should propagate delete errors so the job fails', async () => {
             const mockClient = {
                 delete: vi.fn().mockRejectedValue(new Error('Delete failed')),
             };
@@ -1141,8 +1240,11 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            // Should not throw
-            await DatabaseManager.removeChunksByUrlQdrant(qdrantDb, 'https://example.com/page', testLogger);
+            // Must throw — a swallowed delete leaves stale chunks behind while
+            // the sync reports success. Best-effort callers wrap this themselves.
+            await expect(
+                DatabaseManager.removeChunksByUrlQdrant(qdrantDb, 'https://example.com/page', testLogger)
+            ).rejects.toThrow('Delete failed');
         });
     });
 
@@ -1171,6 +1273,43 @@ describe('DatabaseManager', () => {
             const deleteCall = mockClient.delete.mock.calls[0];
             expect(deleteCall[1].points).toContain('p2');
             expect(deleteCall[1].points).not.toContain('p1');
+        });
+
+        it('should paginate through all scroll pages when finding obsolete files', async () => {
+            const mockClient = {
+                scroll: vi.fn()
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p1', payload: { url: 'file:///project/src/a.ts', is_metadata: false } },
+                            { id: 'p2', payload: { url: 'file:///project/src/deleted1.ts', is_metadata: false } },
+                        ],
+                        next_page_offset: 'cursor-2',
+                    })
+                    .mockResolvedValueOnce({
+                        points: [
+                            { id: 'p3', payload: { url: 'file:///project/src/deleted2.ts', is_metadata: false } },
+                        ],
+                        next_page_offset: null,
+                    }),
+                delete: vi.fn().mockResolvedValue({}),
+            };
+            const qdrantDb: QdrantDB = {
+                client: mockClient,
+                collectionName: 'test_col',
+                type: 'qdrant',
+            };
+
+            const processedFiles = new Set(['/project/src/a.ts']);
+            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, processedFiles, '/project/src', testLogger);
+
+            expect(mockClient.scroll).toHaveBeenCalledTimes(2);
+            expect(mockClient.scroll.mock.calls[1][1].offset).toBe('cursor-2');
+
+            expect(mockClient.delete).toHaveBeenCalledOnce();
+            const deleted = mockClient.delete.mock.calls[0][1].points;
+            expect(deleted).toContain('p2');
+            expect(deleted).toContain('p3');
+            expect(deleted).not.toContain('p1');
         });
 
         it('should delete obsolete file chunks in URL rewrite mode', async () => {
@@ -1224,7 +1363,7 @@ describe('DatabaseManager', () => {
             expect(mockClient.delete).not.toHaveBeenCalled();
         });
 
-        it('should handle error gracefully', async () => {
+        it('should propagate errors so the job fails', async () => {
             const mockClient = {
                 scroll: vi.fn().mockRejectedValue(new Error('Qdrant scroll failed')),
             };
@@ -1234,8 +1373,10 @@ describe('DatabaseManager', () => {
                 type: 'qdrant',
             };
 
-            // Should not throw
-            await DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, new Set(), '/project/src', testLogger);
+            // Must throw — a swallowed cleanup failure silently leaves orphans behind.
+            await expect(
+                DatabaseManager.removeObsoleteFilesQdrant(qdrantDb, new Set(), '/project/src', testLogger)
+            ).rejects.toThrow('Qdrant scroll failed');
         });
     });
 

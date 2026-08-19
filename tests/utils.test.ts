@@ -363,4 +363,213 @@ describe('Utils', () => {
             expect(uuid).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
         });
     });
+    // ─── parseNextLink ──────────────────────────────────────────────
+    // GitHub caps page-number pagination on the issues endpoint (HTTP 422 past
+    // its offset limit), so following these cursor URLs is the only way to walk
+    // a large result set.
+    describe('parseNextLink', () => {
+        it('extracts the rel="next" URL', () => {
+            const header = '<https://api.github.com/repositories/1/issues?per_page=100&after=CURSOR>; rel="next"';
+            expect(Utils.parseNextLink(header))
+                .toBe('https://api.github.com/repositories/1/issues?per_page=100&after=CURSOR');
+        });
+
+        it('picks next out of a multi-rel header', () => {
+            const header = '<https://api.example/prev>; rel="prev", <https://api.example/next>; rel="next", <https://api.example/last>; rel="last"';
+            expect(Utils.parseNextLink(header)).toBe('https://api.example/next');
+        });
+
+        it('returns null when there is no next page', () => {
+            const header = '<https://api.example/first>; rel="first", <https://api.example/prev>; rel="prev"';
+            expect(Utils.parseNextLink(header)).toBeNull();
+        });
+
+        it('returns null for empty, undefined or null headers', () => {
+            expect(Utils.parseNextLink(undefined)).toBeNull();
+            expect(Utils.parseNextLink(null)).toBeNull();
+            expect(Utils.parseNextLink('')).toBeNull();
+        });
+
+        it('preserves the cursor query string verbatim', () => {
+            const url = 'https://api.github.com/repositories/74175805/issues?per_page=100&state=all&since=2024-01-01T00%3A00%3A00Z&after=Y3Vyc29yOnYyOpLPAAAB';
+            expect(Utils.parseNextLink(`<${url}>; rel="next"`)).toBe(url);
+        });
+    });
+
+    // ─── stripLoneSurrogates ────────────────────────────────────────
+    // A lone surrogate is invalid UTF-8, so Qdrant rejects the whole JSON body
+    // ("lone leading surrogate in hex escape") and the chunk is lost.
+    describe('stripLoneSurrogates', () => {
+        it('removes a lone high surrogate', () => {
+            const text = 'before \ud83d after';
+            const cleaned = Utils.stripLoneSurrogates(text);
+            expect(cleaned).toBe('before  after');
+            expect(cleaned.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('removes a lone low surrogate', () => {
+            const cleaned = Utils.stripLoneSurrogates('before \ude00 after');
+            expect(cleaned).toBe('before  after');
+            expect(cleaned.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('keeps valid surrogate pairs intact', () => {
+            const emoji = 'ok \ud83d\ude00 done';
+            expect(Utils.stripLoneSurrogates(emoji)).toBe(emoji);
+        });
+
+        it('keeps plain text unchanged', () => {
+            expect(Utils.stripLoneSurrogates('plain ascii + accents éàü + 日本語')).toBe('plain ascii + accents éàü + 日本語');
+        });
+
+        it('handles a lone surrogate adjacent to a valid pair', () => {
+            const cleaned = Utils.stripLoneSurrogates('\ud83d\ud83d\ude00');
+            expect(cleaned).toBe('\ud83d\ude00');
+            expect(cleaned.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('produces JSON-safe output for content that broke the upsert', () => {
+            const broken = 'x'.repeat(10) + '\ud83d';
+            expect(JSON.parse(JSON.stringify({ c: Utils.stripLoneSurrogates(broken) })).c).toBe('x'.repeat(10));
+        });
+    });
+
+    // ─── sliceSafe ──────────────────────────────────────────────────
+    // The chunker splits oversized sections by character offset; a boundary
+    // landing inside a surrogate pair used to emit two broken chunks.
+    describe('sliceSafe', () => {
+        it('never splits a surrogate pair at the end boundary', () => {
+            // Pair straddles index 4/5
+            const text = 'abcd\ud83d\ude00efg';
+            const slice = Utils.sliceSafe(text, 0, 5);
+            expect(slice).toBe('abcd');
+            expect(slice.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('picks up the whole pair the previous slice left behind', () => {
+            const text = 'abcd\ud83d\ude00efg';
+            // Index 5 is the low half; the slice steps back so the pair is intact
+            const slice = Utils.sliceSafe(text, 5, text.length);
+            expect(slice).toBe('\ud83d\ude00efg');
+            expect(slice.isWellFormed?.()).not.toBe(false);
+        });
+
+        it('behaves like slice when no pair is straddled', () => {
+            expect(Utils.sliceSafe('hello world', 0, 5)).toBe('hello');
+            expect(Utils.sliceSafe('hello world', 6, 11)).toBe('world');
+        });
+
+        it('keeps a pair whole when it sits fully inside the range', () => {
+            const text = 'ab\ud83d\ude00cd';
+            expect(Utils.sliceSafe(text, 0, text.length)).toBe(text);
+        });
+
+        it('clamps out-of-range bounds', () => {
+            expect(Utils.sliceSafe('abc', -5, 99)).toBe('abc');
+        });
+
+        it('reassembles the original text when slicing contiguously across a pair', () => {
+            const text = 'aaaa\ud83d\ude00bbbb';
+            const first = Utils.sliceSafe(text, 0, 5);
+            const second = Utils.sliceSafe(text, 5, text.length);
+            expect(first + second).toBe(text);
+            expect((first + second).isWellFormed?.()).not.toBe(false);
+        });
+    });
+
+    // \u2500\u2500\u2500 matchesAnyGlob \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    describe('matchesAnyGlob', () => {
+        it('returns false for an empty pattern list', () => {
+            expect(Utils.matchesAnyGlob('vendor/a.go', [])).toBe(false);
+        });
+
+        it('matches an exact path', () => {
+            expect(Utils.matchesAnyGlob('go.mod', ['go.mod'])).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/go.mod', ['go.mod'])).toBe(false);
+        });
+
+        it('matches everything below a globstar directory', () => {
+            const patterns = ['vendor/**'];
+            expect(Utils.matchesAnyGlob('vendor/a.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('vendor/x/y/z.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('vendored/a.go', patterns)).toBe(false);
+            expect(Utils.matchesAnyGlob('pkg/vendor/a.go', patterns)).toBe(false);
+        });
+
+        it('matches a leading globstar at any depth, including the root', () => {
+            const patterns = ['**/*_test.go'];
+            expect(Utils.matchesAnyGlob('main_test.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/a/main_test.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/a/main.go', patterns)).toBe(false);
+        });
+
+        it('keeps a single star inside one path segment', () => {
+            const patterns = ['pkg/*.go'];
+            expect(Utils.matchesAnyGlob('pkg/a.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('pkg/sub/a.go', patterns)).toBe(false);
+        });
+
+        it('matches a star in the middle of a name', () => {
+            const patterns = ['**/zz_generated.*.go'];
+            expect(Utils.matchesAnyGlob('api/v1/zz_generated.deepcopy.go', patterns)).toBe(true);
+            expect(Utils.matchesAnyGlob('api/v1/zz_generated.go', patterns)).toBe(false);
+        });
+
+        it('matches one character with a question mark', () => {
+            expect(Utils.matchesAnyGlob('v1/a.go', ['v?/a.go'])).toBe(true);
+            expect(Utils.matchesAnyGlob('v12/a.go', ['v?/a.go'])).toBe(false);
+        });
+
+        it('matches when any pattern in the list matches', () => {
+            const patterns = ['vendor/**', '**/*.pb.go'];
+            expect(Utils.matchesAnyGlob('api/v1/types.pb.go', patterns)).toBe(true);
+        });
+
+        it('treats a dot in the pattern as a literal', () => {
+            expect(Utils.matchesAnyGlob('axgo', ['a.go'])).toBe(false);
+        });
+
+        it('normalizes backslashes, leading ./ and trailing slashes', () => {
+            expect(Utils.matchesAnyGlob('vendor\\a.go', ['vendor/**'])).toBe(true);
+            expect(Utils.matchesAnyGlob('./vendor/a.go', ['./vendor/**'])).toBe(true);
+            expect(Utils.matchesAnyGlob('vendor', ['vendor/'])).toBe(true);
+        });
+
+        it('ignores an empty path or an empty pattern', () => {
+            expect(Utils.matchesAnyGlob('', ['**'])).toBe(false);
+            expect(Utils.matchesAnyGlob('a.go', [''])).toBe(false);
+        });
+
+        it('is case-sensitive', () => {
+            expect(Utils.matchesAnyGlob('Vendor/a.go', ['vendor/**'])).toBe(false);
+        });
+    });
+
+    // \u2500\u2500\u2500 isDirectoryExcluded \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    describe('isDirectoryExcluded', () => {
+        it('excludes a directory named by a globstar pattern', () => {
+            expect(Utils.isDirectoryExcluded('vendor', ['vendor/**'])).toBe(true);
+            expect(Utils.isDirectoryExcluded('pkg/client', ['pkg/client/**'])).toBe(true);
+        });
+
+        it('excludes a directory named directly', () => {
+            expect(Utils.isDirectoryExcluded('vendor', ['vendor'])).toBe(true);
+        });
+
+        it('excludes a nested directory that a globstar prefix matches', () => {
+            expect(Utils.isDirectoryExcluded('a/build', ['**/build/**'])).toBe(true);
+        });
+
+        it('does not exclude a directory when the pattern selects only some files', () => {
+            expect(Utils.isDirectoryExcluded('pkg', ['**/*_test.go'])).toBe(false);
+        });
+
+        it('does not exclude a parent of an excluded directory', () => {
+            expect(Utils.isDirectoryExcluded('pkg', ['pkg/client/**'])).toBe(false);
+        });
+
+        it('returns false for an empty pattern list', () => {
+            expect(Utils.isDirectoryExcluded('vendor', [])).toBe(false);
+        });
+    });
 });
