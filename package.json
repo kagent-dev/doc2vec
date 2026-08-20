@@ -54,7 +54,7 @@
         "pg": "^8.18.0",
         "puppeteer": "^25.8.0",
         "sanitize-html": "^2.11.0",
-        "sqlite-vec": "0.1.7-alpha.2",
+        "sqlite-vec": "0.1.9",
         "tree-sitter-wasms": "^0.1.0",
         "turndown": "^7.1.2",
         "web-tree-sitter": "^0.25.4",
