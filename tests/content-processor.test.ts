@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ContentProcessor } from '../content-processor';
+import { ContentProcessor, openBrowser, remoteBrowserEndpoint } from '../content-processor';
 import { Logger, LogLevel } from '../logger';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -1296,6 +1296,43 @@ describe('ContentProcessor', () => {
             expect(processContent).not.toHaveBeenCalled();
         });
 
+        it('should connect to a remote browser instead of launching when BROWSER_WS_ENDPOINT is set', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const launchSpy = vi.spyOn(puppeteerModule.default, 'launch').mockClear();
+            const mockPage = {
+                goto: vi.fn().mockResolvedValue({ status: () => 200, headers: () => ({}) }),
+                evaluate: vi.fn().mockResolvedValue([]),
+                url: vi.fn().mockReturnValue('https://example.com'),
+                close: vi.fn().mockResolvedValue(undefined),
+            };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                connected: true,
+            };
+            const connectSpy = vi.spyOn(puppeteerModule.default, 'connect')
+                .mockResolvedValue(mockBrowser as any).mockClear();
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
+
+            process.env.BROWSER_WS_ENDPOINT = 'ws://browser.example:3000?token=t';
+            try {
+                const visited = new Set<string>();
+                await processor.crawlWebsite('https://example.com', websiteConfig, vi.fn().mockResolvedValue(true), testLogger, visited);
+            } finally {
+                delete process.env.BROWSER_WS_ENDPOINT;
+            }
+
+            expect(connectSpy).toHaveBeenCalledTimes(1);
+            expect(connectSpy.mock.calls[0][0]).toMatchObject({ browserWSEndpoint: 'ws://browser.example:3000?token=t' });
+            // Launch flags belong to the process that starts the browser, so
+            // none are sent to a remote one
+            expect(connectSpy.mock.calls[0][0]).not.toHaveProperty('args');
+            expect(launchSpy).not.toHaveBeenCalled();
+            // The crawl ends its own session; a browserless-style service gives
+            // each connection its own browser
+            expect(mockBrowser.close).toHaveBeenCalled();
+        });
+
         it('should skip already visited URLs', async () => {
             vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
 
@@ -2311,6 +2348,57 @@ describe('ContentProcessor', () => {
 
             const result = await processor.processPage('https://example.com/page', pageConfig);
             expect(result.content).toBeNull();
+        });
+    });
+
+    // ─── openBrowser ─────────────────────────────────────────────────
+    describe('openBrowser', () => {
+        afterEach(() => {
+            delete process.env.BROWSER_WS_ENDPOINT;
+        });
+
+        it('treats an empty or blank BROWSER_WS_ENDPOINT as unset', () => {
+            process.env.BROWSER_WS_ENDPOINT = '   ';
+            expect(remoteBrowserEndpoint()).toBeUndefined();
+            delete process.env.BROWSER_WS_ENDPOINT;
+            expect(remoteBrowserEndpoint()).toBeUndefined();
+            process.env.BROWSER_WS_ENDPOINT = ' ws://b:3000 ';
+            expect(remoteBrowserEndpoint()).toBe('ws://b:3000');
+        });
+
+        it('launches a local browser with sandbox flags when no endpoint is set', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockBrowser = { connected: true };
+            const launchSpy = vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any).mockClear();
+            const connectSpy = vi.spyOn(puppeteerModule.default, 'connect').mockClear();
+            vi.spyOn(puppeteerModule.default, 'executablePath').mockResolvedValue('/nonexistent/chrome' as any);
+
+            const browser = await openBrowser();
+            expect(browser).toBe(mockBrowser);
+            expect(connectSpy).not.toHaveBeenCalled();
+            expect(launchSpy).toHaveBeenCalledTimes(1);
+            expect(launchSpy.mock.calls[0][0]?.args).toEqual(expect.arrayContaining(['--no-sandbox', '--disable-dev-shm-usage']));
+        });
+
+        it('connects over CDP when BROWSER_WS_ENDPOINT is set', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockBrowser = { connected: true };
+            // Spies persist across tests in this file, so start from a clean call count
+            const launchSpy = vi.spyOn(puppeteerModule.default, 'launch').mockClear();
+            const connectSpy = vi.spyOn(puppeteerModule.default, 'connect').mockResolvedValue(mockBrowser as any).mockClear();
+
+            process.env.BROWSER_WS_ENDPOINT = 'ws://browser.example:3000?token=t';
+            const browser = await openBrowser();
+            expect(browser).toBe(mockBrowser);
+            expect(launchSpy).not.toHaveBeenCalled();
+            expect(connectSpy).toHaveBeenCalledWith(expect.objectContaining({ browserWSEndpoint: 'ws://browser.example:3000?token=t' }));
+        });
+
+        it('propagates a failed remote connection to the caller', async () => {
+            const puppeteerModule = await import('puppeteer');
+            vi.spyOn(puppeteerModule.default, 'connect').mockRejectedValue(new Error('ECONNREFUSED'));
+            process.env.BROWSER_WS_ENDPOINT = 'ws://browser.example:3000';
+            await expect(openBrowser()).rejects.toThrow('ECONNREFUSED');
         });
     });
 
