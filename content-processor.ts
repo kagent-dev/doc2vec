@@ -50,6 +50,61 @@ export interface CodeScanResult {
 }
 
 /**
+ * Where the browser comes from.
+ *
+ * Unset (the default): this process launches its own Chromium, which the image
+ * has to carry. Set: this process CONNECTS to a browser running elsewhere over
+ * the Chrome DevTools Protocol, and the image needs no browser at all. The
+ * value is a full CDP WebSocket URL, e.g.
+ *   ws://browserless.qdrant.svc.cluster.local:3000?token=<token>
+ *
+ * A remote browser is the one that keeps the app image small and lets the
+ * browser be updated independently of the app (a browser image tracks Chrome
+ * stable; a distro chromium is frozen at whatever the distro rebuilt last).
+ */
+export const BROWSER_WS_ENDPOINT_ENV = 'BROWSER_WS_ENDPOINT';
+
+export function remoteBrowserEndpoint(): string | undefined {
+    const raw = process.env[BROWSER_WS_ENDPOINT_ENV]?.trim();
+    return raw ? raw : undefined;
+}
+
+/**
+ * Chromium flags for a browser THIS process launches. They are not sent to a
+ * remote browser: launch flags belong to the process that starts the browser.
+ */
+const LOCAL_LAUNCH_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',  // Use /tmp instead of /dev/shm (critical in Docker, default 64MB)
+    '--disable-gpu',
+    '--disable-extensions',
+];
+
+const BROWSER_PROTOCOL_TIMEOUT_MS = 60000;
+
+/**
+ * Open a browser: connect to the remote one named by BROWSER_WS_ENDPOINT, or
+ * launch a local one. Callers close it with browser.close() in both cases —
+ * a browserless-style service gives each connection its own browser, so
+ * closing ends only this caller's session.
+ */
+export async function openBrowser(): Promise<Browser> {
+    const endpoint = remoteBrowserEndpoint();
+    if (endpoint) {
+        return puppeteer.connect({
+            browserWSEndpoint: endpoint,
+            protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+        });
+    }
+    return puppeteer.launch({
+        executablePath: await resolveBrowserExecutablePath(),
+        args: LOCAL_LAUNCH_ARGS,
+        protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+    });
+}
+
+/**
  * Resolve which browser binary to launch, in order of preference:
  *  1. PUPPETEER_EXECUTABLE_PATH (explicit override)
  *  2. Puppeteer's own downloaded Chrome for Testing (version-matched, the
@@ -473,21 +528,9 @@ export class ContentProcessor {
         let page: Page | null = null;
 
         const launchBrowser = async (): Promise<{ browser: Browser; page: Page }> => {
-            const executablePath = await resolveBrowserExecutablePath();
-            const launchOptions = {
-                executablePath,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',  // Use /tmp instead of /dev/shm (critical in Docker, default 64MB)
-                    '--disable-gpu',
-                    '--disable-extensions',
-                ],
-                protocolTimeout: 60000,
-            };
             let b: Browser;
             try {
-                b = await puppeteer.launch(launchOptions);
+                b = await openBrowser();
             } catch (firstError) {
                 // One retry after a pause — the failure may be transient (e.g.
                 // memory pressure from a page that just closed). If the browser
@@ -496,7 +539,7 @@ export class ContentProcessor {
                 logger.warn(`Browser launch failed (${memoryDiagnostics()}), retrying once in 5s...`, firstError);
                 await new Promise(resolve => setTimeout(resolve, 5000));
                 try {
-                    b = await puppeteer.launch(launchOptions);
+                    b = await openBrowser();
                 } catch (secondError) {
                     throw new BrowserLaunchError(
                         `browser failed to launch twice (${memoryDiagnostics()}): ${secondError instanceof Error ? secondError.message : String(secondError)}`
@@ -1030,18 +1073,8 @@ export class ContentProcessor {
             if (existingPage) {
                 page = existingPage;
             } else {
-                // Standalone mode: launch a browser for this single page
-                browser = await puppeteer.launch({
-                    executablePath: await resolveBrowserExecutablePath(),
-                    args: [
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--disable-extensions',
-                    ],
-                    protocolTimeout: 60000,
-                });
+                // Standalone mode: open a browser for this single page
+                browser = await openBrowser();
                 page = await browser.newPage();
             }
 

@@ -485,6 +485,42 @@ The script will then:
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
 
+## Docker Images and the Browser
+
+Website sources are rendered with a real browser (Puppeteer). The `Dockerfile` builds two images so you can choose where that browser runs:
+
+| Target | Contents | Use it when |
+|---|---|---|
+| `runtime` | doc2vec only, no browser | You run a browser elsewhere and point doc2vec at it (see below). Recommended for clusters: the browser is the one component that renders untrusted input, and it can be updated on its own schedule. |
+| `runtime-chrome` | doc2vec plus a bundled, version-matched Chrome | You want a single self-contained container. `linux/amd64` only. |
+
+```bash
+docker build --target runtime        -t doc2vec .
+docker build --target runtime-chrome -t doc2vec:chrome .
+```
+
+Both images are based on Wolfi (Chainguard) and run as the non-root user `doc2vec` (UID 14000).
+
+### Using a remote browser (`BROWSER_WS_ENDPOINT`)
+
+Set `BROWSER_WS_ENDPOINT` to a Chrome DevTools Protocol WebSocket URL and doc2vec connects to that browser instead of launching one. Any CDP-speaking browser works; [browserless](https://github.com/browserless/browserless) is a convenient packaged one:
+
+```bash
+docker run -d --name browser -e TOKEN=secret -e TIMEOUT=0 --shm-size=1g ghcr.io/browserless/chromium
+docker run --rm --link browser \
+  -e BROWSER_WS_ENDPOINT='ws://browser:3000?token=secret' \
+  -e OPENAI_API_KEY \
+  -v "$PWD/config.yaml:/config/config.yaml:ro" \
+  doc2vec node dist/doc2vec.js /config/config.yaml
+```
+
+Notes:
+
+- A crawl holds a browser for as long as it runs, so disable or raise the browser service's session timeout (browserless: `TIMEOUT=0`).
+- Each connection gets its own browser session; doc2vec closes it when the crawl finishes and every 50 pages.
+- Launch flags such as `--no-sandbox` belong to the process that starts the browser and are not sent to a remote one.
+- With `BROWSER_WS_ENDPOINT` unset, doc2vec launches a local Chrome: `PUPPETEER_EXECUTABLE_PATH` if set, else Puppeteer's downloaded Chrome for Testing, else a system `chromium`.
+
 ## Controller Mode
 
 Besides the one-shot sync, doc2vec can run as a **long-lived controller** that schedules sync jobs, records run history and statistics in Postgres, and serves a web UI for monitoring and managing configs:
@@ -591,12 +627,17 @@ spec:
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef: { name: doc2vec-secrets, key: openai-api-key }
+            # The browser runs in its own Deployment (e.g. ghcr.io/browserless/chromium
+            # with TIMEOUT=0); see "Docker Images and the Browser". Drop this variable
+            # and use the `-chrome` image to bundle the browser instead.
+            - name: BROWSER_WS_ENDPOINT
+              value: ws://browserless:3000?token=$(BROWSERLESS_TOKEN)
           volumeMounts:
             - name: configs
               mountPath: /etc/doc2vec
           resources:
             requests: { memory: 1Gi }
-            limits: { memory: 4Gi }   # website sources launch headless Chromium
+            limits: { memory: 2Gi }
       volumes:
         - name: configs
           configMap: { name: doc2vec-configs }
