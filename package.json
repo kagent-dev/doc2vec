@@ -57,7 +57,7 @@
         "sqlite-vec": "0.1.7-alpha.2",
         "tree-sitter-wasms": "^0.1.0",
         "turndown": "^7.1.2",
-        "web-tree-sitter": "^0.25.4",
+        "web-tree-sitter": "^0.26.11",
         "word-extractor": "^1.0.4"
     },
     "devDependencies": {
