@@ -24,7 +24,8 @@
   "author": "",
   "license": "ISC",
   "overrides": {
-    "zod": "$zod"
+    "zod": "$zod",
+    "undici": "^7.29.1"
   },
   "dependencies": {
     "@azure/identity": "^4.13.1",
