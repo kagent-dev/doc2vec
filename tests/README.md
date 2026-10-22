@@ -5,8 +5,8 @@
 | Metric | Value |
 |--------|-------|
 | **Framework** | [Vitest](https://vitest.dev/) v4 |
-| **Total tests** | 524 |
-| **Test files** | 8 |
+| **Total tests** | 780 (+8 skipped) |
+| **Test files** | 18 |
 | **Total lines** | ~10,000 |
 | **Execution time** | ~40s |
 
@@ -30,10 +30,11 @@ npm run test:coverage
 | `tests/utils.test.ts` | 65 | `utils.ts` | Hashing, UUID generation, URL utilities, tokenization |
 | `tests/logger.test.ts` | 47 | `logger.ts` | Log levels, formatting, colors, child loggers, progress bars |
 | `tests/content-processor.test.ts` | 194 | `content-processor.ts` | HTML conversion, chunking, crawling, ETag/lastmod change detection, adaptive backoff, PDF/DOC processing, tab preprocessing |
-| `tests/database.test.ts` | 75 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup, URL-level hash queries, URL prefix queries |
+| `tests/database.test.ts` | 88 | `database.ts` | SQLite and Qdrant operations, metadata, cleanup, URL-level hash queries, URL prefix queries |
 | `tests/code-chunker.test.ts` | 62 | `code-chunker.ts` | AST-based code chunking, language support, merge behavior, function boundary integrity |
-| `tests/doc2vec.test.ts` | 58 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings |
-| `tests/mcp-server.test.ts` | 12 | `mcp/src/server.ts` | MCP server helpers, query handlers, SQLite/Qdrant providers, end-to-end |
+| `tests/doc2vec.test.ts` | 122 | `doc2vec.ts` | Orchestrator class, config loading, source routing, embeddings |
+| `tests/eval.test.ts` | 17 | `eval.ts` | Retrieval eval: URL normalization, recall@k/MRR, case loading, dense/BM25/hybrid retrieval, reranking, one chunk per page, filters |
+| `tests/mcp-server.test.ts` | 29 | `mcp/src/server.ts` | MCP server helpers, query handlers, retrieval pipeline (one chunk per page, hybrid, reranking), DeepInfra reranker, SQLite and Qdrant keyword search, SQLite/Qdrant providers, end-to-end |
 | `tests/e2e.test.ts` | 11 (+2 conditional) | `doc2vec.ts`, `content-processor.ts`, `database.ts` | End-to-end integration tests for local directory, code source, website source, multi-sync change detection, incomplete sync recovery, and markdown store integration (SQLite + Qdrant) |
 
 ---
@@ -305,7 +306,7 @@ npm run test:coverage
 
 ---
 
-### `tests/database.test.ts` (75 tests)
+### `tests/database.test.ts` (88 tests)
 
 #### `initDatabase`
 - **SQLite**: Generates default `db_path` from product_name and version; uses custom `db_path`; returns `SqliteDB` connection
@@ -382,6 +383,18 @@ npm run test:coverage
 #### Error handling
 - `setMetadataValue`: Handles SQLite and Qdrant errors gracefully
 - `getMetadataValue`: Outer catch returns default value
+
+#### `Qdrant keyword index`
+- New collections get the `bm25` sparse vector (IDF modifier) only when the keyword index is on
+- An existing collection gets the vector added only when it is missing; an older Qdrant that rejects it leaves the index off
+- With the index on, a chunk is upserted with both vectors (`""` dense and `bm25` document)
+- Backfill pages through chunks without the vector, skips metadata points and empty text, and writes `qdrant/bm25` documents
+- A failed backfill does not fail the sync; the keyword index stays on for new chunks
+
+#### `Qdrant point ids`
+- The same text on two pages, or twice on one page, gets separate points (id from page URL and chunk position)
+- The id is stable for a page position, so rewriting a page overwrites in place
+- Falls back to the chunk id when a chunk has no position
 
 ---
 
@@ -501,7 +514,7 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 
 ---
 
-### `tests/doc2vec.test.ts` (58 tests)
+### `tests/doc2vec.test.ts` (122 tests)
 
 #### `constructor`
 - Creates Logger, loads config, initializes OpenAI client, initializes ContentProcessor
@@ -557,12 +570,46 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 - Config with only code sources
 - Creates embeddings with correct model name (`text-embedding-3-large`)
 
+#### One-time pass for per-page Qdrant point ids
+- On Qdrant, a website source processes every page once (bypassing lastmod/ETag) and then records it
+- Once recorded, normal caching resumes
+- Does not apply to SQLite
+- Not recorded when network errors cut the pass short
+
 #### Mocks specific to `doc2vec.test.ts`
 - `DatabaseManager` is fully mocked with: `initDatabase`, `initDatabaseMetadata`, `prepareSQLiteStatements`, `insertVectorsSQLite`, `removeObsoleteChunksSQLite`, `removeObsoleteFilesSQLite`, `removeChunksByUrlSQLite`, `removeChunksByUrlQdrant`, `getChunkHashesByUrlSQLite`, `getChunkHashesByUrlQdrant`, `getMetadataValue`, `setMetadataValue`, `getLastRunDate`, `updateLastRunDate`, `storeChunkInQdrant`, `createCollectionQdrant`, `removeObsoleteChunksQdrant`, `removeObsoleteFilesQdrant`
 
 ---
 
-### `tests/mcp-server.test.ts` (12 tests)
+### `tests/eval.test.ts` (17 tests)
+
+#### `eval metrics`
+- `normalizeUrl` ignores fragments, trailing slashes and case
+- `firstRelevantRank` returns the 1-based rank of the first relevant URL, `null` on a miss
+- `computeMetrics` computes recall@k and MRR, counting misses as zero; handles an empty set
+
+#### `retrieval helpers`
+- `onePerPage` keeps the first chunk of each page in order
+- `fuseRrf` ranks chunks found by both lists above chunks found by one
+- `toFtsQuery` quotes terms so punctuation cannot break FTS5 `MATCH`
+
+#### `loadEvalCases`
+- Reads `.jsonl` (skipping blank and `//` lines) and assigns ids by position
+- Reads YAML lists
+- Rejects cases without a query or relevant URLs, and files that are not a list
+
+#### `runEval against sqlite-vec`
+- Ranks like the MCP server query (fixed 4-d vectors, no embedding API), honours `product_name` filter, drops k values above `top_k`
+- A case's own `db` overrides the default database
+- `perPage` drops later chunks of a page already returned
+- `bm25` mode ranks by keywords from an in-memory FTS5 index, honouring filters
+- `hybrid` mode surfaces both the vector match and the keyword match
+- A reranker reorders the top candidates before one chunk per page is applied
+- Fails clearly when no database is given
+
+---
+
+### `tests/mcp-server.test.ts` (29 tests)
 
 #### `MCP server helpers`
 - `normalizeExtensions` normalizes extensions to lowercase and dot-prefixed
@@ -582,6 +629,33 @@ Every test is designed so that total code exceeds `chunkSize` (forcing the chunk
 #### `Qdrant provider`
 - Maps `dbName` to collection and returns search results
 - Scrolls chunks and sorts by `chunk_index`
+
+#### `Retrieval helpers`
+- `onePerPage` keeps the first chunk of each page, ignoring fragments and trailing slashes
+- `fuseRrf` ranks chunks found by both lists first and keeps the vector row (with its distance)
+- `fuseRrf` keeps identical text on two pages as two chunks (chunk ids are content hashes)
+- `toFtsQuery` quotes terms so punctuation cannot break FTS5 `MATCH`
+
+#### `MCP retrieval pipeline`
+- No option set keeps the previous behaviour (same depth, no keyword search)
+- One chunk per page fetches 50 candidates and fills the limit with distinct pages
+- Hybrid fuses keyword hits (no distance shown for keyword-only hits) and falls back to vector results if keyword search fails
+- Reranking reorders the top `rerankCandidates`, shows `Relevance`, then one chunk per page applies
+- A failing reranker keeps the retrieval order
+- `query_code` runs the same pipeline after its path and extension filters
+
+#### `DeepInfra reranker`
+- Sends `{queries, documents}` with the bearer key to the model's inference URL and returns the scores
+- Rejects an HTTP error or a score list of the wrong length
+
+#### `SQLite keyword search`
+- Ranks stored chunks by BM25 with product filters, and rebuilds its in-memory index when the database file changes
+- Feeds hybrid retrieval end to end with the real sqlite-vec query
+
+#### `Qdrant keyword search`
+- Queries the `bm25` vector with the `qdrant/bm25` model and the product/version filter; keyword hits report no distance
+- A collection without the keyword vector is not asked again for 10 minutes
+- Hybrid retrieval on such a collection falls back to the vector results
 
 #### `MCP server end-to-end`
 - Full pipeline: starts local HTTP server, fetches HTML, converts to Markdown, chunks, stores in SQLite, queries via MCP handler, and verifies the unique phrase is returned in results

@@ -973,6 +973,66 @@ sources:
                 // ...but the broad obsolete sweep is skipped when the site was flaky
                 expect(DatabaseManager.removeObsoleteChunksSQLite).not.toHaveBeenCalled();
             });
+
+            // Qdrant point ids used to come from the chunk text, merging the
+            // same chunk on two pages; one full pass restores the lost chunks
+            describe('one-time pass for per-page Qdrant point ids', () => {
+                const qdrantConfig = { ...websiteConfig, database_config: { type: 'qdrant', params: { collection_name: 'c' } } };
+                const forceFullSyncOf = (crawl: any) => crawl.mock.calls[0][crawl.mock.calls[0].length - 1].forceFullSync;
+
+                async function runWith(config: any, dbType: 'sqlite' | 'qdrant', stored: Record<string, string>) {
+                    const { DatabaseManager } = await import('../database');
+                    (DatabaseManager.initDatabase as any).mockResolvedValueOnce(
+                        dbType === 'qdrant' ? { type: 'qdrant', client: {}, collectionName: 'c' } : { type: 'sqlite', db: {} },
+                    );
+                    (DatabaseManager.getMetadataValue as any).mockImplementation(async (_db: any, key: string) =>
+                        Object.entries(stored).find(([prefix]) => key.startsWith(prefix))?.[1]);
+                    instance = createInstanceWithSources([config]);
+                    const crawl = vi.fn().mockResolvedValue({ hasNetworkErrors: false, brokenLinks: [] });
+                    (instance as any).contentProcessor.crawlWebsite = crawl;
+                    await (instance as any).processWebsite(config, makeLogger());
+                    return { crawl, DatabaseManager };
+                }
+
+                afterEach(async () => {
+                    const { DatabaseManager } = await import('../database');
+                    (DatabaseManager.getMetadataValue as any).mockReset().mockResolvedValue(undefined);
+                });
+
+                it('processes every page once on Qdrant, then records it', async () => {
+                    const { crawl, DatabaseManager } = await runWith(qdrantConfig, 'qdrant', { 'sync_complete:': 'true' });
+                    expect(forceFullSyncOf(crawl)).toBe(true);
+                    expect(DatabaseManager.setMetadataValue).toHaveBeenCalledWith(
+                        expect.anything(), expect.stringMatching(/^point_ids_by_position:/), 'true', expect.anything(), expect.anything(),
+                    );
+                });
+
+                it('goes back to normal caching once recorded', async () => {
+                    const { crawl } = await runWith(qdrantConfig, 'qdrant', { 'sync_complete:': 'true', 'point_ids_by_position:': 'true' });
+                    expect(forceFullSyncOf(crawl)).toBe(false);
+                });
+
+                it('does not apply to SQLite, which never merged chunks', async () => {
+                    const { crawl, DatabaseManager } = await runWith(websiteConfig, 'sqlite', { 'sync_complete:': 'true' });
+                    expect(forceFullSyncOf(crawl)).toBe(false);
+                    expect(DatabaseManager.setMetadataValue).not.toHaveBeenCalledWith(
+                        expect.anything(), expect.stringMatching(/^point_ids_by_position:/), expect.anything(), expect.anything(), expect.anything(),
+                    );
+                });
+
+                it('does not record it when network errors cut the pass short', async () => {
+                    const { DatabaseManager } = await import('../database');
+                    (DatabaseManager.initDatabase as any).mockResolvedValueOnce({ type: 'qdrant', client: {}, collectionName: 'c' });
+                    (DatabaseManager.getMetadataValue as any).mockImplementation(async (_db: any, key: string) =>
+                        key.startsWith('sync_complete:') ? 'true' : undefined);
+                    instance = createInstanceWithSources([qdrantConfig]);
+                    (instance as any).contentProcessor.crawlWebsite = vi.fn().mockResolvedValue({ hasNetworkErrors: true, brokenLinks: [] });
+                    await (instance as any).processWebsite(qdrantConfig, makeLogger());
+                    expect(DatabaseManager.setMetadataValue).not.toHaveBeenCalledWith(
+                        expect.anything(), expect.stringMatching(/^point_ids_by_position:/), expect.anything(), expect.anything(), expect.anything(),
+                    );
+                });
+            });
         });
 
         // An incomplete walk (a directory that couldn't be listed) means the set

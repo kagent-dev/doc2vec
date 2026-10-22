@@ -62,9 +62,23 @@ export class DatabaseManager {
             logger.info(`Connecting to Qdrant at ${qdrantUrl}:${qdrantPort}, collection: ${collectionName}`);
             const qdrantClient = new QdrantClient({ url: qdrantUrl, apiKey: process.env.QDRANT_API_KEY, port: qdrantPort });
 
-            await this.createCollectionQdrant(qdrantClient, collectionName, logger, embeddingDimension);
+            await this.createCollectionQdrant(qdrantClient, collectionName, logger, embeddingDimension, !!params.keyword_index);
+            const connection: QdrantDB = { client: qdrantClient, collectionName, type: 'qdrant' };
+            if (params.keyword_index) {
+                connection.keywordIndex = await this.ensureKeywordVectorQdrant(qdrantClient, collectionName, logger);
+                if (connection.keywordIndex) {
+                    // Best-effort: a failed backfill must not fail the sync. New
+                    // chunks still get the vector, and the next sync resumes
+                    // with the chunks that lack it.
+                    try {
+                        await this.backfillKeywordVectorsQdrant(connection, logger);
+                    } catch (error) {
+                        logger.warn(`Keyword vector backfill of ${collectionName} stopped early; it resumes on the next sync:`, error);
+                    }
+                }
+            }
             logger.info(`Qdrant connection established successfully`);
-            return { client: qdrantClient, collectionName, type: 'qdrant' };
+            return connection;
         } else {
             const errMsg = `Unsupported database type: ${dbConfig.type}`;
             logger.error(errMsg);
@@ -72,7 +86,79 @@ export class DatabaseManager {
         }
     }
 
-    static async createCollectionQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger, embeddingDimension: number) {
+    // Qdrant computes the BM25 keyword vector itself from the chunk text
+    // (the `qdrant/bm25` model) and applies IDF at query time (`idf` modifier).
+    // The MCP server queries the same vector name with the same model.
+    static readonly KEYWORD_VECTOR = 'bm25';
+    static readonly KEYWORD_MODEL = 'qdrant/bm25';
+
+    static keywordDocument(text: string) {
+        return { text, model: DatabaseManager.KEYWORD_MODEL };
+    }
+
+    /**
+     * Adds the keyword vector to a collection that predates it. Needs Qdrant
+     * 1.18+ (vector schema updates); on an older server this logs a warning and
+     * returns false, and chunks are stored without the keyword vector.
+     */
+    static async ensureKeywordVectorQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger): Promise<boolean> {
+        try {
+            const info: any = await qdrantClient.getCollection(collectionName);
+            const sparse = info?.config?.params?.sparse_vectors ?? {};
+            if (sparse[DatabaseManager.KEYWORD_VECTOR]) {
+                return true;
+            }
+            logger.info(`Adding keyword vector '${DatabaseManager.KEYWORD_VECTOR}' to collection ${collectionName}`);
+            await qdrantClient.createVectorName(collectionName, DatabaseManager.KEYWORD_VECTOR, { sparse: { modifier: 'idf' } } as any);
+            return true;
+        } catch (error) {
+            logger.warn(`Could not enable the keyword index on ${collectionName} (needs Qdrant 1.18 or later); storing chunks without it:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Gives the keyword vector to every chunk stored before it existed. Only
+     * points without it are read, so an interrupted backfill resumes on the
+     * next sync and a finished one costs a single empty scroll.
+     */
+    static async backfillKeywordVectorsQdrant(db: QdrantDB, logger: Logger): Promise<number> {
+        const { client, collectionName } = db;
+        const filter = {
+            must_not: [
+                { has_vector: DatabaseManager.KEYWORD_VECTOR },
+                { key: 'is_metadata', match: { value: true } },
+            ],
+        };
+        let updated = 0;
+        let offset: any = undefined;
+        do {
+            const page: any = await client.scroll(collectionName, {
+                filter,
+                limit: 256,
+                offset,
+                with_payload: ['content'],
+                with_vector: false,
+            });
+            const points = (page?.points ?? [])
+                .filter((p: any) => typeof p.payload?.content === 'string' && p.payload.content.trim().length > 0)
+                .map((p: any) => ({
+                    id: p.id,
+                    vector: { [DatabaseManager.KEYWORD_VECTOR]: DatabaseManager.keywordDocument(p.payload.content) },
+                }));
+            if (points.length > 0) {
+                await client.updateVectors(collectionName, { wait: true, points });
+                updated += points.length;
+            }
+            offset = page?.next_page_offset;
+        } while (offset !== undefined && offset !== null);
+        if (updated > 0) {
+            logger.info(`Backfilled the keyword vector for ${updated} chunks in ${collectionName}`);
+        }
+        return updated;
+    }
+
+    static async createCollectionQdrant(qdrantClient: QdrantClient, collectionName: string, logger: Logger, embeddingDimension: number, keywordIndex: boolean = false) {
         try {
             logger.debug(`Checking if collection ${collectionName} exists`);
             const collections = await qdrantClient.getCollections();
@@ -91,6 +177,9 @@ export class DatabaseManager {
                     size: embeddingDimension,
                     distance: "Cosine",
                 },
+                ...(keywordIndex && {
+                    sparse_vectors: { [DatabaseManager.KEYWORD_VECTOR]: { modifier: 'idf' as const } },
+                }),
             });
             logger.info(`Collection ${collectionName} created successfully`);
         } catch (error) {
@@ -471,24 +560,45 @@ export class DatabaseManager {
         transaction();
     }
 
+    /**
+     * One point per position on a page. chunk_id is a hash of the chunk text,
+     * so using it as the id merged the same text on two pages (or twice on one
+     * page) into a single point: one page lost the chunk, and both looked
+     * changed on every sync and were re-embedded. Every write path deletes a
+     * page's chunks by URL before inserting the new set, so (url, chunk_index)
+     * is unique and stable enough. Points written under the old scheme keep
+     * their ids until their page changes; deletes go by URL or by the ids read
+     * back, so the two schemes coexist.
+     */
+    static qdrantPointId(chunk: DocumentChunk): string {
+        const { url, chunk_index, chunk_id } = chunk.metadata;
+        if (url && typeof chunk_index === 'number') {
+            return Utils.hashToUuid(Utils.generateHash(`${url}\u0000${chunk_index}`));
+        }
+        return Utils.isValidUuid(chunk_id) ? chunk_id : Utils.hashToUuid(chunk_id);
+    }
+
     static async storeChunkInQdrant(db: QdrantDB, chunk: DocumentChunk, embedding: number[], chunkHash?: string) {
         const { client, collectionName } = db;
         try {
             let pointId: string;
             try {
-                pointId = chunk.metadata.chunk_id;
-                if (!Utils.isValidUuid(pointId)) {
-                    pointId = Utils.hashToUuid(chunk.metadata.chunk_id);
-                }
+                pointId = DatabaseManager.qdrantPointId(chunk);
             } catch (e) {
                 pointId = crypto.randomUUID();
             }
             
             const hash = chunkHash || Utils.generateHash(chunk.content);
             
+            // With a keyword index the point carries both vectors: the unnamed
+            // dense one (named "" in a vector map) and the BM25 one
+            const vector = db.keywordIndex
+                ? { '': embedding, [DatabaseManager.KEYWORD_VECTOR]: DatabaseManager.keywordDocument(chunk.content) }
+                : embedding;
+
             const pointItem = {
                 id: pointId,
-                vector: embedding,
+                vector,
                 payload: {
                     content: chunk.content,
                     product_name: chunk.metadata.product_name,

@@ -107,6 +107,7 @@ export const DATABASE_TYPES: Record<string, { label: string; fields: FieldDef[] 
       { key: 'qdrant_url', label: 'Qdrant URL', type: 'string', placeholder: 'http://localhost' },
       { key: 'qdrant_port', label: 'Port', type: 'number', placeholder: '6333' },
       { key: 'collection_name', label: 'Collection', type: 'string', placeholder: 'my-product' },
+      { key: 'keyword_index', label: 'Keyword index (BM25)', type: 'boolean', help: 'Stores a BM25 keyword vector per chunk so the MCP server can run hybrid search (HYBRID_SEARCH=true). Needs Qdrant 1.18 or later; existing chunks are backfilled on the next sync' },
     ],
   },
 };

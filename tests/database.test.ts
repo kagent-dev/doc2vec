@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { DatabaseManager } from '../database';
 import { Logger, LogLevel } from '../logger';
+import { Utils } from '../utils';
 import { DocumentChunk, SqliteDB, QdrantDB, SourceConfig } from '../types';
 import BetterSqlite3 from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
@@ -1623,5 +1624,113 @@ describe('DatabaseManager', () => {
             const result = (DatabaseManager as any).hasColumn(mockDb, 'branch');
             expect(result).toBe(true);
         });
+    });
+});
+
+describe('Qdrant keyword index', () => {
+    it('creates new collections with the BM25 sparse vector when asked', async () => {
+        const client = { getCollections: vi.fn().mockResolvedValue({ collections: [] }), createCollection: vi.fn().mockResolvedValue({}) };
+        await DatabaseManager.createCollectionQdrant(client as any, 'kw_col', testLogger, TEST_EMBEDDING_DIMENSION, true);
+        expect(client.createCollection).toHaveBeenCalledWith('kw_col', {
+            vectors: { size: TEST_EMBEDDING_DIMENSION, distance: 'Cosine' },
+            sparse_vectors: { bm25: { modifier: 'idf' } },
+        });
+
+        const plain = { getCollections: vi.fn().mockResolvedValue({ collections: [] }), createCollection: vi.fn().mockResolvedValue({}) };
+        await DatabaseManager.createCollectionQdrant(plain as any, 'plain_col', testLogger, TEST_EMBEDDING_DIMENSION);
+        expect(plain.createCollection.mock.calls[0][1]).not.toHaveProperty('sparse_vectors');
+    });
+
+    it('adds the keyword vector to an existing collection only when it is missing', async () => {
+        const has = { getCollection: vi.fn().mockResolvedValue({ config: { params: { sparse_vectors: { bm25: { modifier: 'idf' } } } } }), createVectorName: vi.fn() };
+        await expect(DatabaseManager.ensureKeywordVectorQdrant(has as any, 'c', testLogger)).resolves.toBe(true);
+        expect(has.createVectorName).not.toHaveBeenCalled();
+
+        const missing = { getCollection: vi.fn().mockResolvedValue({ config: { params: {} } }), createVectorName: vi.fn().mockResolvedValue(true) };
+        await expect(DatabaseManager.ensureKeywordVectorQdrant(missing as any, 'c', testLogger)).resolves.toBe(true);
+        expect(missing.createVectorName).toHaveBeenCalledWith('c', 'bm25', { sparse: { modifier: 'idf' } });
+
+        // An older Qdrant rejects the schema update: chunks are then stored without it
+        const old = { getCollection: vi.fn().mockResolvedValue({ config: { params: {} } }), createVectorName: vi.fn().mockRejectedValue(new Error('404 Not Found')) };
+        await expect(DatabaseManager.ensureKeywordVectorQdrant(old as any, 'c', testLogger)).resolves.toBe(false);
+    });
+
+    it('stores the dense and BM25 vectors together when the index is on', async () => {
+        const client = { upsert: vi.fn().mockResolvedValue({}) };
+        const chunk = createTestChunk();
+        const embedding = createTestEmbedding();
+        await DatabaseManager.storeChunkInQdrant({ client, collectionName: 'c', type: 'qdrant', keywordIndex: true }, chunk, embedding);
+        const point = client.upsert.mock.calls[0][1].points[0];
+        expect(point.vector).toEqual({ '': embedding, bm25: { text: chunk.content, model: 'qdrant/bm25' } });
+    });
+
+    it('keeps syncing when the backfill fails, with the keyword index still on for new chunks', async () => {
+        const create = vi.spyOn(DatabaseManager, 'createCollectionQdrant').mockResolvedValue(undefined);
+        const ensure = vi.spyOn(DatabaseManager, 'ensureKeywordVectorQdrant').mockResolvedValue(true);
+        const backfill = vi.spyOn(DatabaseManager, 'backfillKeywordVectorsQdrant').mockRejectedValue(new Error('timeout'));
+        try {
+            const config = {
+                type: 'website', product_name: 'p', version: 'v', url: 'https://d/', max_size: 1,
+                database_config: { type: 'qdrant', params: { qdrant_url: 'http://localhost', qdrant_port: 6333, collection_name: 'c', keyword_index: true } },
+            } as any;
+            const db = await DatabaseManager.initDatabase(config, testLogger, TEST_EMBEDDING_DIMENSION) as QdrantDB;
+            expect(db.keywordIndex).toBe(true);
+            expect(create).toHaveBeenCalledWith(expect.anything(), 'c', expect.anything(), TEST_EMBEDDING_DIMENSION, true);
+            expect(backfill).toHaveBeenCalledOnce();
+        } finally {
+            create.mockRestore(); ensure.mockRestore(); backfill.mockRestore();
+        }
+    });
+
+    it('backfills only chunks without the keyword vector, page by page, skipping metadata and empty text', async () => {
+        const client = {
+            scroll: vi.fn()
+                .mockResolvedValueOnce({
+                    points: [
+                        { id: 'a', payload: { content: 'Install with Helm' } },
+                        { id: 'b', payload: { content: '   ' } },
+                    ],
+                    next_page_offset: 'c',
+                })
+                .mockResolvedValueOnce({ points: [{ id: 'c', payload: { content: 'mTLS' } }], next_page_offset: null }),
+            updateVectors: vi.fn().mockResolvedValue({}),
+        };
+        const updated = await DatabaseManager.backfillKeywordVectorsQdrant({ client, collectionName: 'c', type: 'qdrant', keywordIndex: true }, testLogger);
+        expect(updated).toBe(2);
+        expect(client.scroll).toHaveBeenCalledWith('c', expect.objectContaining({
+            filter: { must_not: [{ has_vector: 'bm25' }, { key: 'is_metadata', match: { value: true } }] },
+            offset: undefined,
+        }));
+        expect(client.scroll.mock.calls[1][1].offset).toBe('c');
+        expect(client.updateVectors).toHaveBeenNthCalledWith(1, 'c', {
+            wait: true,
+            points: [{ id: 'a', vector: { bm25: { text: 'Install with Helm', model: 'qdrant/bm25' } } }],
+        });
+        expect(client.updateVectors).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe('Qdrant point ids', () => {
+    it('gives the same text on two pages, or twice on a page, separate points', () => {
+        const same = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+        const a0 = DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: same, url: 'https://d/a', chunk_index: 0 } }));
+        const b0 = DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: same, url: 'https://d/b', chunk_index: 0 } }));
+        const a3 = DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: same, url: 'https://d/a', chunk_index: 3 } }));
+        expect(new Set([a0, b0, a3]).size).toBe(3);
+        expect(a0).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
+    });
+
+    it('is stable for a page position, so a rewrite of the page overwrites in place', () => {
+        const first = DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: 'aaaa', url: 'https://d/a', chunk_index: 1 } }));
+        const edited = DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: 'bbbb', url: 'https://d/a', chunk_index: 1 } }));
+        expect(edited).toBe(first);
+    });
+
+    it('falls back to the chunk_id when the chunk has no position', () => {
+        const uuid = '123e4567-e89b-42d3-a456-426614174000';
+        expect(DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: uuid, chunk_index: undefined as any } }))).toBe(uuid);
+        const hex = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+        expect(DatabaseManager.qdrantPointId(createTestChunk({ metadata: { chunk_id: hex, chunk_index: undefined as any } })))
+            .toBe(Utils.hashToUuid(hex));
     });
 });
