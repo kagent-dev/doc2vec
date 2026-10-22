@@ -697,8 +697,17 @@ export class Doc2Vec {
         // remaining pages to be skipped indefinitely.
         const syncCompleteKey = `sync_complete:${urlPrefix}`;
         const syncCompleteValue = await DatabaseManager.getMetadataValue(dbConnection, syncCompleteKey, undefined, logger);
-        const forceFullSync = syncCompleteValue !== 'true';
-        if (forceFullSync) {
+        // Qdrant point ids used to come from the chunk text, which merged the
+        // same chunk on two pages into one point (see qdrantPointId). One pass
+        // over every page rewrites the pages that lost chunks; pages whose
+        // chunks are all there are skipped by the hash comparison as usual.
+        const pointIdKey = `point_ids_by_position:${urlPrefix}`;
+        const repairPointIds = dbConnection.type === 'qdrant'
+            && (await DatabaseManager.getMetadataValue(dbConnection, pointIdKey, undefined, logger)) !== 'true';
+        const forceFullSync = syncCompleteValue !== 'true' || repairPointIds;
+        if (forceFullSync && syncCompleteValue === 'true') {
+            logger.info('Processing all pages once to restore chunks shared between pages (per-page Qdrant point ids); unchanged pages are not re-embedded');
+        } else if (forceFullSync) {
             logger.info('Full sync has not yet completed for this source — forcing processing of all pages (bypassing lastmod/ETag skip)');
         }
 
@@ -783,6 +792,9 @@ export class Doc2Vec {
             // unset and the next run will force-process all pages again.
             if (forceFullSync) {
                 await DatabaseManager.setMetadataValue(dbConnection, syncCompleteKey, 'true', logger, this.embeddingDimension);
+                if (repairPointIds) {
+                    await DatabaseManager.setMetadataValue(dbConnection, pointIdKey, 'true', logger, this.embeddingDimension);
+                }
                 logger.info('Full sync completed successfully — subsequent runs will use normal caching');
             }
             let removed = { items: 0, chunks: 0 };
@@ -935,7 +947,15 @@ export class Doc2Vec {
         const fileListKey = `s3_filelist_${bucketKey}`;
 
         const lastSyncValue = await DatabaseManager.getMetadataValue(dbConnection, lastSyncKey, '0', logger);
-        const lastSyncTimestamp = parseInt(lastSyncValue || '0', 10);
+        // One pass over every object to restore chunks that text-derived
+        // Qdrant point ids merged across files (see processWebsite)
+        const pointIdKey = `point_ids_by_position:s3_${bucketKey}`;
+        const repairPointIds = dbConnection.type === 'qdrant'
+            && (await DatabaseManager.getMetadataValue(dbConnection, pointIdKey, undefined, logger)) !== 'true';
+        if (repairPointIds && lastSyncValue && lastSyncValue !== '0') {
+            logger.info('Processing all objects once to restore chunks shared between files (per-page Qdrant point ids)');
+        }
+        const lastSyncTimestamp = repairPointIds ? 0 : parseInt(lastSyncValue || '0', 10);
 
         const includeExtensions = config.include_extensions || ['.md', '.txt', '.html', '.htm', '.pdf', '.doc', '.docx'];
         const excludeExtensions = config.exclude_extensions || [];
@@ -1117,6 +1137,9 @@ export class Doc2Vec {
         const currentKeys = Array.from(processedFiles);
         await DatabaseManager.setMetadataValue(dbConnection, fileListKey, JSON.stringify(currentKeys), logger, this.embeddingDimension);
         await DatabaseManager.setMetadataValue(dbConnection, lastSyncKey, `${syncStartTimestamp}`, logger, this.embeddingDimension);
+        if (repairPointIds) {
+            await DatabaseManager.setMetadataValue(dbConnection, pointIdKey, 'true', logger, this.embeddingDimension);
+        }
 
         logger.info(`Finished processing S3 bucket: ${config.bucket}`);
     }
@@ -2124,6 +2147,36 @@ if (require.main === module) {
             (value: string, previous: number[]) => [...previous, parseInt(value, 10)], [] as number[])
         .action((configPath: string, options: { source: string[]; sourceIndex: number[] }) =>
             runOneShot(configPath, { names: options.source, indices: options.sourceIndex }));
+
+    program
+        .command('eval <cases>')
+        .description('Measure retrieval quality (recall@k, MRR) of a sqlite-vec database against questions with known relevant URLs')
+        .option('--db <path>', 'sqlite database to query (cases may override it with a "db" field)')
+        .option('--config <path>', 'config file whose embedding section built the database (default: env vars)')
+        .option('--top-k <n>', 'number of chunks retrieved per question', (v: string) => parseInt(v, 10), 10)
+        .option('--out <path>', 'write the full JSON report here')
+        .option('--mode <mode>', "retrieval: 'dense' (vector, as the MCP server), 'bm25' (keyword) or 'hybrid' (both, fused with RRF)", 'dense')
+        .option('--per-page', 'keep only the best chunk of each page in the results', false)
+        .option('--rerank <provider>', "rerank the top candidates: 'deepinfra' (needs DEEPINFRA_API_KEY)")
+        .option('--rerank-model <model>', 'reranker model (default: nvidia/Nemotron-3.5-Rerank-8B-BF16)')
+        .option('--rerank-candidates <n>', 'how many top chunks the reranker sees (default: 40)', (v: string) => parseInt(v, 10))
+        .action(async (casesPath: string, options: {
+            db?: string; config?: string; topK: number; out?: string; mode: string; perPage: boolean;
+            rerank?: string; rerankModel?: string; rerankCandidates?: number;
+        }) => {
+            // Lazy-require so the sync path doesn't load the eval module
+            const { runEvalCommand } = require('./eval') as typeof import('./eval');
+            try {
+                await runEvalCommand({
+                    casesPath, dbPath: options.db, configPath: options.config, topK: options.topK, outPath: options.out,
+                    mode: options.mode as import('./eval').RetrievalMode, perPage: options.perPage,
+                    rerank: options.rerank, rerankModel: options.rerankModel, rerankCandidates: options.rerankCandidates,
+                });
+            } catch (err) {
+                console.error(err instanceof Error ? err.message : err);
+                process.exit(1);
+            }
+        });
 
     program
         .command('controller [configs...]')

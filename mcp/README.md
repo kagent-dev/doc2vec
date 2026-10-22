@@ -49,6 +49,27 @@ The server automatically detects the database schema and adapts its queries acco
 | `QDRANT_API_KEY` | Qdrant API key (optional) | - |
 | `TRANSPORT_TYPE` | Transport type: 'sse', 'stdio', or 'http' | sse |
 | `PORT` | Port to run the server on (HTTP/SSE transports only) | 3001 |
+| `ONE_CHUNK_PER_PAGE` | Return at most one chunk per page (the best one) | `false` |
+| `HYBRID_SEARCH` | Fuse vector search with keyword (BM25) search. On Qdrant, needs collections ingested with `keyword_index: true` | `false` |
+| `RERANKER` | Rerank the top candidates: `deepinfra`, or unset for none | - |
+| `DEEPINFRA_API_KEY` | DeepInfra API key (required when `RERANKER=deepinfra`) | - |
+| `RERANK_MODEL` | DeepInfra reranker model | `nvidia/Nemotron-3.5-Rerank-8B-BF16` |
+| `RERANK_CANDIDATES` | How many top candidates the reranker scores | `40` |
+| `RERANK_TIMEOUT_MS` | Reranker request timeout; on timeout or error results keep their retrieval order | `10000` |
+
+## Retrieval Pipeline
+
+`query_documentation` and `query_code` run the same steps:
+
+1. **Vector search** for the nearest chunks.
+2. **Keyword search** (`HYBRID_SEARCH`): BM25 over the chunk text, fused with the vector results by Reciprocal Rank Fusion.
+   - **SQLite**: the keyword index is built in memory from the stored chunk text the first time a database is searched (about a second per few thousand chunks, plus the chunk text in memory), cached for up to 8 databases, and rebuilt when the database file changes. Nothing changes at ingestion.
+   - **Qdrant**: the server queries the `bm25` sparse vector that doc2vec stores when a source sets `keyword_index: true` (Qdrant computes it with its `qdrant/bm25` model). A collection without it falls back to vector search alone, and is retried after 10 minutes.
+3. **URL and extension filters** from the tool arguments.
+4. **Reranking** (`RERANKER`): the top `RERANK_CANDIDATES` chunks are scored against the query by a cross-encoder and reordered. Results then show a `Relevance` score.
+5. **One chunk per page** (`ONE_CHUNK_PER_PAGE`): later chunks of a page already returned are dropped, so the results cover more pages. Use `get_chunks` to read the rest of a page.
+
+On 1,206 support questions over two documentation sites, with `text-embedding-3-large`, the share of questions whose cited page is in the 4 results rises from 63.8% (vector search only) to 68.2% with one chunk per page, 70.8% with keyword search added, and 79.5% with `nvidia/Nemotron-3.5-Rerank-8B-BF16` reranking (measured on this server's own query code). See `RETRIEVAL_ROADMAP.md` in the doc2vec repository for the full comparison. Reranking adds about 1.5 s per query (median, one request at a time).
 
 ## Local Setup and Running
 

@@ -105,6 +105,7 @@ export interface QdrantDatabaseParams {
     qdrant_url?: string;
     qdrant_port?: number;
     collection_name?: string;
+    keyword_index?: boolean;   // also store a BM25 keyword vector per chunk, for hybrid search (Qdrant >= 1.18)
 }
 
 export interface EmbeddingConfig {
@@ -210,6 +211,7 @@ export interface QdrantDB {
     client: any; // QdrantClient
     collectionName: string;
     type: 'qdrant';
+    keywordIndex?: boolean;  // chunks are stored with a BM25 keyword vector
 }
 
 export type DatabaseConnection = SqliteDB | QdrantDB; 

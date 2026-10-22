@@ -8,6 +8,7 @@ export interface QueryResult {
     chunk_index?: number;
     total_chunks?: number;
     embedding?: Float32Array | number[];
+    relevance?: number;
     [key: string]: unknown;
 }
 
@@ -29,6 +30,34 @@ export type QueryCollection = (
     topK?: number
 ) => Promise<QueryResult[]>;
 
+// Keyword (BM25) search over the same chunks, for hybrid retrieval
+export type KeywordSearch = (
+    queryText: string,
+    dbPath: string,
+    filter: QueryFilter,
+    topK: number
+) => Promise<QueryResult[]>;
+
+// Scores each document against the query; higher is more relevant
+export type Rerank = (query: string, documents: string[]) => Promise<number[]>;
+
+export interface RetrievalOptions {
+    onePerPage?: boolean;       // keep only the best chunk of each page
+    hybrid?: boolean;           // fuse vector and keyword results (needs keywordSearch)
+    rerankCandidates?: number;  // how many fused candidates the reranker sees
+}
+
+// Must match what doc2vec writes (DatabaseManager.KEYWORD_VECTOR / KEYWORD_MODEL)
+export const QDRANT_KEYWORD_VECTOR = 'bm25';
+export const QDRANT_KEYWORD_MODEL = 'qdrant/bm25';
+
+export const DEFAULT_RERANK_MODEL = 'nvidia/Nemotron-3.5-Rerank-8B-BF16';
+export const DEFAULT_RERANK_CANDIDATES = 40;
+// List depth fetched before fusion or per-page filtering, so the top results
+// still fill up after repeats of a page are dropped
+const CANDIDATE_DEPTH = 50;
+const RRF_K = 60;
+
 export type GetChunksForDocument = (
     productName: string | undefined,
     dbName: string | undefined,
@@ -49,12 +78,15 @@ type SqliteDatabaseStatement = {
 type SqliteDatabase = {
     prepare: (query: string) => SqliteDatabaseStatement;
     close: () => void;
+    exec?: (sql: string) => void;
+    transaction?: (fn: () => void) => () => void;
 };
 
 type SqliteDatabaseCtor = new (path: string) => SqliteDatabase;
 
 type FsModule = {
     existsSync: (path: string) => boolean;
+    statSync?: (path: string) => { mtimeMs: number };
 };
 
 type PathModule = {
@@ -63,7 +95,7 @@ type PathModule = {
 };
 
 type QdrantClientLike = {
-    search: (collectionName: string, params: any) => Promise<any>;
+    query: (collectionName: string, params: any) => Promise<any>;
     scroll: (collectionName: string, params: any) => Promise<any>;
 };
 
@@ -106,13 +138,167 @@ export function filterResultsWithContent(results: QueryResult[]): QueryResult[] 
     });
 }
 
+// Keeps the first (best) chunk of each page, in order. Pages are compared
+// without #fragment and trailing slash, as one page's chunks share a URL.
+export function onePerPage<T extends { url?: string }>(results: T[]): T[] {
+    const seen = new Set<string>();
+    return results.filter((row) => {
+        const key = (row.url ?? '').split('#')[0].replace(/\/+$/, '').toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+// Reciprocal Rank Fusion: each list adds 1 / (RRF_K + rank) to a chunk's
+// score, so vector distances and BM25 scores need no calibration. A chunk
+// found by both keeps the row of the first list it appears in. Chunks are
+// matched on id and URL: the id is a hash of the text, so the same text on
+// two pages shares an id and must not merge into one page's row.
+export function fuseRrf(lists: QueryResult[][]): QueryResult[] {
+    const scores = new Map<string, { row: QueryResult; score: number }>();
+    for (const list of lists) {
+        list.forEach((row, index) => {
+            const key = `${row.chunk_id}\u0000${row.url ?? ''}`;
+            const entry = scores.get(key) ?? { row, score: 0 };
+            entry.score += 1 / (RRF_K + index + 1);
+            scores.set(key, entry);
+        });
+    }
+    return [...scores.values()].sort((a, b) => b.score - a.score).map((e) => e.row);
+}
+
+// Free text as an FTS5 OR-query of quoted terms, so punctuation in a
+// question (colons, quotes, parentheses) cannot break the MATCH syntax
+export function toFtsQuery(text: string): string {
+    const terms = text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+    return [...new Set(terms)].map((t) => `"${t}"`).join(' OR ');
+}
+
+// DeepInfra's inference API: one query, its candidate documents, one score each
+export function createDeepInfraReranker(deps: {
+    apiKey: string;
+    model?: string;
+    baseUrl?: string;
+    timeoutMs?: number;
+    fetch?: typeof fetch;
+}): Rerank {
+    const model = deps.model ?? DEFAULT_RERANK_MODEL;
+    const baseUrl = (deps.baseUrl ?? 'https://api.deepinfra.com/v1/inference').replace(/\/+$/, '');
+    const doFetch = deps.fetch ?? fetch;
+    return async (query, documents) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? 10000);
+        try {
+            const response = await doFetch(`${baseUrl}/${model}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${deps.apiKey}` },
+                body: JSON.stringify({ queries: [query], documents }),
+                signal: controller.signal,
+            });
+            if (!response.ok) {
+                throw new Error(`reranker returned HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+            }
+            const body = await response.json() as { scores?: unknown };
+            if (!Array.isArray(body.scores) || body.scores.length !== documents.length) {
+                throw new Error('reranker did not return one score per document');
+            }
+            return body.scores.map(Number);
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+}
+
+type QueryResultOut = {
+    distance?: number;
+    relevance?: number;
+    content: string;
+    url?: string;
+    section?: string;
+    chunk_index?: number;
+    total_chunks?: number;
+};
+
+const toOutput = (qr: QueryResult): QueryResultOut => ({
+    ...(typeof qr.distance === 'number' && { distance: qr.distance }),
+    ...(typeof qr.relevance === 'number' && { relevance: qr.relevance }),
+    content: qr.content,
+    ...(qr.url && { url: qr.url }),
+    ...(qr.section && { section: qr.section }),
+    ...(typeof qr.chunk_index === 'number' && { chunk_index: qr.chunk_index }),
+    ...(typeof qr.total_chunks === 'number' && { total_chunks: qr.total_chunks }),
+});
+
+const formatResult = (r: QueryResultOut, index: number): string =>
+    [
+        `Result ${index + 1}:`,
+        `  Content: ${r.content}`,
+        typeof r.distance === 'number' ? `  Distance: ${r.distance.toFixed(4)}` : null,
+        typeof r.relevance === 'number' ? `  Relevance: ${r.relevance.toFixed(4)}` : null,
+        r.url ? `  URL: ${r.url}` : null,
+        typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number' && r.total_chunks > 0
+            ? `  Chunk: ${r.chunk_index + 1} of ${r.total_chunks}`
+            : null,
+        '---',
+    ].filter((line) => line !== null).join('\n');
+
 export function createQueryHandlers(deps: {
     createEmbeddings: (text: string) => Promise<number[]>;
     resolveDbPath: ResolveDbPath;
     queryCollection: QueryCollection;
     getChunksForDocument: GetChunksForDocument;
+    keywordSearch?: KeywordSearch;
+    rerank?: Rerank;
+    options?: RetrievalOptions;
 }) {
-    const { createEmbeddings, resolveDbPath, queryCollection, getChunksForDocument } = deps;
+    const { createEmbeddings, resolveDbPath, queryCollection, getChunksForDocument, keywordSearch, rerank } = deps;
+    const options = deps.options ?? {};
+    const rerankCandidates = options.rerankCandidates ?? DEFAULT_RERANK_CANDIDATES;
+
+    // Vector search, optionally fused with keyword search, then post-filters,
+    // reranking and one chunk per page. Keyword search and reranking are
+    // best-effort: if either fails the query falls back to what it has.
+    async function retrieve(
+        queryText: string,
+        dbPath: string,
+        filter: QueryFilter,
+        limit: number,
+        postFilter: (rows: QueryResult[]) => QueryResult[],
+        hasPostFilters: boolean
+    ): Promise<{ results: QueryResult[]; candidates: QueryResult[] }> {
+        const queryEmbedding = await createEmbeddings(queryText);
+        const useKeyword = !!(options.hybrid && keywordSearch);
+        const depth = Math.max(
+            hasPostFilters ? limit * 3 : limit,
+            options.onePerPage || useKeyword ? CANDIDATE_DEPTH : 0,
+            rerank ? rerankCandidates : 0
+        );
+        let candidates = await queryCollection(queryEmbedding, dbPath, filter, depth);
+        if (useKeyword) {
+            try {
+                const keyword = await keywordSearch!(queryText, dbPath, filter, depth);
+                candidates = fuseRrf([candidates, keyword]);
+            } catch (error) {
+                console.error(`Keyword search failed in ${dbPath}, using vector results only:`, error);
+            }
+        }
+        let ranked = filterResultsWithContent(postFilter(candidates));
+        if (rerank && ranked.length > 1) {
+            const pool = ranked.slice(0, rerankCandidates);
+            try {
+                const scores = await rerank(queryText, pool.map((row) => row.content));
+                const reranked = pool
+                    .map((row, i) => ({ ...row, relevance: scores[i] }))
+                    .sort((a, b) => b.relevance - a.relevance);
+                ranked = [...reranked, ...ranked.slice(rerankCandidates)];
+            } catch (error) {
+                console.error('Reranking failed, keeping retrieval order:', error);
+            }
+        }
+        if (options.onePerPage) ranked = onePerPage(ranked);
+        return { results: ranked.slice(0, limit), candidates };
+    }
 
     async function queryDocumentation(
         queryText: string,
@@ -121,33 +307,17 @@ export function createQueryHandlers(deps: {
         version: string | undefined,
         urlPathPrefix: string | undefined,
         limit: number = 4
-    ): Promise<{
-        distance: number;
-        content: string;
-        url?: string;
-        section?: string;
-        chunk_index?: number;
-        total_chunks?: number;
-    }[]> {
-        const queryEmbedding = await createEmbeddings(queryText);
+    ): Promise<QueryResultOut[]> {
         const { dbPath } = resolveDbPath(dbName, productName, version);
-        const hasPostFilters = !!urlPathPrefix;
-        const fetchLimit = hasPostFilters ? limit * 3 : limit;
-        const results = await queryCollection(
-            queryEmbedding,
+        const { results } = await retrieve(
+            queryText,
             dbPath,
             { product_name: productName, version: version, urlPrefix: urlPathPrefix },
-            fetchLimit
+            limit,
+            (rows) => filterResultsByUrl(rows, urlPathPrefix),
+            !!urlPathPrefix
         );
-        const filteredResults = filterResultsWithContent(filterResultsByUrl(results, urlPathPrefix));
-        return filteredResults.slice(0, limit).map((qr: QueryResult) => ({
-            distance: typeof qr.distance === 'number' ? qr.distance : 0,
-            content: qr.content,
-            ...(qr.url && { url: qr.url }),
-            ...(qr.section && { section: qr.section }),
-            ...(typeof qr.chunk_index === 'number' && { chunk_index: qr.chunk_index }),
-            ...(typeof qr.total_chunks === 'number' && { total_chunks: qr.total_chunks }),
-        }));
+        return results.map(toOutput);
     }
 
     async function queryCode(
@@ -160,38 +330,21 @@ export function createQueryHandlers(deps: {
         extensions: string[] | undefined,
         limit: number = 4
     ): Promise<{
-        results: {
-            distance: number;
-            content: string;
-            url?: string;
-            section?: string;
-            chunk_index?: number;
-            total_chunks?: number;
-        }[];
+        results: QueryResultOut[];
         rawCount: number;
         emptyContentCount: number;
     }> {
-        const queryEmbedding = await createEmbeddings(queryText);
         const { dbPath } = resolveDbPath(dbName, productName, undefined, repo);
-        const hasPostFilters = !!filePathPrefix || (extensions && extensions.length > 0);
-        const fetchLimit = hasPostFilters ? limit * 3 : limit;
-        const results = await queryCollection(
-            queryEmbedding,
+        const { results, candidates } = await retrieve(
+            queryText,
             dbPath,
             { product_name: productName, repo, branch, urlPrefix: filePathPrefix, extensions },
-            fetchLimit
+            limit,
+            (rows) => filterResultsByUrl(rows, filePathPrefix, extensions),
+            !!filePathPrefix || !!(extensions && extensions.length > 0)
         );
-        const filteredResults = filterResultsWithContent(filterResultsByUrl(results, filePathPrefix, extensions));
-        const mappedResults = filteredResults.slice(0, limit).map((qr: QueryResult) => ({
-            distance: typeof qr.distance === 'number' ? qr.distance : 0,
-            content: qr.content,
-            ...(qr.url && { url: qr.url }),
-            ...(qr.section && { section: qr.section }),
-            ...(typeof qr.chunk_index === 'number' && { chunk_index: qr.chunk_index }),
-            ...(typeof qr.total_chunks === 'number' && { total_chunks: qr.total_chunks }),
-        }));
-        const emptyContentCount = results.filter((row) => typeof row.content !== 'string' || row.content.trim().length === 0).length;
-        return { results: mappedResults, rawCount: results.length, emptyContentCount };
+        const emptyContentCount = candidates.filter((row) => typeof row.content !== 'string' || row.content.trim().length === 0).length;
+        return { results: results.map(toOutput), rawCount: candidates.length, emptyContentCount };
     }
 
     const queryDocumentationToolHandler = async ({
@@ -229,18 +382,7 @@ export function createQueryHandlers(deps: {
                 };
             }
 
-            const formattedResults = results.map((r, index) =>
-                [
-                    `Result ${index + 1}:`,
-                    `  Content: ${r.content}`,
-                    `  Distance: ${r.distance.toFixed(4)}`,
-                    r.url ? `  URL: ${r.url}` : null,
-                    typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number' && r.total_chunks > 0
-                        ? `  Chunk: ${r.chunk_index + 1} of ${r.total_chunks}`
-                        : null,
-                    '---',
-                ].filter((line) => line !== null).join('\n')
-            ).join('\n');
+            const formattedResults = results.map(formatResult).join('\n');
 
             const responseText = `Found ${results.length} relevant documentation snippets for "${queryText}" in ${productName ? `product "${productName}"` : `db "${dbName}"`} ${version ? `(version ${version})` : ''}:\n\n${formattedResults}`;
             console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
@@ -313,18 +455,7 @@ export function createQueryHandlers(deps: {
                 };
             }
 
-            const formattedResults = results.map((r, index) =>
-                [
-                    `Result ${index + 1}:`,
-                    `  Content: ${r.content}`,
-                    `  Distance: ${r.distance.toFixed(4)}`,
-                    r.url ? `  URL: ${r.url}` : null,
-                    typeof r.chunk_index === 'number' && typeof r.total_chunks === 'number' && r.total_chunks > 0
-                        ? `  Chunk: ${r.chunk_index + 1} of ${r.total_chunks}`
-                        : null,
-                    '---',
-                ].filter((line) => line !== null).join('\n')
-            ).join('\n');
+            const formattedResults = results.map(formatResult).join('\n');
 
             const responseText = `Found ${results.length} relevant code snippets for "${queryText}" in ${target} ${branch ? `(branch ${branch})` : ''}:\n\n${formattedResults}`;
             console.error(`Handler finished processing. Payload size (approx): ${responseText.length} chars. Returning response object...`);
@@ -411,8 +542,10 @@ export function createSqliteDbProvider(deps: {
     Database: SqliteDatabaseCtor;
     fs: FsModule;
     path: PathModule;
+    keywordIndexCacheSize?: number;
 }) {
     const { dbDir, sqliteVec, Database, fs, path } = deps;
+    const keywordIndexCacheSize = deps.keywordIndexCacheSize ?? 8;
 
     const resolveDbPath: ResolveDbPath = (dbName?: string, productName?: string) => {
         if (dbName) {
@@ -488,6 +621,84 @@ export function createSqliteDbProvider(deps: {
                 db.close();
             }
         }
+    };
+
+    // The keyword index is built in memory from the stored chunk text the first
+    // time a database is searched, so existing databases need no re-ingestion.
+    // It is rebuilt when the file changes; the least recently used index is
+    // dropped past keywordIndexCacheSize databases.
+    type KeywordIndex = { mtimeMs: number; db: SqliteDatabase; hasBranch: boolean; hasRepo: boolean };
+    const keywordIndexes = new Map<string, KeywordIndex>();
+    const FULL_COLUMNS = ['chunk_id', 'content', 'url', 'section', 'heading_hierarchy', 'chunk_index', 'total_chunks', 'product_name', 'version', 'branch', 'repo'];
+    const BASIC_COLUMNS = ['chunk_id', 'content', 'url', 'section', 'heading_hierarchy', 'product_name', 'version'];
+
+    const keywordIndexFor = (dbPath: string): KeywordIndex => {
+        const mtimeMs = fs.statSync ? fs.statSync(dbPath).mtimeMs : 0;
+        const cached = keywordIndexes.get(dbPath);
+        if (cached && cached.mtimeMs === mtimeMs) {
+            keywordIndexes.delete(dbPath);
+            keywordIndexes.set(dbPath, cached);
+            return cached;
+        }
+        cached?.db.close();
+        keywordIndexes.delete(dbPath);
+
+        const source = new Database(dbPath);
+        let rows: any[];
+        let columns = FULL_COLUMNS;
+        try {
+            sqliteVec.load(source);
+            try {
+                rows = source.prepare(`SELECT ${FULL_COLUMNS.join(', ')} FROM vec_items`).all();
+            } catch {
+                // Databases from before code sources have no branch, repo or chunk_index
+                columns = BASIC_COLUMNS;
+                rows = source.prepare(`SELECT ${BASIC_COLUMNS.join(', ')} FROM vec_items`).all();
+            }
+        } finally {
+            source.close();
+        }
+
+        const index = new Database(':memory:');
+        index.exec!(`CREATE VIRTUAL TABLE chunks USING fts5(content, ${FULL_COLUMNS.filter((c) => c !== 'content').map((c) => `${c} UNINDEXED`).join(', ')})`);
+        const insert = index.prepare(`INSERT INTO chunks (${FULL_COLUMNS.join(', ')}) VALUES (${FULL_COLUMNS.map(() => '?').join(', ')})`) as any;
+        index.transaction!(() => {
+            for (const row of rows) insert.run(...FULL_COLUMNS.map((c) => row[c] ?? null));
+        })();
+
+        const entry = { mtimeMs, db: index, hasBranch: columns === FULL_COLUMNS, hasRepo: columns === FULL_COLUMNS };
+        keywordIndexes.set(dbPath, entry);
+        while (keywordIndexes.size > keywordIndexCacheSize) {
+            const [oldest, old] = keywordIndexes.entries().next().value as [string, KeywordIndex];
+            old.db.close();
+            keywordIndexes.delete(oldest);
+        }
+        console.error(`[DB ${dbPath}] Keyword index built over ${rows.length} chunks.`);
+        return entry;
+    };
+
+    const keywordSearch: KeywordSearch = async (queryText, dbPath, filter, topK) => {
+        if (!fs.existsSync(dbPath)) {
+            throw new Error(`Database file not found at ${dbPath}`);
+        }
+        const match = toFtsQuery(queryText);
+        if (!match) return [];
+        const index = keywordIndexFor(dbPath);
+        // A filter on a column this database lacks would match nothing; leave
+        // the query to vector search alone rather than return wrong rows
+        if ((filter.branch && !index.hasBranch) || (filter.repo && !index.hasRepo)) return [];
+        let query = `
+            SELECT chunk_id, content, url, section, heading_hierarchy, chunk_index, total_chunks
+            FROM chunks
+            WHERE chunks MATCH ?`;
+        const params: Array<string | number> = [match];
+        if (filter.product_name) { query += ` AND product_name = ?`; params.push(filter.product_name); }
+        if (filter.version) { query += ` AND version = ?`; params.push(filter.version); }
+        if (filter.branch) { query += ` AND branch = ?`; params.push(filter.branch); }
+        if (filter.repo) { query += ` AND repo = ?`; params.push(filter.repo); }
+        query += ` ORDER BY bm25(chunks) LIMIT ?`;
+        params.push(topK);
+        return index.db.prepare(query).all(...params) as QueryResult[];
     };
 
     const getChunksForDocument: GetChunksForDocument = async (
@@ -608,6 +819,7 @@ export function createSqliteDbProvider(deps: {
     return {
         resolveDbPath,
         queryCollection,
+        keywordSearch,
         getChunksForDocument,
     };
 }
@@ -689,8 +901,10 @@ export function createQdrantProvider(deps: { client: QdrantClientLike }) {
         topK: number = 10
     ): Promise<QueryResult[]> => {
         const must = buildFilterMust(filter);
-        const response = await client.search(dbPath, {
-            vector: queryEmbedding,
+        // The Query API (Qdrant 1.10+); the older `search` call is gone from
+        // @qdrant/js-client-rest 1.19
+        const response = await client.query(dbPath, {
+            query: queryEmbedding,
             limit: topK,
             filter: must.length > 0 ? { must } : undefined,
             with_payload: true,
@@ -698,6 +912,35 @@ export function createQdrantProvider(deps: { client: QdrantClientLike }) {
         });
         const points = extractPoints(response);
         return points.map(mapPointToResult);
+    };
+
+    // BM25 over the keyword vector doc2vec writes when a source sets
+    // `keyword_index: true`. Qdrant tokenizes the query with the same model it
+    // used for the chunks. A collection without that vector makes the query
+    // fail, and the handler then keeps the vector results alone; the failure is
+    // remembered for a while so such collections are not queried every time.
+    const KEYWORD_RETRY_MS = 10 * 60 * 1000;
+    const keywordUnavailable = new Map<string, number>();
+    const keywordSearch: KeywordSearch = async (queryText, dbPath, filter, topK) => {
+        const since = keywordUnavailable.get(dbPath);
+        if (since !== undefined && Date.now() - since < KEYWORD_RETRY_MS) return [];
+        const must = buildFilterMust(filter);
+        try {
+            const response = await client.query(dbPath, {
+                query: { text: queryText, model: QDRANT_KEYWORD_MODEL },
+                using: QDRANT_KEYWORD_VECTOR,
+                limit: topK,
+                filter: must.length > 0 ? { must } : undefined,
+                with_payload: true,
+                with_vector: false,
+            });
+            keywordUnavailable.delete(dbPath);
+            // The score is a BM25 score, not a vector distance: report none
+            return extractPoints(response).map((point) => ({ ...mapPointToResult(point), distance: undefined }));
+        } catch (error) {
+            keywordUnavailable.set(dbPath, Date.now());
+            throw error;
+        }
     };
 
     const getChunksForDocument: GetChunksForDocument = async (
@@ -750,6 +993,7 @@ export function createQdrantProvider(deps: { client: QdrantClientLike }) {
     return {
         resolveDbPath,
         queryCollection,
+        keywordSearch,
         getChunksForDocument,
     };
 }

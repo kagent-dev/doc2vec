@@ -19,7 +19,7 @@ import { QdrantClient } from '@qdrant/js-client-rest';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs'; // Import fs for checking file existence
-import { createQueryHandlers, createSqliteDbProvider, createQdrantProvider } from './server.js';
+import { createQueryHandlers, createSqliteDbProvider, createQdrantProvider, createDeepInfraReranker, DEFAULT_RERANK_MODEL, DEFAULT_RERANK_CANDIDATES, type Rerank } from './server.js';
 
 // --- Configuration & Environment Check ---
 
@@ -71,6 +71,20 @@ if (vectorDbType === 'sqlite' && !fs.existsSync(dbDir)) {
     process.exit(1);
 }
 
+// Retrieval configuration
+const envFlag = (name: string, fallback: boolean): boolean => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === '') return fallback;
+    return !['false', '0', 'no', 'off'].includes(raw.trim().toLowerCase());
+};
+const onePerPageEnabled = envFlag('ONE_CHUNK_PER_PAGE', false);
+const hybridSearchEnabled = envFlag('HYBRID_SEARCH', false);
+const rerankerProvider = (process.env.RERANKER || '').trim().toLowerCase();  // '' (off) or 'deepinfra'
+const deepInfraApiKey = process.env.DEEPINFRA_API_KEY;
+const rerankModel = process.env.RERANK_MODEL || DEFAULT_RERANK_MODEL;
+const rerankCandidates = parseInt(process.env.RERANK_CANDIDATES || String(DEFAULT_RERANK_CANDIDATES), 10);
+const rerankTimeoutMs = parseInt(process.env.RERANK_TIMEOUT_MS || '10000', 10);
+
 const strictMode = process.env.STRICT_MODE === 'true';
 if (strictMode) {
     switch (embeddingProvider) {
@@ -102,6 +116,22 @@ if (strictMode) {
         console.error(`Error: Unknown VECTOR_DB_TYPE '${vectorDbType}'. Supported: sqlite, qdrant`);
         process.exit(1);
     }
+
+    if (rerankerProvider && rerankerProvider !== 'deepinfra') {
+        console.error(`Error: Unknown RERANKER '${rerankerProvider}'. Supported: deepinfra`);
+        process.exit(1);
+    }
+    if (rerankerProvider === 'deepinfra' && !deepInfraApiKey) {
+        console.error("Error: RERANKER=deepinfra requires the DEEPINFRA_API_KEY environment variable.");
+        process.exit(1);
+    }
+}
+
+let rerank: Rerank | undefined;
+if (rerankerProvider === 'deepinfra' && deepInfraApiKey) {
+    rerank = createDeepInfraReranker({ apiKey: deepInfraApiKey, model: rerankModel, timeoutMs: rerankTimeoutMs });
+} else if (rerankerProvider) {
+    console.error(`Warning: reranking disabled: RERANKER='${rerankerProvider}' needs ${rerankerProvider === 'deepinfra' ? 'DEEPINFRA_API_KEY' : 'a supported value (deepinfra)'}.`);
 }
 
 async function createEmbeddings(text: string): Promise<number[]> {
@@ -184,7 +214,15 @@ const { queryDocumentationToolHandler, queryCodeToolHandler, getChunksToolHandle
     resolveDbPath: activeProvider.resolveDbPath,
     queryCollection: activeProvider.queryCollection,
     getChunksForDocument: activeProvider.getChunksForDocument,
+    // SQLite builds its keyword index from the stored chunk text; Qdrant
+    // queries the BM25 vector doc2vec writes with `keyword_index: true`
+    keywordSearch: activeProvider.keywordSearch,
+    rerank,
+    options: { onePerPage: onePerPageEnabled, hybrid: hybridSearchEnabled, rerankCandidates },
 });
+console.error(`Retrieval: ${hybridSearchEnabled ? 'hybrid (vector + keyword)' : 'vector'}` +
+    `${rerank ? `, reranked by ${rerankModel} over ${rerankCandidates} candidates` : ''}` +
+    `${onePerPageEnabled ? ', one chunk per page' : ''}`);
 
 // --- MCP Server Setup ---
 const serverName = "sqlite-vec-doc-query"; // Store name for logging

@@ -267,6 +267,7 @@ Configuration is managed through two files:
                     *   `qdrant_url`: (Optional) URL of your Qdrant instance. Defaults to `http://localhost:6333`.
                     *   `qdrant_port`: (Optional) Port for the Qdrant REST API. Defaults to `443` if `qdrant_url` starts with `https`, otherwise `6333`.
                     *   `collection_name`: (Optional) Name of the Qdrant collection to use. Defaults to `<product_name>_<version>` (lowercased, spaces replaced with underscores).
+                    *   `keyword_index`: (Optional) `true` to also store a BM25 keyword vector per chunk, so the MCP server can run hybrid search (`HYBRID_SEARCH=true`). Needs Qdrant 1.18 or later. See [Qdrant keyword index](#qdrant-keyword-index).
 
         Optional embedding configuration:
         *   `embedding.provider`: Provider for embeddings (`openai` or `azure`).
@@ -485,6 +486,34 @@ The script will then:
 7.  Cleanup obsolete chunks.
 8.  Output detailed logs.
 
+### Evaluating retrieval quality
+
+`doc2vec eval` measures how well a SQLite database answers real questions, so a change to the embedding model, chunking or ranking can be judged by numbers. Each case is a question plus the URLs that should come back; the command embeds the question with the same model as the database, runs the same nearest-neighbour query as the MCP server, and reports recall@1/4/10 (share of questions with a relevant chunk in the top k) and MRR (mean reciprocal rank of the first relevant chunk).
+
+```bash
+doc2vec eval cases.jsonl --db ./istio.db --config config.yaml --top-k 10 --out report.json
+```
+
+Cases can be `.jsonl` (one per line), `.json` (an array) or `.yaml`:
+
+```json
+{"id": "mtls-1", "query": "how do I enable strict mTLS for one namespace?", "relevant_urls": ["https://istio.io/latest/docs/tasks/security/authentication/mtls-migration/"], "product_name": "istio", "version": "latest"}
+```
+
+`db`, `product_name` and `version` are optional per case. URLs match ignoring `#fragments`, trailing slashes and case. `--config` reads only the `embedding` section; without it the `OPENAI_*` / `AZURE_OPENAI_*` env vars are used.
+
+Search methods can be compared on the same database without re-ingesting it:
+
+- `--mode dense` (default): nearest chunks by embedding, the MCP server's query.
+- `--mode bm25`: keyword ranking with SQLite FTS5, built in memory from the stored chunk text.
+- `--mode hybrid`: dense and BM25 lists fused with Reciprocal Rank Fusion.
+- `--per-page`: keep only the best chunk of each page, so the top results cover more pages.
+- `--rerank deepinfra`: rerank the top `--rerank-candidates` chunks (default 40) with `--rerank-model` (default `nvidia/Nemotron-3.5-Rerank-8B-BF16`); needs `DEEPINFRA_API_KEY`.
+
+These match the MCP server's retrieval settings (`HYBRID_SEARCH`, `ONE_CHUNK_PER_PAGE`, `RERANKER`; see `mcp/README.md`), so a configuration can be measured before it is deployed.
+
+Results of comparing embedding models, search methods and rerankers are in [RETRIEVAL_ROADMAP.md](RETRIEVAL_ROADMAP.md).
+
 ## Docker Images and the Browser
 
 Website sources are rendered with a real browser (Puppeteer). The `Dockerfile` builds two images so you can choose where that browser runs:
@@ -674,6 +703,21 @@ Server-sent events: `GET /api/events` (run and config updates) and `GET /api/run
 ### Qdrant (`database_config.type: 'qdrant'`)
 *   Uses `@qdrant/js-client-rest`.
 *   Requires `qdrant_url`, `qdrant_port`, `collection_name` and potentially `QDRANT_API_KEY`.
+
+#### Qdrant point ids
+
+Each chunk is stored as one point whose id comes from its page URL and its position on the page. Earlier versions derived the id from the chunk text, so the same text on two pages (a shared "Before you begin" section, for example) became a single point: one page lost the chunk, and both pages looked changed and were re-embedded on every sync.
+
+After upgrading, the first sync of each **website** or **S3** source on Qdrant processes every page once (bypassing the lastmod/ETag or timestamp shortcuts) and rewrites only the pages whose chunks were merged; unchanged pages are not re-embedded. Local directories compare every file on each sync and repair themselves on the first run. GitHub issues, Zendesk and code chunks carry the issue, ticket or file in their text, so merges there are rare; any affected item is repaired the next time it changes. SQLite was never affected.
+
+#### Qdrant keyword index
+
+With `keyword_index: true`, each chunk is stored with two vectors: the embedding (the collection's unnamed vector, as before) and a sparse `bm25` vector that Qdrant computes from the chunk text with its built-in `qdrant/bm25` model (IDF applied at query time). The MCP server queries both when `HYBRID_SEARCH=true`.
+
+*   **New collections** are created with the `bm25` sparse vector.
+*   **Existing collections** get it added on the next sync (Qdrant 1.18+ vector schema update), and every chunk stored before then is backfilled from its stored text. Embeddings are not recomputed. The backfill only reads chunks that lack the vector, so it resumes if interrupted and costs one empty scroll once done.
+*   On a Qdrant older than 1.18 the sync logs a warning and stores chunks without the keyword vector.
+*   Turning the option off later stops writing the vector; the existing ones stay unused.
 
 ## PDF Processing
 
