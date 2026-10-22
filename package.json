@@ -38,7 +38,7 @@
         "@mozilla/readability": "^0.6.0",
         "@qdrant/js-client-rest": "^1.19.0",
         "@qdrant/qdrant-js": "^1.19.0",
-        "axios": "^1.19.0",
+        "axios": "^1.20.0",
         "better-sqlite3": "^13.0.3",
         "chalk": "^5.4.1",
         "cheerio": "^1.0.0-rc.12",
