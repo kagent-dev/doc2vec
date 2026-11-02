@@ -86,8 +86,8 @@ COPY --from=builder /app/build /app/build
 COPY --from=builder /app/node_modules /app/node_modules
 
 # Create non-root user and verify build directory
-RUN addgroup -g 1001 -S nodejs     && \
-    adduser -S kagent -u 1001 -G nodejs
+RUN addgroup -g 14000 -S doc2vec   && \
+    adduser -S doc2vec -u 14000 -G doc2vec
 
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/kubernetes.db /app/build/kubernetes.db
 ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/istio.db /app/build/istio.db
@@ -107,12 +107,15 @@ ADD https://doc-sqlite-db.s3.sa-east-1.amazonaws.com/ambient.db /app/build/ambie
 RUN for file in /app/build/*.db; do echo "Checksum for $file:";sha256sum "$file";done
 
 # Ensure the app directory is owned by the non-root user
-RUN chown -R kagent:nodejs /app
+RUN chown -R doc2vec:doc2vec /app
 
 LABEL org.opencontainers.image.source=https://github.com/kagent-dev/doc2vec
 LABEL org.opencontainers.image.description="Kagent Doc2Vec MCP"
 LABEL org.opencontainers.image.authors="Kagent Creators 🤖"
 
 EXPOSE 3001
+
+# Run as the numeric non-root UID so kubelet can enforce runAsNonRoot
+USER 14000
 
 ENTRYPOINT ["node", "build/index.js"]
