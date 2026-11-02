@@ -36,7 +36,7 @@
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
     "openai": "^6.49.0",
-    "sqlite-vec": "0.1.7-alpha.2",
+    "sqlite-vec": "0.1.9",
     "zod": "^4.6.7"
   },
   "devDependencies": {
