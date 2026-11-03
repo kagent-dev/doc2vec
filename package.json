@@ -51,7 +51,7 @@
         "mammoth": "^1.13.0",
         "openai": "^4.20.1",
         "pdfjs-dist": "^5.3.31",
-        "pg": "^8.18.0",
+        "pg": "^8.23.1",
         "puppeteer": "^25.8.0",
         "sanitize-html": "^2.11.0",
         "sqlite-vec": "0.1.9",
