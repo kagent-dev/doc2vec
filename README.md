@@ -257,7 +257,7 @@ Configuration is managed through two files:
         Common configuration for all types:
         *   `product_name`: A string identifying the product (used in metadata).
         *   `version`: A string identifying the product version (used in metadata).
-        *   `max_size`: Maximum raw content size (in characters). For websites, this limits the raw HTML fetched by Puppeteer. Recommending 1MB (1048576).
+        *   `max_size`: Maximum raw content size (in characters). For websites, this limits the raw HTML fetched by Puppeteer. Recommending 1MB (1048576). Pages whose uncompressed HTML is more than 4× `max_size` (checked with a HEAD request) are skipped without being rendered, so a multi-MB page can't exhaust the browser's memory; their links are still followed.
         *   `database_config`: Configuration for the database.
             *   `type`: Specifies the storage backend (`'sqlite'` or `'qdrant'`).
             *   `params`: Parameters specific to the chosen database type.
@@ -548,6 +548,8 @@ Notes:
 - A crawl holds a browser for as long as it runs, so disable or raise the browser service's session timeout (browserless: `TIMEOUT=0`).
 - Each connection gets its own browser session; doc2vec closes it when the crawl finishes and every 50 pages.
 - Launch flags such as `--no-sandbox` belong to the process that starts the browser and are not sent to a remote one.
+- If the browser service is unreachable (e.g. its pod was OOMKilled and is restarting), doc2vec retries the connection after 5s, 15s, 30s and 60s before failing the source, and reports the actual connection error (`Unexpected server response: 429`, `ECONNREFUSED`, …).
+- Size the browser service's memory for the largest pages you crawl. doc2vec skips pages over 4× `max_size` before rendering, but pages just under that can still be heavy. A memory-backed `/dev/shm` (`emptyDir: { medium: Memory }`) counts against the same limit.
 - With `BROWSER_WS_ENDPOINT` unset, doc2vec launches a local Chrome: `PUPPETEER_EXECUTABLE_PATH` if set, else Puppeteer's downloaded Chrome for Testing, else a system `chromium`.
 
 ## Controller Mode

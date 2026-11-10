@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ContentProcessor, openBrowser, remoteBrowserEndpoint } from '../content-processor';
+import { ContentProcessor, describeError, openBrowser, remoteBrowserEndpoint } from '../content-processor';
 import { Logger, LogLevel } from '../logger';
 import * as fs from 'fs';
+import * as http from 'http';
 import * as path from 'path';
 import axios from 'axios';
 import { SourceConfig, WebsiteSourceConfig, LocalDirectorySourceConfig, CodeSourceConfig } from '../types';
@@ -14,6 +15,10 @@ describe('ContentProcessor', () => {
 
     beforeEach(() => {
         processor = new ContentProcessor(testLogger);
+        // The pre-render size probe makes a real HEAD request. Crawl tests here
+        // use example.com URLs with processPage mocked, so keep them offline;
+        // the probe has its own tests against a local server below.
+        vi.spyOn(processor as any, 'probeOversizedPage').mockResolvedValue(null);
     });
 
     // ─── convertHtmlToMarkdown ──────────────────────────────────────
@@ -1286,7 +1291,7 @@ describe('ContentProcessor', () => {
             const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, visited);
             // Attach the rejection expectation before advancing time so the
             // rejection isn't treated as unhandled
-            const assertion = expect(crawlPromise).rejects.toThrow(/browser failed to launch twice/);
+            const assertion = expect(crawlPromise).rejects.toThrow(/browser failed to launch after 2 attempts .*: Failed to launch the browser process!/);
             await vi.advanceTimersByTimeAsync(6000);
             await assertion;
             vi.useRealTimers();
@@ -1331,6 +1336,79 @@ describe('ContentProcessor', () => {
             // The crawl ends its own session; a browserless-style service gives
             // each connection its own browser
             expect(mockBrowser.close).toHaveBeenCalled();
+        });
+
+        // A ws-library ErrorEvent, as puppeteer.connect() rejects with when the
+        // WebSocket handshake fails (e.g. browserless restarting after an OOM kill).
+        const wsErrorEvent = (message: string) => ({
+            type: 'error',
+            message,
+            error: new Error(message),
+            target: { url: 'ws://browser.example:3000?token=secret-token' },
+        });
+
+        it('should keep retrying a remote browser long enough for it to restart', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockPage = { goto: vi.fn(), evaluate: vi.fn(), url: vi.fn(), close: vi.fn() };
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue(mockPage),
+                close: vi.fn().mockResolvedValue(undefined),
+                connected: true,
+            };
+            const connectSpy = vi.spyOn(puppeteerModule.default, 'connect')
+                .mockClear()
+                .mockRejectedValueOnce(wsErrorEvent('connect ECONNREFUSED 10.0.0.1:3000'))
+                .mockRejectedValueOnce(wsErrorEvent('Unexpected server response: 503'))
+                .mockResolvedValue(mockBrowser as any);
+            vi.spyOn(processor as any, 'processPage').mockResolvedValue({ content: '# Content', links: [], finalUrl: 'https://example.com' });
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            process.env.BROWSER_WS_ENDPOINT = 'ws://browser.example:3000?token=secret-token';
+            vi.useFakeTimers();
+            try {
+                const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, new Set<string>());
+                // 5s + 15s pauses before the third attempt
+                await vi.advanceTimersByTimeAsync(21000);
+                await crawlPromise;
+            } finally {
+                vi.useRealTimers();
+                delete process.env.BROWSER_WS_ENDPOINT;
+            }
+
+            expect(connectSpy).toHaveBeenCalledTimes(3);
+            expect(processContent).toHaveBeenCalled();
+        });
+
+        it('should report the real remote connection error, without the token, after all retries', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const connectSpy = vi.spyOn(puppeteerModule.default, 'connect')
+                .mockClear()
+                .mockRejectedValue(wsErrorEvent('Unexpected server response: 429'));
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            process.env.BROWSER_WS_ENDPOINT = 'ws://browser.example:3000?token=secret-token';
+            vi.useFakeTimers();
+            try {
+                const crawlPromise = processor.crawlWebsite('https://example.com', websiteConfig, processContent, testLogger, new Set<string>());
+                const assertion = crawlPromise.then(
+                    () => { throw new Error('crawl should have failed'); },
+                    (error: Error) => error,
+                );
+                await vi.advanceTimersByTimeAsync(5000 + 15000 + 30000 + 60000 + 1000);
+                const error = await assertion;
+                expect(error.name).toBe('BrowserLaunchError');
+                expect(error.message).toMatch(
+                    /browser failed to launch after 5 attempts .*: cannot connect to remote browser at ws:\/\/browser\.example:3000: Unexpected server response: 429/
+                );
+                expect(error.message).not.toContain('[object Object]');
+                expect(error.message).not.toContain('secret-token');
+            } finally {
+                vi.useRealTimers();
+                delete process.env.BROWSER_WS_ENDPOINT;
+            }
+
+            expect(connectSpy).toHaveBeenCalledTimes(5);
+            expect(processContent).not.toHaveBeenCalled();
         });
 
         it('should skip already visited URLs', async () => {
@@ -2399,6 +2477,147 @@ describe('ContentProcessor', () => {
             vi.spyOn(puppeteerModule.default, 'connect').mockRejectedValue(new Error('ECONNREFUSED'));
             process.env.BROWSER_WS_ENDPOINT = 'ws://browser.example:3000';
             await expect(openBrowser()).rejects.toThrow('ECONNREFUSED');
+        });
+
+        it('turns a ws ErrorEvent rejection into an Error naming the host but not the token', async () => {
+            const puppeteerModule = await import('puppeteer');
+            vi.spyOn(puppeteerModule.default, 'connect').mockRejectedValue({
+                type: 'error',
+                message: 'Unexpected server response: 429',
+                error: new Error('Unexpected server response: 429'),
+            });
+            process.env.BROWSER_WS_ENDPOINT = 'ws://user:pass@browser.example:3000/chromium?token=secret-token';
+            const error = await openBrowser().catch(e => e);
+            expect(error).toBeInstanceOf(Error);
+            expect(error.message).toBe('cannot connect to remote browser at ws://browser.example:3000: Unexpected server response: 429');
+        });
+    });
+
+    // ─── oversized pages: skipped before rendering ───────────────────
+    describe('oversized page pre-skip', () => {
+        const MAX_SIZE = 1000; // pre-skip threshold: 4 x 1000 = 4000 bytes
+        const bigPage = `<html><body><a href="/child/">child</a><a href="#top">anchor</a>`
+            + `<a href="mailto:x@example.com">mail</a><p>${'x'.repeat(5000)}</p></body></html>`;
+        const childPage = '<html><body><article><h1>Child</h1><p>Small page.</p></article></body></html>';
+        let server: http.Server;
+        let base: string;
+        let fresh: ContentProcessor;
+        const requests: string[] = [];
+
+        beforeEach(async () => {
+            requests.length = 0;
+            server = http.createServer((req, res) => {
+                requests.push(`${req.method} ${req.url} ${req.headers['accept-encoding'] ?? ''}`);
+                const send = (body: string, extra: Record<string, string> = {}) => {
+                    res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Length': String(Buffer.byteLength(body)), ...extra });
+                    res.end(req.method === 'HEAD' ? undefined : body);
+                };
+                if (req.url === '/big/') return send(bigPage);
+                if (req.url === '/child/') return send(childPage);
+                if (req.url === '/redirect-big/') {
+                    res.writeHead(301, { Location: '/big/' });
+                    return res.end();
+                }
+                // Claims to be compressed: its length says nothing about the rendered size
+                if (req.url === '/compressed/') {
+                    res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Encoding': 'br', 'Content-Length': '99999' });
+                    return res.end();
+                }
+                res.writeHead(404);
+                res.end('Not found');
+            });
+            await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+            base = `http://127.0.0.1:${(server.address() as any).port}`;
+            // A processor without the probe stub installed by the outer beforeEach
+            fresh = new ContentProcessor(testLogger);
+        });
+
+        afterEach(async () => {
+            vi.restoreAllMocks();
+            await new Promise(resolve => server.close(resolve));
+        });
+
+        const probe = (url: string) => (fresh as any).probeOversizedPage(url, MAX_SIZE, testLogger);
+
+        it('reports a page whose uncompressed size is over 4x max_size, asking for identity encoding', async () => {
+            const result = await probe(`${base}/big/`);
+            expect(result).toEqual({ bytes: Buffer.byteLength(bigPage), finalUrl: `${base}/big/` });
+            expect(requests).toEqual([`HEAD /big/ identity`]);
+        });
+
+        it('follows redirects and reports the final URL', async () => {
+            const result = await probe(`${base}/redirect-big/`);
+            expect(result?.finalUrl).toBe(`${base}/big/`);
+        });
+
+        it('lets small, compressed, missing or unreachable pages through to rendering', async () => {
+            expect(await probe(`${base}/child/`)).toBeNull();
+            expect(await probe(`${base}/compressed/`)).toBeNull();
+            expect(await probe(`${base}/missing/`)).toBeNull();
+            expect(await probe('http://127.0.0.1:1/unreachable/')).toBeNull();
+        });
+
+        it('crawls past an oversized page without rendering it, still following its links', async () => {
+            const puppeteerModule = await import('puppeteer');
+            const mockBrowser = {
+                newPage: vi.fn().mockResolvedValue({ goto: vi.fn().mockResolvedValue(null), close: vi.fn() }),
+                close: vi.fn().mockResolvedValue(undefined),
+                connected: true,
+            };
+            vi.spyOn(puppeteerModule.default, 'launch').mockResolvedValue(mockBrowser as any);
+            vi.spyOn(puppeteerModule.default, 'executablePath').mockResolvedValue('/nonexistent/chrome' as any);
+            const processPageSpy = vi.spyOn(fresh as any, 'processPage')
+                .mockResolvedValue({ content: '# Child', links: [], finalUrl: `${base}/child/` });
+            const processContent = vi.fn().mockResolvedValue(true);
+
+            const config: WebsiteSourceConfig = {
+                type: 'website',
+                product_name: 'TestProduct',
+                version: '1.0',
+                max_size: MAX_SIZE,
+                url: `${base}/`,
+                database_config: { type: 'sqlite', params: {} },
+            };
+            await fresh.crawlWebsite(`${base}/big/`, config, processContent, testLogger, new Set<string>());
+
+            // The big page never reached the browser; the child it links to did
+            const rendered = processPageSpy.mock.calls.map(call => call[0]);
+            expect(rendered).not.toContain(`${base}/big/`);
+            expect(rendered).toContain(`${base}/child/`);
+            expect(processContent).toHaveBeenCalledTimes(1);
+            // Its links came from a plain GET of the raw HTML
+            expect(requests.some(r => r.startsWith('GET /big/'))).toBe(true);
+        });
+
+        it('extracts links from raw HTML, dropping in-page anchors and mailto', async () => {
+            const result = await (fresh as any).extractLinksWithoutBrowser(`${base}/redirect-big/`, testLogger);
+            expect(result).toEqual({ links: ['/child/'], finalUrl: `${base}/big/` });
+        });
+
+        it('returns no links when the raw HTML cannot be fetched', async () => {
+            const result = await (fresh as any).extractLinksWithoutBrowser(`${base}/missing/`, testLogger);
+            expect(result).toEqual({ links: [], finalUrl: `${base}/missing/` });
+        });
+    });
+
+    // ─── describeError ───────────────────────────────────────────────
+    describe('describeError', () => {
+        it('uses the message of an Error', () => {
+            expect(describeError(new Error('boom'))).toBe('boom');
+        });
+        it('unwraps a ws ErrorEvent (inner error first, then message)', () => {
+            expect(describeError({ type: 'error', message: 'outer', error: new Error('inner') })).toBe('inner');
+            expect(describeError({ type: 'error', message: 'outer only' })).toBe('outer only');
+        });
+        it('never renders a plain object as [object Object] or serializes it', () => {
+            expect(describeError({ type: 'close' })).toBe('close event');
+            const described = describeError({ target: { url: 'ws://h?token=secret' } });
+            expect(described).toBe('non-Error rejection (Object)');
+            expect(described).not.toContain('secret');
+        });
+        it('stringifies primitives', () => {
+            expect(describeError('plain string')).toBe('plain string');
+            expect(describeError(undefined)).toBe('undefined');
         });
     });
 

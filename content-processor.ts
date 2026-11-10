@@ -84,6 +84,15 @@ const LOCAL_LAUNCH_ARGS = [
 const BROWSER_PROTOCOL_TIMEOUT_MS = 60000;
 
 /**
+ * Pages whose uncompressed HTML exceeds this multiple of a source's max_size are
+ * skipped before rendering. The max_size check after rendering measures only
+ * the main content element, so the whole page is always somewhat larger. The
+ * margin keeps pages with a lot of chrome around valid content from being lost.
+ * The pages that OOM-killed browserless were 5.6–12.7 MB, against a 1 MB max_size.
+ */
+export const OVERSIZED_PAGE_FACTOR = 4;
+
+/**
  * Open a browser: connect to the remote one named by BROWSER_WS_ENDPOINT, or
  * launch a local one. Callers close it with browser.close() in both cases —
  * a browserless-style service gives each connection its own browser, so
@@ -92,16 +101,63 @@ const BROWSER_PROTOCOL_TIMEOUT_MS = 60000;
 export async function openBrowser(): Promise<Browser> {
     const endpoint = remoteBrowserEndpoint();
     if (endpoint) {
-        return puppeteer.connect({
-            browserWSEndpoint: endpoint,
-            protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
-        });
+        try {
+            return await puppeteer.connect({
+                browserWSEndpoint: endpoint,
+                protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+            });
+        } catch (error) {
+            // puppeteer rejects a failed WebSocket handshake with the raw `ws`
+            // ErrorEvent (not an Error), which stringifies to "[object Object]".
+            // Re-throw a real Error naming the browser host (never the full
+            // URL: it carries the token).
+            throw new Error(`cannot connect to remote browser at ${describeEndpoint(endpoint)}: ${describeError(error)}`);
+        }
     }
     return puppeteer.launch({
         executablePath: await resolveBrowserExecutablePath(),
         args: LOCAL_LAUNCH_ARGS,
         protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
     });
+}
+
+/** `ws://host:port` of a CDP endpoint, without path, query (token) or credentials. */
+function describeEndpoint(endpoint: string): string {
+    try {
+        const url = new URL(endpoint);
+        return `${url.protocol}//${url.host}`;
+    } catch {
+        return '<unparseable endpoint>';
+    }
+}
+
+/**
+ * Human-readable message for anything thrown or rejected. Handles Error, the
+ * `ws` ErrorEvent shape ({ message, error }) and other plain objects, which
+ * String() would render as "[object Object]".
+ */
+export function describeError(error: unknown): string {
+    if (error instanceof Error) return error.message || error.name;
+    if (error && typeof error === 'object') {
+        const obj = error as { message?: unknown; error?: unknown; type?: unknown };
+        if (obj.error instanceof Error && obj.error.message) return obj.error.message;
+        if (typeof obj.message === 'string' && obj.message) return obj.message;
+        if (typeof obj.type === 'string' && obj.type) return `${obj.type} event`;
+        // Deliberately not JSON-serialized: event objects reference the socket,
+        // whose URL may carry a token.
+        return `non-Error rejection (${error.constructor?.name ?? 'Object'})`;
+    }
+    return String(error);
+}
+
+/**
+ * Pauses between browser launch/connect attempts. A remote browser service
+ * (browserless) gets a longer window: when its pod is OOMKilled and restarts,
+ * it refuses connections for ~30s, and a single 5s retry turned that into
+ * several consecutive sources failing outright.
+ */
+export function browserLaunchRetryDelaysMs(): number[] {
+    return remoteBrowserEndpoint() ? [5000, 15000, 30000, 60000] : [5000];
 }
 
 /**
@@ -528,26 +584,36 @@ export class ContentProcessor {
         let page: Page | null = null;
 
         const launchBrowser = async (): Promise<{ browser: Browser; page: Page }> => {
-            let b: Browser;
-            try {
-                b = await openBrowser();
-            } catch (firstError) {
-                // One retry after a pause — the failure may be transient (e.g.
-                // memory pressure from a page that just closed). If the browser
-                // cannot launch at all, no page in this crawl can be processed,
-                // so escalate as fatal instead of failing every URL one by one.
-                logger.warn(`Browser launch failed (${memoryDiagnostics()}), retrying once in 5s...`, firstError);
-                await new Promise(resolve => setTimeout(resolve, 5000));
+            // Retry after pauses — the failure may be transient (memory
+            // pressure from a page that just closed, or a remote browser
+            // service restarting). If the browser cannot launch at all, no page
+            // in this crawl can be processed, so escalate as fatal instead of
+            // failing every URL one by one.
+            const delays = browserLaunchRetryDelaysMs();
+            const attempts = delays.length + 1;
+            for (let attempt = 1; ; attempt++) {
+                let b: Browser | undefined;
                 try {
                     b = await openBrowser();
-                } catch (secondError) {
-                    throw new BrowserLaunchError(
-                        `browser failed to launch twice (${memoryDiagnostics()}): ${secondError instanceof Error ? secondError.message : String(secondError)}`
-                    );
+                    const p = await b.newPage();
+                    if (attempt > 1) logger.info(`Browser launched on attempt ${attempt}/${attempts}`);
+                    return { browser: b, page: p };
+                } catch (error) {
+                    // Don't leak a remote session whose first page failed to open
+                    if (b) {
+                        try { await b.close(); } catch { /* already gone */ }
+                    }
+                    const reason = describeError(error);
+                    if (attempt >= attempts) {
+                        throw new BrowserLaunchError(
+                            `browser failed to launch after ${attempts} attempts (${memoryDiagnostics()}): ${reason}`
+                        );
+                    }
+                    const delayMs = delays[attempt - 1];
+                    logger.warn(`Browser launch failed (attempt ${attempt}/${attempts}, ${memoryDiagnostics()}): ${reason} — retrying in ${Math.round(delayMs / 1000)}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
                 }
             }
-            const p = await b.newPage();
-            return { browser: b, page: p };
         };
 
         // Track whether the page needs to be recreated (e.g., after a timeout error)
@@ -788,17 +854,33 @@ export class ContentProcessor {
                     logger.info(`Crawling: ${url}`);
                     const sources = referrers.get(url) ?? new Set([baseUrl]);
 
+                    // A page far larger than max_size would be discarded after
+                    // rendering anyway, and rendering multi-MB pages is what
+                    // OOM-kills the browser. Skip it before Chromium sees it, but
+                    // still harvest its links from the raw HTML so the crawl
+                    // discovers the same pages as before.
+                    const oversized = Utils.isPdfUrl(url)
+                        ? null
+                        : await this.probeOversizedPage(url, sourceConfig.max_size, logger);
+
                     // For HTML pages, ensure the browser is running and pass the shared page
                     // For PDFs, processPage handles them without Puppeteer
-                    const currentPage = Utils.isPdfUrl(url) ? undefined : await ensureBrowser();
-
-                    const result = await this.processPage(url, sourceConfig, (reportedUrl, status) => {
-                        if (status === 404) {
-                            for (const source of sources) {
-                                addBrokenLink(source, reportedUrl);
+                    let currentPage: Page | undefined;
+                    let result: { content: string | null, links: string[], finalUrl: string, etag?: string };
+                    if (oversized) {
+                        logger.warn(`Page is ${oversized.bytes} bytes, over ${OVERSIZED_PAGE_FACTOR}x max size (${sourceConfig.max_size}). Skipping without rendering: ${url}`);
+                        const raw = await this.extractLinksWithoutBrowser(oversized.finalUrl, logger);
+                        result = { content: null, links: raw.links, finalUrl: raw.finalUrl };
+                    } else {
+                        currentPage = Utils.isPdfUrl(url) ? undefined : await ensureBrowser();
+                        result = await this.processPage(url, sourceConfig, (reportedUrl, status) => {
+                            if (status === 404) {
+                                for (const source of sources) {
+                                    addBrokenLink(source, reportedUrl);
+                                }
                             }
-                        }
-                    }, currentPage);
+                        }, currentPage);
+                    }
 
                     let contentProcessedSuccessfully = false;
                     if (result.content !== null) {
@@ -862,7 +944,7 @@ export class ContentProcessor {
                     // Page processed successfully — reset protocol error counter and
                     // increment the periodic restart counter
                     consecutiveProtocolErrors = 0;
-                    if (!Utils.isPdfUrl(url)) {
+                    if (currentPage) {
                         pagesSinceRestart++;
                     }
 
@@ -1027,6 +1109,81 @@ export class ContentProcessor {
         }
         
         return false;
+    }
+
+    /**
+     * HEAD the page asking for an UNCOMPRESSED body and report its size when it
+     * is more than OVERSIZED_PAGE_FACTOR x maxSize. Compressed lengths are
+     * useless here (a 7 MB docs page is 27 KB of brotli), so a response that is
+     * still encoded, has no Content-Length, fails, or isn't 2xx returns null and
+     * the page is rendered as usual.
+     */
+    protected async probeOversizedPage(
+        url: string,
+        maxSize: number,
+        logger: Logger
+    ): Promise<{ bytes: number; finalUrl: string } | null> {
+        try {
+            const response = await axios.request({
+                method: 'HEAD',
+                url,
+                timeout: 10000,
+                maxRedirects: 5,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; doc2vec crawler)',
+                    'Accept-Encoding': 'identity',
+                },
+                validateStatus: () => true,
+                // Otherwise axios deletes Content-Encoding from HEAD responses,
+                // hiding that a server ignored `identity` and sent a compressed length
+                decompress: false,
+            });
+            if (response.status < 200 || response.status >= 300) return null;
+            const encoding = String(response.headers['content-encoding'] ?? 'identity').toLowerCase();
+            if (encoding !== 'identity') return null;
+            const bytes = Number(response.headers['content-length']);
+            if (!Number.isFinite(bytes) || bytes <= maxSize * OVERSIZED_PAGE_FACTOR) return null;
+            const finalUrl: string = (response.request as any)?.res?.responseUrl || url;
+            return { bytes, finalUrl };
+        } catch (error) {
+            logger.debug(`Size probe failed for ${url}: ${describeError(error)}. Rendering normally.`);
+            return null;
+        }
+    }
+
+    /**
+     * Collect a page's links from its raw HTML, without a browser. Used for
+     * pages too large to render, so skipping them doesn't cut off the pages
+     * only they link to. JS-inserted links are missed — acceptable for the
+     * static documentation pages that reach this size.
+     */
+    protected async extractLinksWithoutBrowser(
+        url: string,
+        logger: Logger
+    ): Promise<{ links: string[]; finalUrl: string }> {
+        try {
+            const response = await axios.get<string>(url, {
+                timeout: 60000,
+                maxRedirects: 5,
+                responseType: 'text',
+                maxContentLength: 64 * 1024 * 1024,
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; doc2vec crawler)' },
+            });
+            const $ = load(response.data);
+            const links: string[] = [];
+            $('a[href]').each((_, el) => {
+                const href = $(el).attr('href');
+                if (href && !href.startsWith('#') && !href.startsWith('mailto:')) {
+                    links.push(href);
+                }
+            });
+            logger.debug(`Extracted ${links.length} links from raw HTML of ${url}`);
+            const finalUrl: string = (response.request as any)?.res?.responseUrl || url;
+            return { links, finalUrl };
+        } catch (error) {
+            logger.warn(`Could not fetch ${url} to extract its links: ${describeError(error)}`);
+            return { links: [], finalUrl: url };
+        }
     }
 
     async processPage(
