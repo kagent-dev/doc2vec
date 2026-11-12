@@ -24,6 +24,20 @@ import {
 const testLogger = new Logger('e2e', { level: LogLevel.NONE });
 
 /**
+ * The crawler sends two kinds of HEAD request: the ETag change check, and the
+ * size probe that runs before a page is rendered (it asks for the uncompressed
+ * length with `Accept-Encoding: identity`). Change-detection tests count only
+ * the former, so they keep asserting "no ETag check for sitemap pages".
+ */
+function isSizeProbe(req: http.IncomingMessage): boolean {
+    return req.method === 'HEAD' && req.headers['accept-encoding'] === 'identity';
+}
+
+function isEtagHead(req: http.IncomingMessage): boolean {
+    return req.method === 'HEAD' && !isSizeProbe(req);
+}
+
+/**
  * Creates an in-memory SQLite database with the full vec_items schema.
  */
 function createE2EDatabase(): { db: BetterSqlite3.Database; dbConnection: SqliteDB } {
@@ -755,9 +769,11 @@ describe('E2E: Website Multi-Sync Change Detection', () => {
     const pageEtags: Record<string, string> = {};
     let sitemapXml = '';
     let headRequestCount = 0;
+    let sizeProbeCount = 0;
 
     beforeEach(async () => {
         headRequestCount = 0;
+        sizeProbeCount = 0;
 
         // Initial page content
         pageContent['/'] = `
@@ -817,6 +833,7 @@ describe('E2E: Website Multi-Sync Change Detection', () => {
         // Start HTTP server with ETag and sitemap support
         server = http.createServer((req, res) => {
             const urlPath = req.url || '';
+            if (isSizeProbe(req)) sizeProbeCount++;
 
             // Serve sitemap
             if (urlPath === '/sitemap.xml') {
@@ -832,7 +849,7 @@ describe('E2E: Website Multi-Sync Change Detection', () => {
                 if (etag) headers['ETag'] = etag;
 
                 if (req.method === 'HEAD') {
-                    headRequestCount++;
+                    if (isEtagHead(req)) headRequestCount++;
                     res.writeHead(200, headers);
                     res.end();
                 } else {
@@ -938,6 +955,7 @@ describe('E2E: Website Multi-Sync Change Detection', () => {
         const page3ChunksBefore = getChunksForUrl(db, `${baseUrl}/page3`);
 
         headRequestCount = 0;
+        sizeProbeCount = 0;
         const run3 = await runWebsiteSync(processor, config, dbConnection, tracker);
 
         // Only page2 and home should be visited by Puppeteer
@@ -951,8 +969,12 @@ describe('E2E: Website Multi-Sync Change Detection', () => {
         // page1 and page3 chunks should be completely unchanged
         expect(getChunksForUrl(db, `${baseUrl}/page1`)).toEqual(page1ChunksBefore);
         expect(getChunksForUrl(db, `${baseUrl}/page3`)).toEqual(page3ChunksBefore);
-        // No HEAD requests for pages in sitemap (they all have lastmod)
+        // No ETag HEAD requests for pages in sitemap (they all have lastmod)
         expect(headRequestCount).toBe(0);
+        // ...but each page that is rendered gets one size probe, and only those:
+        // page1 and page3 are skipped on lastmod before it.
+        expect(sizeProbeCount).toBe(run3.processedUrls.size);
+        expect(sizeProbeCount).toBeGreaterThan(0);
 
         // ═══════════════════════════════════════════════════════════════
         // RUN 4: New page4 discovered via links (not in sitemap)
@@ -1163,7 +1185,7 @@ describe('E2E: Website Incomplete Sync Recovery', () => {
                 const headers: Record<string, string> = { 'Content-Type': 'text/html' };
                 if (etag) headers['ETag'] = etag;
                 if (req.method === 'HEAD') {
-                    headRequestCount++;
+                    if (isEtagHead(req)) headRequestCount++;
                     res.writeHead(200, headers);
                     res.end();
                 } else {
@@ -1551,7 +1573,7 @@ describe('E2E: Website Markdown Store Multi-Sync', () => {
 
             // Handle 404 for specific pages on HEAD requests
             if (req.method === 'HEAD' && notFoundPages.has(urlPath)) {
-                headRequestCount++;
+                if (isEtagHead(req)) headRequestCount++;
                 res.writeHead(404);
                 res.end();
                 return;
@@ -1564,7 +1586,7 @@ describe('E2E: Website Markdown Store Multi-Sync', () => {
                 if (etag) headers['ETag'] = etag;
 
                 if (req.method === 'HEAD') {
-                    headRequestCount++;
+                    if (isEtagHead(req)) headRequestCount++;
                     res.writeHead(200, headers);
                     res.end();
                 } else {
@@ -1572,7 +1594,7 @@ describe('E2E: Website Markdown Store Multi-Sync', () => {
                     res.end(content);
                 }
             } else {
-                if (req.method === 'HEAD') headRequestCount++;
+                if (isEtagHead(req)) headRequestCount++;
                 res.writeHead(404);
                 res.end('Not found');
             }
@@ -2271,7 +2293,7 @@ describe.skipIf(!canRunQdrantTests)('E2E: Qdrant Multi-Sync Change Detection', (
                 const headers: Record<string, string> = { 'Content-Type': 'text/html' };
                 if (etag) headers['ETag'] = etag;
                 if (req.method === 'HEAD') {
-                    headRequestCount++;
+                    if (isEtagHead(req)) headRequestCount++;
                     res.writeHead(200, headers);
                     res.end();
                 } else {
