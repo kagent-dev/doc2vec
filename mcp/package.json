@@ -34,7 +34,7 @@
     "@qdrant/js-client-rest": "^1.19.0",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^16.4.7",
-    "express": "^5.2.1",
+    "express": "^5.3.0",
     "openai": "^6.49.0",
     "sqlite-vec": "0.1.9",
     "zod": "^4.6.7"
