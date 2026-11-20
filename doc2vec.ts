@@ -36,6 +36,7 @@ import {
 } from './types';
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
 import { MarkdownStore } from './markdown-store';
+import { ZendeskAuth } from './zendesk-auth';
 
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
 const execAsync = promisify(exec);
@@ -1558,7 +1559,11 @@ export class Doc2Vec {
     private async processZendesk(config: ZendeskSourceConfig, parentLogger: Logger): Promise<void> {
         const logger = parentLogger.child('process');
         logger.info(`Starting processing for Zendesk: ${config.zendesk_subdomain}.zendesk.com`);
-        
+
+        // One per source run, shared by tickets and articles so they reuse the OAuth token.
+        // Throws on missing or unsubstituted credentials before any database work.
+        const auth = new ZendeskAuth(config, logger);
+
         const dbConnection = await DatabaseManager.initDatabase(config, logger, this.embeddingDimension);
         
         // Initialize metadata storage
@@ -1569,20 +1574,19 @@ export class Doc2Vec {
         
         if (fetchTickets) {
             logger.section('ZENDESK TICKETS');
-            await this.fetchAndProcessZendeskTickets(config, dbConnection, logger);
+            await this.fetchAndProcessZendeskTickets(config, dbConnection, logger, auth);
         }
-        
+
         if (fetchArticles) {
             logger.section('ZENDESK ARTICLES');
-            await this.fetchAndProcessZendeskArticles(config, dbConnection, logger);
+            await this.fetchAndProcessZendeskArticles(config, dbConnection, logger, auth);
         }
         
         logger.info(`Finished processing Zendesk: ${config.zendesk_subdomain}.zendesk.com`);
     }
 
-    private async fetchAndProcessZendeskTickets(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
+    private async fetchAndProcessZendeskTickets(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger, auth: ZendeskAuth = new ZendeskAuth(config, logger)): Promise<void> {
         const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2`;
-        const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
         // Capture timestamp at the start so tickets updated during sync are re-processed next run
         const syncStartDate = new Date().toISOString();
 
@@ -1598,11 +1602,12 @@ export class Doc2Vec {
         const excludedOrgIds = new Set<number>();
 
         const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
+            let reauthenticated = false;
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
                     const response = await axios.get(url, {
                         headers: {
-                            'Authorization': `Basic ${auth}`,
+                            'Authorization': await auth.header(),
                             'Content-Type': 'application/json',
                         },
                     });
@@ -1610,6 +1615,14 @@ export class Doc2Vec {
                 } catch (error: any) {
                     // 403 is a permissions error — retrying won't help
                     if (error.response?.status === 403) throw error;
+
+                    // 401 on OAuth: the token expired or was revoked. Ask for a new one, once.
+                    if (error.response?.status === 401 && !reauthenticated && auth.invalidate()) {
+                        reauthenticated = true;
+                        logger.warn('Zendesk rejected the OAuth token (401), requesting a new one');
+                        attempt--;
+                        continue;
+                    }
 
                     if (error.response?.status === 429) {
                         const retryAfter = parseInt(error.response.headers?.['retry-after'] || '60', 10);
@@ -1832,20 +1845,20 @@ export class Doc2Vec {
         }
     }
 
-    private async fetchAndProcessZendeskArticles(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger): Promise<void> {
+    private async fetchAndProcessZendeskArticles(config: ZendeskSourceConfig, dbConnection: DatabaseConnection, logger: Logger, auth: ZendeskAuth = new ZendeskAuth(config, logger)): Promise<void> {
         const baseUrl = `https://${config.zendesk_subdomain}.zendesk.com/api/v2/help_center`;
-        const auth = Buffer.from(`${config.email}/token:${config.api_token}`).toString('base64');
-        
+
         // Get the start date for filtering
         const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
         const startDateObj = new Date(startDate);
-        
+
         const fetchWithRetry = async (url: string, retries = 3): Promise<any> => {
+            let reauthenticated = false;
             for (let attempt = 0; attempt < retries; attempt++) {
                 try {
                     const response = await axios.get(url, {
                         headers: {
-                            'Authorization': `Basic ${auth}`,
+                            'Authorization': await auth.header(),
                             'Content-Type': 'application/json',
                         },
                     });
@@ -1859,6 +1872,14 @@ export class Doc2Vec {
                     
                     return response.data;
                 } catch (error: any) {
+                    // 401 on OAuth: the token expired or was revoked. Ask for a new one, once.
+                    if (error.response?.status === 401 && !reauthenticated && auth.invalidate()) {
+                        reauthenticated = true;
+                        logger.warn('Zendesk rejected the OAuth token (401), requesting a new one');
+                        attempt--;
+                        continue;
+                    }
+
                     logger.error(`Zendesk API error (attempt ${attempt + 1}):`, error.message);
                     if (attempt === retries - 1) throw error;
                     await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));

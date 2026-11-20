@@ -1675,6 +1675,126 @@ sources:
 
             expect(DB.updateLastRunDate).toHaveBeenCalledTimes(1);
         });
+
+        describe('OAuth client credentials', () => {
+            function makeOAuthConfig() {
+                const { email, api_token, ...rest } = makeZendeskConfig();
+                return { ...rest, oauth_client_id: 'doc2vec', oauth_client_secret: 'shh' };
+            }
+
+            async function getAxiosPostMock() {
+                const axiosMod = await import('axios');
+                return (axiosMod.default as any).post as ReturnType<typeof vi.fn>;
+            }
+
+            const unauthorized = () => Object.assign(new Error('Unauthorized'), { response: { status: 401 } });
+
+            it('should send the bearer token from the client_credentials grant', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+                vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+
+                axiosPost.mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } });
+                axiosGet
+                    .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeOAuthConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosPost).toHaveBeenCalledTimes(1);
+                expect(axiosPost.mock.calls[0][0]).toBe('https://testco.zendesk.com/oauth/tokens');
+                expect(axiosGet.mock.calls.map(c => c[1].headers.Authorization)).toEqual(['Bearer tok-1', 'Bearer tok-1']);
+            });
+
+            it('should request a new token after a 401 and retry the request', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+                const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+
+                axiosPost
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } })
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-2', expires_in: 1800 } });
+                axiosGet
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeOAuthConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosPost).toHaveBeenCalledTimes(2);
+                expect(axiosGet.mock.calls.map(c => c[1].headers.Authorization)).toEqual(['Bearer tok-1', 'Bearer tok-2', 'Bearer tok-2']);
+                expect(processChunksSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('should request a new token only once per request', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+
+                axiosPost
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } })
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-2', expires_in: 1800 } });
+                // 401, 401 (now an ordinary failure: 2 s backoff), then 403 ends it
+                axiosGet
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockRejectedValueOnce(Object.assign(new Error('Forbidden'), { response: { status: 403 } }));
+
+                await expect(
+                    (instance as any).fetchAndProcessZendeskTickets(
+                        makeOAuthConfig(),
+                        { type: 'sqlite', db: {} },
+                        (instance as any).logger,
+                    ),
+                ).rejects.toThrow('Forbidden');
+
+                expect(axiosPost).toHaveBeenCalledTimes(2);
+                expect(axiosGet).toHaveBeenCalledTimes(3);
+            });
+
+            it('should request a new token after a 401 when fetching articles', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+
+                axiosPost
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } })
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-2', expires_in: 1800 } });
+                axiosGet
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockResolvedValueOnce({ data: { articles: [], next_page: null } });
+
+                await (instance as any).fetchAndProcessZendeskArticles(
+                    makeOAuthConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosGet.mock.calls.map(c => c[1].headers.Authorization)).toEqual(['Bearer tok-1', 'Bearer tok-2']);
+                expect(axiosGet.mock.calls[1][0]).toBe('https://testco.zendesk.com/api/v2/help_center/articles.json');
+            });
+
+            it('should fail a source without credentials before touching the database', async () => {
+                const instance = makeInstance();
+                const { DatabaseManager: DB } = await import('../database');
+                const { email, api_token, ...noCredentials } = makeZendeskConfig();
+
+                await expect(
+                    (instance as any).processZendesk(noCredentials, (instance as any).logger),
+                ).rejects.toThrow(/set oauth_client_id and oauth_client_secret/);
+                expect(DB.initDatabase).not.toHaveBeenCalled();
+            });
+        });
     });
 
     // 15. Edge cases
