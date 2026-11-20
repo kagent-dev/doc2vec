@@ -48,8 +48,14 @@ export interface GithubSourceConfig extends BaseSourceConfig {
 export interface ZendeskSourceConfig extends BaseSourceConfig {
     type: 'zendesk';
     zendesk_subdomain: string;     // e.g., 'mycompany' for mycompany.zendesk.com
-    email: string;                 // Zendesk user email for authentication
-    api_token: string;             // Zendesk API token
+    // OAuth client credentials grant (preferred). The client must be confidential.
+    oauth_client_id?: string;      // the OAuth client's Identifier in Admin Center (not its numeric id)
+    oauth_client_secret?: string;  // the OAuth client's Secret
+    oauth_scope?: string;          // space-separated scopes to request (default: 'read')
+    oauth_token_expires_in?: number; // access token lifetime in seconds, 300-172800 (default: 1800)
+    // API token auth (legacy: Zendesk deactivates API tokens on 2027-04-30)
+    email?: string;                // Zendesk user email for API token auth
+    api_token?: string;            // Zendesk API token
     fetch_tickets?: boolean;       // Whether to fetch tickets (default: true)
     fetch_articles?: boolean;      // Whether to fetch help center articles (default: true)
     start_date?: string;           // For incremental updates (default: start of current year)
