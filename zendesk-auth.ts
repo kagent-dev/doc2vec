@@ -4,12 +4,21 @@ import { Logger } from './logger';
 import { ZendeskSourceConfig } from './types';
 
 /**
- * Read-only access to every GET endpoint the sync calls: search.json, ticket
- * comments, organizations and help_center/articles. Zendesk does not document
- * which resource scope search.json needs, so the default is the broad `read`
- * rather than `tickets:read organizations:read hc:read`.
+ * The read-only scopes a source needs, from what it fetches: tickets:read for
+ * the incremental ticket export and comments, organizations:read to resolve
+ * excluded_organizations, hc:read for help center articles. Zendesk's OAuth
+ * client form offers only these resource scopes, not the broad `read`, and a
+ * token request for a scope the client does not allow fails with invalid_scope.
  */
-export const DEFAULT_ZENDESK_OAUTH_SCOPE = 'read';
+export function defaultZendeskOAuthScope(config: ZendeskSourceConfig): string {
+    const scopes: string[] = [];
+    if (config.fetch_tickets !== false) {
+        scopes.push('tickets:read');
+        if (config.excluded_organizations?.length) scopes.push('organizations:read');
+    }
+    if (config.fetch_articles !== false) scopes.push('hc:read');
+    return scopes.length > 0 ? scopes.join(' ') : 'read';
+}
 
 /**
  * Zendesk's own default for clients created on or after 2026-04-30. Sent
@@ -101,7 +110,7 @@ export class ZendeskAuth {
 
     private async requestToken(): Promise<string> {
         const url = `https://${this.config.zendesk_subdomain}.zendesk.com/oauth/tokens`;
-        const scope = this.config.oauth_scope?.trim() || DEFAULT_ZENDESK_OAUTH_SCOPE;
+        const scope = this.config.oauth_scope?.trim() || defaultZendeskOAuthScope(this.config);
         const expiresIn = this.config.oauth_token_expires_in ?? DEFAULT_ZENDESK_OAUTH_EXPIRES_IN;
         const body = new URLSearchParams({
             grant_type: 'client_credentials',

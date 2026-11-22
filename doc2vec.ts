@@ -1594,8 +1594,8 @@ export class Doc2Vec {
         const startDate = config.start_date || `${new Date().getFullYear()}-01-01`;
         const lastRunDate = await DatabaseManager.getLastRunDate(dbConnection, `zendesk_tickets_${config.zendesk_subdomain}`, `${startDate}T00:00:00Z`, logger);
 
-        // Status filter applied client-side (includes 'closed' by default so tickets
-        // transitioning to closed get updated rather than left stale)
+        // Status filter applied client-side to every exported ticket (includes 'closed' by
+        // default so tickets transitioning to closed get updated rather than left stale)
         const statusFilter = new Set(config.ticket_status || ['new', 'open', 'pending', 'hold', 'solved', 'closed']);
 
         const excludedOrgNames = new Set((config.excluded_organizations || []).map(n => n.toLowerCase()));
@@ -1771,17 +1771,29 @@ export class Doc2Vec {
 
         logger.info(`Fetching Zendesk tickets updated since ${lastRunDate}`);
 
-        // Build query parameters — use the status filter for the search query
-        const statusList = Array.from(statusFilter);
-        const statusClause = `status:${statusList.join(',status:')}`;
-
-        // Zendesk /search.json caps results at 1000 (10 pages * 100). Bisect the date range
-        // into smaller windows whenever a window would exceed that cap, so we never hit page 11.
+        // The incremental ticket export, not /search.json: search needs the broad `read`
+        // OAuth scope (Zendesk answers 403 "missing the following required scopes: read"
+        // to a tickets:read token), the export works with tickets:read. It also returns
+        // deleted tickets, and has no 1000-result cap to bisect around.
         let totalTickets = 0;
         let failedTickets = 0;
+        let skippedUnchanged = 0;
+
+        // The export selects tickets by generated_timestamp, which system updates bump
+        // without touching updated_at. Skip those, as the old `updated>` search did, so
+        // unchanged tickets are not re-fetched and re-embedded. Deleted tickets always pass.
+        const lastRunMs = Date.parse(lastRunDate);
+        // A ticket can show up again on a later page if it changed during the export.
+        const seen = new Map<number, string>();
 
         const processResults = async (results: any[]) => {
             for (const ticket of results) {
+                if (ticket.status !== 'deleted' && Number.isFinite(lastRunMs) && Date.parse(ticket.updated_at) < lastRunMs) {
+                    skippedUnchanged++;
+                    continue;
+                }
+                if (seen.get(ticket.id) === ticket.updated_at) continue;
+                seen.set(ticket.id, ticket.updated_at);
                 try {
                     await processTicket(ticket);
                     totalTickets++;
@@ -1793,43 +1805,27 @@ export class Doc2Vec {
             }
         };
 
-        // Work queue of [start, end) date windows (ISO strings). Seed with [lastRunDate, syncStartDate).
-        const windows: Array<[string, string]> = [[lastRunDate, syncStartDate]];
-        const MAX_PER_WINDOW = 1000;
+        // start_time is in Unix seconds and must be over a minute old.
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const fromSeconds = Number.isFinite(lastRunMs) ? Math.floor(lastRunMs / 1000) : nowSeconds;
+        const startTime = Math.min(fromSeconds, nowSeconds - 61);
 
-        while (windows.length > 0) {
-            const [wStart, wEnd] = windows.shift()!;
-            const q = `updated>${wStart} updated<${wEnd} ${statusClause}`;
-            const firstUrl = `${baseUrl}/search.json?query=${encodeURIComponent(q)}&sort_by=updated_at&sort_order=asc`;
-
-            logger.debug(`Searching window ${wStart} .. ${wEnd}`);
-            const firstData = await fetchWithRetry(firstUrl);
-            const count = firstData?.count ?? 0;
-
-            if (count > MAX_PER_WINDOW) {
-                const startMs = new Date(wStart).getTime();
-                const endMs = new Date(wEnd).getTime();
-                if (endMs - startMs <= 1000) {
-                    logger.warn(`Window ${wStart} .. ${wEnd} has ${count} tickets but is already ≤1s wide — processing first 1000 only, some may be missed`);
-                } else {
-                    const midIso = new Date(startMs + Math.floor((endMs - startMs) / 2)).toISOString();
-                    logger.debug(`Window has ${count} tickets (>${MAX_PER_WINDOW}) — bisecting at ${midIso}`);
-                    windows.unshift([wStart, midIso], [midIso, wEnd]);
-                    continue;
-                }
+        let pageUrl: string | null = `${baseUrl}/incremental/tickets/cursor.json?start_time=${startTime}`;
+        let page = 0;
+        while (pageUrl) {
+            if (page > 0) {
+                // The export endpoints allow 10 requests a minute.
+                await new Promise(res => setTimeout(res, 6000));
             }
-
-            logger.info(`Processing window ${wStart}..${wEnd}: ${count} tickets`);
-            await processResults(firstData.results || []);
-
-            let nextPage: string | null = firstData.next_page || null;
-            while (nextPage) {
-                logger.debug(`Fetching next page: ${nextPage}`);
-                await new Promise(res => setTimeout(res, 1000));
-                const data = await fetchWithRetry(nextPage);
-                await processResults(data.results || []);
-                nextPage = data.next_page || null;
-            }
+            const data: any = await fetchWithRetry(pageUrl);
+            const tickets: any[] = data?.tickets || [];
+            page++;
+            logger.info(`Export page ${page}: ${tickets.length} tickets${data?.end_of_stream ? ' (end of stream)' : ''}`);
+            await processResults(tickets);
+            pageUrl = data?.end_of_stream ? null : (data?.after_url || null);
+        }
+        if (skippedUnchanged > 0) {
+            logger.debug(`Skipped ${skippedUnchanged} exported ticket(s) not updated since ${lastRunDate}`);
         }
 
         // Only advance the watermark when all tickets succeeded

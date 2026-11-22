@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Logger, LogLevel } from '../logger';
-import { ZendeskAuth, DEFAULT_ZENDESK_OAUTH_SCOPE, DEFAULT_ZENDESK_OAUTH_EXPIRES_IN } from '../zendesk-auth';
+import { ZendeskAuth, defaultZendeskOAuthScope, DEFAULT_ZENDESK_OAUTH_EXPIRES_IN } from '../zendesk-auth';
 
 vi.mock('axios', () => ({
     default: {
@@ -92,9 +92,19 @@ describe('ZendeskAuth', () => {
                 grant_type: 'client_credentials',
                 client_id: 'doc2vec',
                 client_secret: 's3cret-value',
-                scope: DEFAULT_ZENDESK_OAUTH_SCOPE,
+                scope: 'tickets:read hc:read',
                 expires_in: String(DEFAULT_ZENDESK_OAUTH_EXPIRES_IN),
             });
+        });
+
+        it('derives the default scope from what the source fetches', () => {
+            expect(defaultZendeskOAuthScope(makeConfig())).toBe('tickets:read hc:read');
+            expect(defaultZendeskOAuthScope(makeConfig({ fetch_articles: false }))).toBe('tickets:read');
+            expect(defaultZendeskOAuthScope(makeConfig({ fetch_articles: false, excluded_organizations: ['Acme'] })))
+                .toBe('tickets:read organizations:read');
+            expect(defaultZendeskOAuthScope(makeConfig({ fetch_articles: false, excluded_organizations: [] }))).toBe('tickets:read');
+            expect(defaultZendeskOAuthScope(makeConfig({ fetch_tickets: false }))).toBe('hc:read');
+            expect(defaultZendeskOAuthScope(makeConfig({ fetch_tickets: false, fetch_articles: false }))).toBe('read');
         });
 
         it('sends the configured scope and lifetime', async () => {

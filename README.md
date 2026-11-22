@@ -119,7 +119,7 @@ This ensures that searches for parent topics (like "Installation") will also mat
 *   **TypeScript:** As the project is written in TypeScript (`ts-node` is used for execution via `npm start`).
 *   **OpenAI API Key or Azure OpenAI Credentials:** You need either an OpenAI API key or Azure OpenAI credentials to generate embeddings.
 *   **GitHub Personal Access Token:** Required for accessing GitHub issues (set as `GITHUB_PERSONAL_ACCESS_TOKEN` in your environment).
-*   **Zendesk OAuth client:** Required for accessing Zendesk tickets and articles. A Zendesk admin creates a **confidential** OAuth client (Admin Center > Apps and integrations > APIs > OAuth clients); doc2vec exchanges its identifier and secret for short-lived tokens with the `client_credentials` grant. The tokens act as the admin who created the client, so a dedicated service user should own it. Set `ZENDESK_OAUTH_CLIENT_ID` and `ZENDESK_OAUTH_CLIENT_SECRET` in your environment. The legacy `email` + `ZENDESK_API_TOKEN` pair still works until Zendesk deactivates all API tokens on 2027-04-30.
+*   **Zendesk OAuth client:** Required for accessing Zendesk tickets and articles. A Zendesk admin creates a **confidential** OAuth client (Admin Center > Apps and integrations > APIs > OAuth clients); doc2vec exchanges its identifier and secret for short-lived tokens with the `client_credentials` grant. The tokens act as the admin who created the client, so a dedicated service user should own it; it must be an admin, because the ticket sync reads Zendesk's incremental ticket export. Allow the client `tickets:read` (plus `organizations:read` when you use `excluded_organizations`) for tickets and `hc:read` for help center articles. Set `ZENDESK_OAUTH_CLIENT_ID` and `ZENDESK_OAUTH_CLIENT_SECRET` in your environment. The legacy `email` + `ZENDESK_API_TOKEN` pair still works until Zendesk deactivates all API tokens on 2027-04-30.
 *   **(Optional) Qdrant Instance:** If using the `qdrant` database type, you need a running Qdrant instance accessible from where you run the script.
 *   **(Optional) Build Tools:** Dependencies like `better-sqlite3` and `sqlite-vec` might require native compilation, which could necessitate build tools like `python`, `make`, and a C++ compiler (like `g++` or Clang) depending on your operating system.
 
@@ -231,7 +231,7 @@ Configuration is managed through two files:
         *   `zendesk_subdomain`: Your Zendesk subdomain (e.g., `'mycompany'` for mycompany.zendesk.com).
         *   `oauth_client_id`: The **Identifier** of a confidential Zendesk OAuth client (not its numeric id; reference environment variable as `'${ZENDESK_OAUTH_CLIENT_ID}'`).
         *   `oauth_client_secret`: The OAuth client's secret (reference environment variable as `'${ZENDESK_OAUTH_CLIENT_SECRET}'`). doc2vec requests a token from `https://<subdomain>.zendesk.com/oauth/tokens` with the `client_credentials` grant, reuses it until a minute before it expires, and requests a new one after a `401`. Zendesk returns no refresh token for this grant.
-        *   `oauth_scope`: (Optional) Space-separated scopes to request (defaults to `'read'`, read-only access to every endpoint). The client's allowed scopes in Admin Center must include it.
+        *   `oauth_scope`: (Optional) Space-separated scopes to request. Defaults to what the source fetches: `tickets:read`, plus `organizations:read` when `excluded_organizations` is set, plus `hc:read` for articles. The client's allowed scopes in Admin Center must include every scope requested, or Zendesk answers `invalid_scope`. Tickets are read from the incremental ticket export (`/api/v2/incremental/tickets/cursor.json`), not the Search API, which needs the broad `read` scope.
         *   `oauth_token_expires_in`: (Optional) Access token lifetime in seconds, 300 to 172800 (defaults to `1800`).
         *   `email` and `api_token`: (Legacy) API token authentication, used only when the OAuth fields are absent. Zendesk stopped issuing API tokens on 2026-10-27 and deactivates the remaining ones on 2027-04-30.
         *   `fetch_tickets`: (Optional) Whether to fetch support tickets (defaults to `true`).
@@ -885,7 +885,7 @@ If you don't specify a config path, it will look for config.yaml in the current 
           *   For Word documents, extract text from `.doc` files or convert `.docx` files to Markdown with formatting.
           *   Process each file's content.
         - **For Zendesk:**
-          *   Fetch tickets and articles using the Zendesk API.
+          *   Fetch tickets from the incremental ticket export and articles from the Help Center API.
           *   Convert tickets to formatted Markdown.
           *   Convert articles to formatted Markdown.
           *   Track last run date to support incremental updates.
@@ -902,7 +902,9 @@ If you don't specify a config path, it will look for config.yaml in the current 
 
 ### Zendesk OAuth (client credentials)
 - **OAuth instead of API tokens:** Zendesk sources accept `oauth_client_id` and `oauth_client_secret` of a confidential OAuth client and authenticate with short-lived bearer tokens from the `client_credentials` grant. Zendesk stopped issuing API tokens on 2026-10-27 and deactivates the remaining ones on 2027-04-30
-- **Token lifecycle:** one token per source run, shared by tickets and articles, replaced a minute before it expires and after any `401`; `oauth_scope` defaults to `read` and `oauth_token_expires_in` to `1800`
+- **Token lifecycle:** one token per source run, shared by tickets and articles, replaced a minute before it expires and after any `401`; `oauth_token_expires_in` defaults to `1800`
+- **Least-privilege scopes:** `oauth_scope` defaults to the resource scopes the source needs (`tickets:read`, `organizations:read` with excluded organizations, `hc:read` for articles). Zendesk's OAuth client form offers only these, not `read`
+- **Tickets from the incremental export:** the ticket sync reads `/api/v2/incremental/tickets/cursor.json` from the last run date instead of `/search.json`, which needs the `read` scope. It follows `after_url` until `end_of_stream`, skips tickets whose `updated_at` predates the last run (system-only updates), processes a ticket seen twice in one run once, and now removes the chunks of deleted tickets, which search never returned. The 1000-result search cap and the date bisection around it are gone
 - **Fail fast:** a source with no credentials, only half of the OAuth pair, or an unset `${VAR}` placeholder fails before any request; token errors report Zendesk's `error`/`error_description` and never the request body
 - **Legacy auth kept:** `email` + `api_token` still work, with a warning, when the OAuth fields are absent
 

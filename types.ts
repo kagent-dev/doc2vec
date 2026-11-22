@@ -51,7 +51,7 @@ export interface ZendeskSourceConfig extends BaseSourceConfig {
     // OAuth client credentials grant (preferred). The client must be confidential.
     oauth_client_id?: string;      // the OAuth client's Identifier in Admin Center (not its numeric id)
     oauth_client_secret?: string;  // the OAuth client's Secret
-    oauth_scope?: string;          // space-separated scopes to request (default: 'read')
+    oauth_scope?: string;          // space-separated scopes to request (default: derived from what the source fetches)
     oauth_token_expires_in?: number; // access token lifetime in seconds, 300-172800 (default: 1800)
     // API token auth (legacy: Zendesk deactivates API tokens on 2027-04-30)
     email?: string;                // Zendesk user email for API token auth

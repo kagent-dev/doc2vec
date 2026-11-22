@@ -55,7 +55,7 @@ export const SOURCE_TYPES: Record<string, { label: string; fields: FieldDef[] }>
       { key: 'zendesk_subdomain', label: 'Subdomain', type: 'string', required: true, placeholder: 'mycompany', help: 'mycompany.zendesk.com' },
       { key: 'oauth_client_id', label: 'OAuth client identifier', type: 'string', placeholder: '${ZENDESK_OAUTH_CLIENT_ID}', help: 'Identifier of a confidential OAuth client (client_credentials grant). Set this pair, or the legacy email + API token' },
       { key: 'oauth_client_secret', label: 'OAuth client secret', type: 'string', secret: true, placeholder: '${ZENDESK_OAUTH_CLIENT_SECRET}' },
-      { key: 'oauth_scope', label: 'OAuth scope', type: 'string', placeholder: 'read', help: 'Space-separated scopes to request (default: read)' },
+      { key: 'oauth_scope', label: 'OAuth scope', type: 'string', placeholder: 'tickets:read hc:read', help: 'Space-separated scopes to request (default: tickets:read, plus organizations:read with excluded organizations, plus hc:read for articles)' },
       { key: 'oauth_token_expires_in', label: 'OAuth token lifetime (s)', type: 'number', placeholder: '1800', help: '300-172800 (default: 1800)' },
       { key: 'email', label: 'User email (legacy)', type: 'string', placeholder: 'agent@company.com', help: 'API token auth; Zendesk deactivates API tokens on 2027-04-30' },
       { key: 'api_token', label: 'API token (legacy)', type: 'string', secret: true, placeholder: '${ZENDESK_API_TOKEN}' },
