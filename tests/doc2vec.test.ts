@@ -1530,7 +1530,7 @@ sources:
             });
             axiosGet
                 .mockRejectedValueOnce(rateLimitError)
-                .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
                 .mockResolvedValueOnce({ data: makeCommentsResponse() });
 
             await (instance as any).fetchAndProcessZendeskTickets(
@@ -1569,7 +1569,7 @@ sources:
             const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
 
             axiosGet
-                .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
                 .mockResolvedValueOnce({ data: makeCommentsResponse() });
 
             await (instance as any).fetchAndProcessZendeskTickets(
@@ -1593,7 +1593,7 @@ sources:
             const { DatabaseManager: DB } = await import('../database');
 
             axiosGet
-                .mockResolvedValueOnce({ data: { results: [makeTicket({ status: 'deleted' })], next_page: null } });
+                .mockResolvedValueOnce({ data: { tickets: [makeTicket({ status: 'deleted' })], end_of_stream: true } });
 
             await (instance as any).fetchAndProcessZendeskTickets(
                 makeZendeskConfig(),
@@ -1608,6 +1608,115 @@ sources:
             );
         });
 
+        describe('incremental ticket export', () => {
+            it('should read the cursor export from the last run date, not search', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+
+                axiosGet
+                    .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeZendeskConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                // getLastRunDate is mocked to 2025-01-01T00:00:00Z
+                expect(axiosGet.mock.calls[0][0]).toBe('https://testco.zendesk.com/api/v2/incremental/tickets/cursor.json?start_time=1735689600');
+                expect(axiosGet.mock.calls.some(c => String(c[0]).includes('search'))).toBe(false);
+            });
+
+            it('should follow after_url until end_of_stream', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+                const next = 'https://testco.zendesk.com/api/v2/incremental/tickets/cursor.json?cursor=abc';
+
+                axiosGet
+                    .mockResolvedValueOnce({ data: { tickets: [makeTicket({ id: 1 })], end_of_stream: false, after_url: next } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() })
+                    .mockResolvedValueOnce({ data: { tickets: [makeTicket({ id: 2 })], end_of_stream: true, after_url: `${next}2` } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeZendeskConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosGet.mock.calls.map(c => c[0])).toEqual([
+                    'https://testco.zendesk.com/api/v2/incremental/tickets/cursor.json?start_time=1735689600',
+                    'https://testco.zendesk.com/api/v2/tickets/1/comments.json',
+                    next,
+                    'https://testco.zendesk.com/api/v2/tickets/2/comments.json',
+                ]);
+                expect(processChunksSpy).toHaveBeenCalledTimes(2);
+            });
+
+            it('should skip tickets not updated since the last run, but not deleted ones', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+                const { DatabaseManager: DB } = await import('../database');
+
+                axiosGet
+                    .mockResolvedValueOnce({
+                        data: {
+                            tickets: [
+                                // only generated_timestamp moved: skipped
+                                makeTicket({ id: 1, updated_at: '2024-12-31T23:59:59Z' }),
+                                makeTicket({ id: 2, updated_at: '2024-12-31T00:00:00Z', status: 'deleted' }),
+                                makeTicket({ id: 3, updated_at: '2025-01-01T00:00:00Z' }),
+                            ],
+                            end_of_stream: true,
+                        },
+                    })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeZendeskConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosGet).toHaveBeenCalledTimes(2);
+                expect(axiosGet.mock.calls[1][0]).toBe('https://testco.zendesk.com/api/v2/tickets/3/comments.json');
+                expect(processChunksSpy).toHaveBeenCalledTimes(1);
+                expect(DB.removeChunksByUrlSQLite).toHaveBeenCalledWith({}, 'https://testco.zendesk.com/agent/tickets/2', expect.anything());
+            });
+
+            it('should process a ticket that appears twice with the same updated_at only once', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+
+                axiosGet
+                    .mockResolvedValueOnce({
+                        data: {
+                            tickets: [
+                                makeTicket({ id: 1 }),
+                                makeTicket({ id: 1 }),
+                                makeTicket({ id: 1, updated_at: '2025-01-03T00:00:00Z' }),
+                            ],
+                            end_of_stream: true,
+                        },
+                    })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeZendeskConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(processChunksSpy).toHaveBeenCalledTimes(2);
+            });
+        });
+
         it('should skip tickets with status outside configured filter', async () => {
             const instance = makeInstance({ ticket_status: ['open', 'solved'] });
             const axiosGet = await getAxiosMock();
@@ -1616,12 +1725,12 @@ sources:
             axiosGet
                 .mockResolvedValueOnce({
                     data: {
-                        results: [
+                        tickets: [
                             makeTicket({ id: 1, status: 'open' }),
                             makeTicket({ id: 2, status: 'pending' }),  // should be skipped
                             makeTicket({ id: 3, status: 'solved' }),
                         ],
-                        next_page: null,
+                        end_of_stream: true,
                     },
                 })
                 // comments for ticket 1 and 3 only
@@ -1645,7 +1754,7 @@ sources:
             vi.spyOn(instance as any, 'processChunksForUrl').mockRejectedValue(new Error('embedding failure'));
 
             axiosGet
-                .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
                 .mockResolvedValueOnce({ data: makeCommentsResponse() });
 
             await (instance as any).fetchAndProcessZendeskTickets(
@@ -1664,7 +1773,7 @@ sources:
             vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
 
             axiosGet
-                .mockResolvedValueOnce({ data: { results: [makeTicket()], next_page: null } })
+                .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
                 .mockResolvedValueOnce({ data: makeCommentsResponse() });
 
             await (instance as any).fetchAndProcessZendeskTickets(
@@ -1674,6 +1783,126 @@ sources:
             );
 
             expect(DB.updateLastRunDate).toHaveBeenCalledTimes(1);
+        });
+
+        describe('OAuth client credentials', () => {
+            function makeOAuthConfig() {
+                const { email, api_token, ...rest } = makeZendeskConfig();
+                return { ...rest, oauth_client_id: 'doc2vec', oauth_client_secret: 'shh' };
+            }
+
+            async function getAxiosPostMock() {
+                const axiosMod = await import('axios');
+                return (axiosMod.default as any).post as ReturnType<typeof vi.fn>;
+            }
+
+            const unauthorized = () => Object.assign(new Error('Unauthorized'), { response: { status: 401 } });
+
+            it('should send the bearer token from the client_credentials grant', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+                vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+
+                axiosPost.mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } });
+                axiosGet
+                    .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeOAuthConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosPost).toHaveBeenCalledTimes(1);
+                expect(axiosPost.mock.calls[0][0]).toBe('https://testco.zendesk.com/oauth/tokens');
+                expect(axiosGet.mock.calls.map(c => c[1].headers.Authorization)).toEqual(['Bearer tok-1', 'Bearer tok-1']);
+            });
+
+            it('should request a new token after a 401 and retry the request', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+                const processChunksSpy = vi.spyOn(instance as any, 'processChunksForUrl').mockResolvedValue(undefined);
+
+                axiosPost
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } })
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-2', expires_in: 1800 } });
+                axiosGet
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockResolvedValueOnce({ data: { tickets: [makeTicket()], end_of_stream: true } })
+                    .mockResolvedValueOnce({ data: makeCommentsResponse() });
+
+                await (instance as any).fetchAndProcessZendeskTickets(
+                    makeOAuthConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosPost).toHaveBeenCalledTimes(2);
+                expect(axiosGet.mock.calls.map(c => c[1].headers.Authorization)).toEqual(['Bearer tok-1', 'Bearer tok-2', 'Bearer tok-2']);
+                expect(processChunksSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('should request a new token only once per request', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+
+                axiosPost
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } })
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-2', expires_in: 1800 } });
+                // 401, 401 (now an ordinary failure: 2 s backoff), then 403 ends it
+                axiosGet
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockRejectedValueOnce(Object.assign(new Error('Forbidden'), { response: { status: 403 } }));
+
+                await expect(
+                    (instance as any).fetchAndProcessZendeskTickets(
+                        makeOAuthConfig(),
+                        { type: 'sqlite', db: {} },
+                        (instance as any).logger,
+                    ),
+                ).rejects.toThrow('Forbidden');
+
+                expect(axiosPost).toHaveBeenCalledTimes(2);
+                expect(axiosGet).toHaveBeenCalledTimes(3);
+            });
+
+            it('should request a new token after a 401 when fetching articles', async () => {
+                const instance = makeInstance();
+                const axiosGet = await getAxiosMock();
+                const axiosPost = await getAxiosPostMock();
+
+                axiosPost
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-1', expires_in: 1800 } })
+                    .mockResolvedValueOnce({ data: { access_token: 'tok-2', expires_in: 1800 } });
+                axiosGet
+                    .mockRejectedValueOnce(unauthorized())
+                    .mockResolvedValueOnce({ data: { articles: [], next_page: null } });
+
+                await (instance as any).fetchAndProcessZendeskArticles(
+                    makeOAuthConfig(),
+                    { type: 'sqlite', db: {} },
+                    (instance as any).logger,
+                );
+
+                expect(axiosGet.mock.calls.map(c => c[1].headers.Authorization)).toEqual(['Bearer tok-1', 'Bearer tok-2']);
+                expect(axiosGet.mock.calls[1][0]).toBe('https://testco.zendesk.com/api/v2/help_center/articles.json');
+            });
+
+            it('should fail a source without credentials before touching the database', async () => {
+                const instance = makeInstance();
+                const { DatabaseManager: DB } = await import('../database');
+                const { email, api_token, ...noCredentials } = makeZendeskConfig();
+
+                await expect(
+                    (instance as any).processZendesk(noCredentials, (instance as any).logger),
+                ).rejects.toThrow(/set oauth_client_id and oauth_client_secret/);
+                expect(DB.initDatabase).not.toHaveBeenCalled();
+            });
         });
     });
 
